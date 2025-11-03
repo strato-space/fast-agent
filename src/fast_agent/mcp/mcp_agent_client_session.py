@@ -3,20 +3,20 @@ A derived client session for the MCP Agent framework.
 It adds logging and supports sampling requests.
 """
 
+import asyncio
 from datetime import timedelta
 from time import perf_counter
 from typing import TYPE_CHECKING
 
 from mcp import ClientSession, ServerNotification
 from mcp.shared.message import MessageMetadata
+from mcp.shared.request import PendingRequest, TaskHandlerOptions
 from mcp.shared.session import (
     ProgressFnT,
     ReceiveResultT,
     SendRequestT,
 )
 from mcp.types import (
-    CallToolRequest,
-    CallToolRequestParams,
     CallToolResult,
     GetPromptRequest,
     GetPromptRequestParams,
@@ -26,7 +26,10 @@ from mcp.types import (
     ReadResourceRequest,
     ReadResourceRequestParams,
     ReadResourceResult,
+    RelatedTaskMetadata,
     Root,
+    TaskMetadata,
+    TextContent,
     ToolListChangedNotification,
 )
 from pydantic import FileUrl
@@ -41,6 +44,9 @@ if TYPE_CHECKING:
     from fast_agent.mcp.transport_tracking import TransportChannelMetrics
 
 logger = get_logger(__name__)
+
+LONG_RUNNING_RESULT_WAIT_SECONDS = 2.0
+"""Maximum seconds to wait for a long-running tool before returning placeholder result."""
 
 
 async def list_roots(ctx: ClientSession) -> ListRootsResult:
@@ -205,6 +211,8 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         request_read_timeout_seconds: timedelta | None = None,
         metadata: MessageMetadata | None = None,
         progress_callback: ProgressFnT | None = None,
+        task: TaskMetadata | None = None,
+        related_task: RelatedTaskMetadata | None = None,
     ) -> ReceiveResultT:
         logger.debug("send_request: request=", data=request.model_dump())
         request_id = getattr(self, "_request_id", None)
@@ -216,6 +224,8 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 request_read_timeout_seconds=request_read_timeout_seconds,
                 metadata=metadata,
                 progress_callback=progress_callback,
+                task=task,
+                related_task=related_task,
             )
             logger.debug(
                 "send_request: response=",
@@ -308,37 +318,115 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
             logger.error(f"Error in tool list changed callback: {e}")
 
     # TODO -- decide whether to make this override type safe or not (modify SDK)
+    @staticmethod
+    def _merge_meta_dict(
+        base_meta: dict | None = None, extra_meta: dict | None = None
+    ) -> dict | None:
+        """Merge metadata dictionaries, handling Pydantic Meta objects."""
+        merged: dict = {}
+
+        def _normalize(meta: dict | None) -> dict:
+            if meta is None:
+                return {}
+            if hasattr(meta, "model_dump"):
+                return dict(meta.model_dump())
+            return dict(meta)
+
+        merged.update(_normalize(base_meta))
+        merged.update(extra_meta or {})
+        return merged or None
+
+    def begin_call_tool(
+        self,
+        name: str,
+        arguments: dict | None = None,
+        read_timeout_seconds: timedelta | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: dict | None = None,
+        _meta: dict | None = None,
+        task: TaskMetadata | None = None,
+    ) -> PendingRequest[CallToolResult]:
+        """Begin a tool call while preserving legacy _meta support."""
+        combined_meta = self._merge_meta_dict(meta, _meta)
+        return super().begin_call_tool(
+            name,
+            arguments,
+            read_timeout_seconds=read_timeout_seconds,
+            progress_callback=progress_callback,
+            task=task,
+            meta=combined_meta,
+        )
+
     async def call_tool(
-        self, name: str, arguments: dict | None = None, _meta: dict | None = None, **kwargs
+        self,
+        name: str,
+        arguments: dict | None = None,
+        read_timeout_seconds: timedelta | None = None,
+        progress_callback: ProgressFnT | None = None,
+        *,
+        meta: dict | None = None,
+        _meta: dict | None = None,
+        task: TaskMetadata | None = None,
+        task_handler_options: TaskHandlerOptions | None = None,
     ) -> CallToolResult:
-        """Call a tool with optional metadata support."""
-        if _meta:
-            from mcp.types import RequestParams
+        """Call a tool, using task semantics only for long-running tools."""
+        is_long_running = name.endswith("_lr")
 
-            # Safe merge - preserve existing meta fields like progressToken
-            existing_meta = kwargs.get("meta")
-            if existing_meta:
-                meta_dict = (
-                    existing_meta.model_dump() if hasattr(existing_meta, "model_dump") else {}
+        if is_long_running:
+            pending = self.begin_call_tool(
+                name,
+                arguments,
+                read_timeout_seconds=read_timeout_seconds,
+                progress_callback=progress_callback,
+                meta=meta,
+                _meta=_meta,
+                task=task,
+            )
+            result_task = asyncio.create_task(pending.result(task_handler_options))
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(result_task), timeout=LONG_RUNNING_RESULT_WAIT_SECONDS
                 )
-                meta_dict.update(_meta)
-                meta_obj = RequestParams.Meta(**meta_dict)
-            else:
-                meta_obj = RequestParams.Meta(**_meta)
+            except asyncio.TimeoutError:
+                def _consume_result(fut: asyncio.Future) -> None:
+                    try:
+                        fut.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:  # pragma: no cover - diagnostic logging
+                        logger.debug(
+                            "Deferred long-running tool result raised",
+                            data={"tool_name": name, "error": str(exc)},
+                        )
 
-            # Create CallToolRequestParams without meta, then add _meta via model_dump
-            params = CallToolRequestParams(name=name, arguments=arguments)
-            params_dict = params.model_dump(by_alias=True)
-            params_dict["_meta"] = meta_obj.model_dump()
+                result_task.add_done_callback(_consume_result)
 
-            # Create request with proper types
-            request = CallToolRequest(
-                method="tools/call", params=CallToolRequestParams.model_validate(params_dict)
+                task_id = getattr(pending, "task_id", None)
+                placeholder = "Long-running task started; check outstanding tasks for updates."
+                if task_id:
+                    placeholder = f"{placeholder} (task: {task_id})"
+
+                return CallToolResult(
+                    isError=False,
+                    content=[TextContent(type="text", text=placeholder)],
+                )
+
+        combined_meta = self._merge_meta_dict(meta, _meta)
+
+        if task is not None or task_handler_options is not None:
+            logger.debug(
+                "Ignoring task metadata/options for non long-running tool call",
+                data={"tool_name": name},
             )
 
-            return await self.send_request(request, CallToolResult)
-        else:
-            return await super().call_tool(name, arguments, **kwargs)
+        return await super().call_tool(
+            name,
+            arguments,
+            read_timeout_seconds=read_timeout_seconds,
+            progress_callback=progress_callback,
+            meta=combined_meta,
+        )
 
     async def read_resource(
         self, uri: str, _meta: dict | None = None, **kwargs

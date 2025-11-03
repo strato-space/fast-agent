@@ -10,6 +10,8 @@ from rich.text import Text
 from fast_agent.ui import console
 
 if TYPE_CHECKING:
+    from mcp.types import Task
+
     from fast_agent.mcp.mcp_aggregator import ServerStatus
     from fast_agent.mcp.transport_tracking import ChannelSnapshot
 
@@ -85,6 +87,14 @@ TIMELINE_COLORS_STDIO = {
     "ping": Colours.PING,
     "none": Colours.IDLE,
 }
+
+TASK_STATUS_STYLES = {
+    "submitted": Colours.TEXT_INFO,
+    "working": Colours.TEXT_WARNING,
+    "input_required": Colours.TEXT_WARNING,
+    "unknown": Colours.TEXT_DIM,
+}
+OUTSTANDING_TASK_DISPLAY_LIMIT = 5
 
 
 def _format_compact_duration(seconds: float | None) -> str | None:
@@ -680,6 +690,70 @@ def _render_channel_summary(status: ServerStatus, indent: str, total_width: int)
     console.console.print()
 
 
+def _shorten_task_id(task_id: str, max_length: int = 28) -> str:
+    """Return a compact representation of a task identifier."""
+    if len(task_id) <= max_length:
+        return task_id
+    head = task_id[: max_length // 2 - 1]
+    tail = task_id[-(max_length // 2 - 2) :]
+    return f"{head}…{tail}"
+
+
+def _format_task_line(task: "Task", indent: str) -> Text:
+    """Format a single outstanding task for display."""
+    line = Text(indent)
+    line.append(SYMBOL_REQUEST, style=f"dim {Colours.TEXT_DIM}")
+
+    task_id = _shorten_task_id(task.taskId or "unknown")
+    line.append(f" {task_id}", style=Colours.TEXT_INFO)
+
+    status_value = (task.status or "unknown").lower()
+    status_style = TASK_STATUS_STYLES.get(status_value, Colours.TEXT_DEFAULT)
+    line.append(f"  {status_value}", style=status_style)
+
+    if task.keepAlive is not None:
+        line.append(f"  ttl {task.keepAlive}ms", style=Colours.TEXT_DIM)
+    if task.pollFrequency is not None:
+        line.append(f"  poll {task.pollFrequency}ms", style=Colours.TEXT_DIM)
+    if task.error:
+        line.append(f"  {task.error}", style=Colours.TEXT_ERROR)
+
+    return line
+
+
+def _render_outstanding_tasks(status: ServerStatus, indent: str) -> None:
+    """Render outstanding MCP tasks for a server."""
+    tasks: list["Task"] = getattr(status, "outstanding_tasks", None) or []
+    task_error = getattr(status, "task_error", None)
+
+    if task_error:
+        line = Text(indent + "  ")
+        line.append("tasks: ", style=Colours.TEXT_DIM)
+        message = task_error if len(task_error) <= 80 else f"{task_error[:77]}..."
+        line.append(message, style=Colours.TEXT_ERROR)
+        console.console.print(line)
+        return
+
+    #    print("tasks:", tasks)
+    if not tasks:
+        return
+
+    header = Text(indent + "  ")
+    header.append("tasks: ", style=Colours.TEXT_DIM)
+    header.append(f"{len(tasks)} outstanding", style=Colours.TEXT_DEFAULT)
+    console.console.print(header)
+
+    display = tasks[:OUTSTANDING_TASK_DISPLAY_LIMIT]
+    for task in display:
+        console.console.print(_format_task_line(task, indent + "    "))
+
+    remaining = len(tasks) - len(display)
+    if remaining > 0:
+        summary = Text(indent + "    ")
+        summary.append(f"… {remaining} more task(s)", style=Colours.TEXT_DIM)
+        console.console.print(summary)
+
+
 async def render_mcp_status(agent, indent: str = "") -> None:
     server_status_map = {}
     if hasattr(agent, "get_server_status") and callable(getattr(agent, "get_server_status")):
@@ -814,6 +888,7 @@ async def render_mcp_status(agent, indent: str = "") -> None:
             calls_line.append("mcp calls: ", style=Colours.TEXT_DIM)
             calls_line.append(calls, style=Colours.TEXT_DEFAULT)
             console.console.print(calls_line)
+        _render_outstanding_tasks(status, indent)
         _render_channel_summary(status, indent, total_width)
 
         combined_tokens = primary_caps + secondary_caps

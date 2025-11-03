@@ -22,6 +22,7 @@ from mcp.types import (
     ListToolsResult,
     Prompt,
     ServerCapabilities,
+    Task,
     TextContent,
     Tool,
 )
@@ -104,8 +105,13 @@ class ServerStatus(BaseModel):
     session_id: str | None = None
     transport_channels: TransportSnapshot | None = None
     skybridge: SkybridgeServerConfig | None = None
+    outstanding_tasks: List[Task] = Field(default_factory=list)
+    task_error: str | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
 class MCPAggregator(ContextDependent):
@@ -831,6 +837,37 @@ class MCPAggregator(ContextDependent):
 
         return instructions
 
+    async def _collect_outstanding_tasks(
+        self,
+        session: ClientSession,
+        server_name: str,
+        *,
+        limit: int = 20,
+    ) -> tuple[List[Task], str | None]:
+        """Fetch outstanding (non-terminal) tasks for a server."""
+        tasks: List[Task] = []
+        cursor: str | None = None
+
+        try:
+            while len(tasks) < limit:
+                result = await session.list_tasks(cursor=cursor)
+                for task in result.tasks:
+                    status = (task.status or "").lower()
+                    if status not in TERMINAL_TASK_STATUSES:
+                        tasks.append(task)
+                        if len(tasks) >= limit:
+                            break
+                cursor = result.nextCursor
+                if not cursor:
+                    break
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            logger.debug(
+                "Failed to list tasks for server '%s': %s", server_name, exc, exc_info=True
+            )
+            return [], str(exc)
+
+        return tasks, None
+
     async def collect_server_status(self) -> Dict[str, ServerStatus]:
         """Return aggregated status information for each configured server."""
         if not self.initialized:
@@ -867,6 +904,8 @@ class MCPAggregator(ContextDependent):
             server_conn = None
             transport: str | None = None
             transport_snapshot: TransportSnapshot | None = None
+            outstanding_tasks: List[Task] = []
+            task_error: str | None = None
 
             manager = getattr(self, "_persistent_connection_manager", None)
             if self.connection_persistence and manager is not None:
@@ -904,6 +943,14 @@ class MCPAggregator(ContextDependent):
                                 session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
                             except Exception:
                                 session_id = None
+                        has_long_running_tools = any(
+                            tool.tool.name.endswith("_lr")
+                            for tool in self._server_to_tool_map.get(server_name, [])
+                        )
+                        if has_long_running_tools and hasattr(session, "list_tasks"):
+                            outstanding_tasks, task_error = await self._collect_outstanding_tasks(
+                                session, server_name
+                            )
                     metrics = getattr(server_conn, "transport_metrics", None)
                     if metrics is not None:
                         try:
@@ -998,6 +1045,8 @@ class MCPAggregator(ContextDependent):
                 session_id=session_id,
                 transport_channels=transport_snapshot,
                 skybridge=self._skybridge_configs.get(server_name),
+                outstanding_tasks=outstanding_tasks,
+                task_error=task_error,
             )
 
         return status_map
