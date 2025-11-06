@@ -266,8 +266,8 @@ class ModelDatabase:
 
     @classmethod
     def get_model_params(cls, model: str) -> Optional[ModelParameters]:
-        """Get model parameters for a given model name"""
-        return cls.MODELS.get(model)
+        """Get model parameters for a given model name (case-insensitive)"""
+        return cls.MODELS.get(model.lower())
 
     @classmethod
     def get_context_window(cls, model: str) -> Optional[int]:

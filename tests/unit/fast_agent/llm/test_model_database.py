@@ -39,6 +39,25 @@ def test_model_database_tokenizes():
     assert ModelDatabase.get_tokenizes("unknown-model") is None
 
 
+def test_model_database_case_insensitive():
+    """Test that ModelDatabase lookups are case-insensitive"""
+    # Test with different casing variations
+    assert ModelDatabase.get_context_window("claude-sonnet-4-0") == 200000
+    assert ModelDatabase.get_context_window("Claude-Sonnet-4-0") == 200000
+    assert ModelDatabase.get_context_window("CLAUDE-SONNET-4-0") == 200000
+
+    # Test provider-prefixed models (like moonshotai/kimi-k2-instruct-0905)
+    assert ModelDatabase.get_model_params("moonshotai/kimi-k2-instruct-0905") is not None
+    assert ModelDatabase.get_model_params("Moonshotai/Kimi-K2-Instruct-0905") is not None
+    assert ModelDatabase.get_model_params("MOONSHOTAI/KIMI-K2-INSTRUCT-0905") is not None
+
+    # Verify the actual parameters are correct
+    kimi_params_lower = ModelDatabase.get_model_params("moonshotai/kimi-k2-instruct-0905")
+    kimi_params_mixed = ModelDatabase.get_model_params("Moonshotai/Kimi-K2-Instruct-0905")
+    assert kimi_params_lower.context_window == kimi_params_mixed.context_window
+    assert kimi_params_lower.max_output_tokens == kimi_params_mixed.max_output_tokens
+
+
 def test_model_database_supports_mime_basic():
     """Test MIME support lookups with normalization and aliases."""
     # Known multimodal model supports images and pdf
