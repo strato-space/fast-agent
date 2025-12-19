@@ -17,11 +17,7 @@ from mcp.client.stdio import (
     get_default_environment,
 )
 from mcp.client.streamable_http import GetSessionIdCallback
-from mcp.shared._httpx_utils import (
-    MCP_DEFAULT_SSE_READ_TIMEOUT,
-    MCP_DEFAULT_TIMEOUT,
-    create_mcp_http_client,
-)
+from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.types import Implementation, JSONRPCMessage, ServerCapabilities
 
 from fast_agent.config import MCPServerSettings
@@ -44,6 +40,12 @@ if TYPE_CHECKING:
     from fast_agent.mcp_server_registry import ServerRegistry
 
 logger = get_logger(__name__)
+
+try:
+    from mcp.shared._httpx_utils import MCP_DEFAULT_SSE_READ_TIMEOUT, MCP_DEFAULT_TIMEOUT
+except ImportError:  # pragma: no cover - compatibility with older MCP SDK releases
+    MCP_DEFAULT_TIMEOUT = 30.0
+    MCP_DEFAULT_SSE_READ_TIMEOUT = 300.0
 
 
 class StreamingContextAdapter:

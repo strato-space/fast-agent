@@ -2,15 +2,21 @@
 Direct AgentApp implementation for interacting with agents without proxies.
 """
 
+from pathlib import Path
 from typing import Mapping, Union
 
 from deprecated import deprecated
 from mcp.types import GetPromptResult, PromptMessage
+from pydantic import AnyUrl
 from rich import print as rich_print
 
 from fast_agent.agents.agent_types import AgentType
+from fast_agent.constants import DEFAULT_AGENT_INSTRUCTION
+from fast_agent.core.direct_decorators import _resolve_instruction
 from fast_agent.core.exceptions import AgentConfigError, ServerConfigError
+from fast_agent.core.prompt_templates import apply_template_variables, enrich_with_environment_context
 from fast_agent.interfaces import AgentProtocol
+from fast_agent.skills.registry import format_skills_for_prompt
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.ui.interactive_prompt import InteractivePrompt
 from fast_agent.ui.progress_display import progress_display
@@ -50,6 +56,62 @@ class AgentApp:
         if name in self._agents:
             return self._agents[name]
         raise AttributeError(f"Agent '{name}' not found")
+
+    def read_instructions(self, agent_name: str | None = None) -> str | None:
+        """
+        Read the stored instruction template for an agent.
+
+        Prefers the template stored on the agent's config (if present) so callers can
+        retrieve the unmodified instruction even if runtime template substitution has
+        already been applied to the agent's live instruction.
+        """
+        agent = self._agent(agent_name)
+
+        config = getattr(agent, "config", None) or getattr(agent, "_config", None)
+        template = getattr(config, "instruction", None) if config is not None else None
+        if template:
+            return template
+
+        return getattr(agent, "instruction", None)
+
+    async def write_instructions(
+        self,
+        instruction: str | Path | AnyUrl = DEFAULT_AGENT_INSTRUCTION,
+        agent_name: str | None = None,
+    ) -> str:
+        """
+        Update an agent's instruction template and synchronize the effective system prompt.
+
+        This routine:
+        - Resolves `instruction` when provided as a file path or URL
+        - Stores the original template on the agent config (when available)
+        - Applies late-binding templates (env, file templates, agentSkills) for immediate use
+        - Keeps default request params + attached LLM params aligned
+
+        Returns:
+            The effective instruction string after template application (and server template
+            application when supported by the agent).
+        """
+        agent = self._agent(agent_name)
+        template = _resolve_instruction(instruction)
+
+        config = getattr(agent, "config", None) or getattr(agent, "_config", None)
+        if config is not None and hasattr(config, "instruction"):
+            config.instruction = template
+
+        resolved = self._resolve_instruction_for_agent(agent, template)
+        self._sync_agent_instruction(agent, resolved)
+
+        if "{{agentSkills}}" in template and "{{agentSkills}}" not in resolved:
+            setattr(agent, "_agent_skills_warning_shown", True)
+
+        apply_server_templates = getattr(agent, "_apply_instruction_templates", None)
+        if callable(apply_server_templates) and getattr(agent, "initialized", False):
+            await apply_server_templates()
+            resolved = getattr(agent, "instruction", resolved) or resolved
+            self._sync_agent_instruction(agent, resolved)
+
+        return resolved
 
     async def __call__(
         self,
@@ -114,6 +176,70 @@ class AgentApp:
                 return agent
 
         return next(iter(self._agents.values()))
+
+    def _resolve_instruction_for_agent(self, agent: AgentProtocol, template: str) -> str:
+        """Apply late-binding instruction templates (env, files, skills) for an agent."""
+        context_vars: dict[str, str] = {}
+
+        agent_context = getattr(agent, "context", None)
+        skills_override = None
+        if agent_context is not None:
+            cfg = getattr(agent_context, "config", None)
+            skills_cfg = getattr(cfg, "skills", None) if cfg is not None else None
+            skills_override = (
+                getattr(skills_cfg, "directory", None) if skills_cfg is not None else None
+            )
+
+        enrich_with_environment_context(
+            context_vars,
+            str(Path.cwd()),
+            {"name": "fast-agent"},
+            skills_override,
+        )
+
+        skill_manifests = None
+        config = getattr(agent, "config", None) or getattr(agent, "_config", None)
+        if config is not None and hasattr(config, "skill_manifests"):
+            skill_manifests = getattr(config, "skill_manifests", None)
+        elif hasattr(agent, "_skill_manifests"):
+            skill_manifests = getattr(agent, "_skill_manifests", None)
+
+        if skill_manifests is not None:
+            try:
+                context_vars["agentSkills"] = format_skills_for_prompt(skill_manifests)
+            except Exception:
+                pass
+
+        resolved = apply_template_variables(template, context_vars)
+        return resolved or template
+
+    def _sync_agent_instruction(self, agent: AgentProtocol, instruction: str) -> None:
+        """Keep config/request params/LLM state in sync with the provided instruction."""
+        if hasattr(agent, "instruction"):
+            setattr(agent, "instruction", instruction)
+
+        config = getattr(agent, "config", None) or getattr(agent, "_config", None)
+        config_request_params = getattr(config, "default_request_params", None) if config is not None else None
+        if config_request_params is not None and hasattr(config_request_params, "systemPrompt"):
+            config_request_params.systemPrompt = instruction
+
+        request_params = getattr(agent, "_default_request_params", None)
+        if request_params is not None and hasattr(request_params, "systemPrompt"):
+            request_params.systemPrompt = instruction
+
+        llm = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
+        if llm is not None:
+            default_request_params = getattr(llm, "default_request_params", None)
+            if default_request_params is not None and hasattr(default_request_params, "systemPrompt"):
+                default_request_params.systemPrompt = instruction
+            if hasattr(llm, "instruction"):
+                llm.instruction = instruction
+
+        attach_kwargs = getattr(agent, "_llm_attach_kwargs", None)
+        if isinstance(attach_kwargs, dict):
+            stored_params = attach_kwargs.get("request_params")
+            if stored_params is not None and hasattr(stored_params, "systemPrompt"):
+                stored_params.systemPrompt = instruction
 
     async def apply_prompt(
         self,
