@@ -39,6 +39,14 @@ class MCPServerAuthSettings(BaseModel):
     # Token persistence: use OS keychain via 'keyring' by default; fallback to 'memory'.
     persist: Literal["keyring", "memory"] = "keyring"
 
+    # Optional pre-registered OAuth client credentials (skip dynamic registration).
+    client_id: str | None = None
+    client_secret: str | None = None
+    token_endpoint_auth_method: Literal["none", "client_secret_post", "client_secret_basic"] | None = None
+
+    # Optional URL-based client ID (CIMD) for servers that support it.
+    client_metadata_url: str | None = None
+
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 

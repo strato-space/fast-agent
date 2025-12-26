@@ -52,6 +52,31 @@ class InMemoryTokenStorage(TokenStorage):
         self._client_info = client_info
 
 
+class _PreloadedClientInfoStorage(TokenStorage):
+    """Wrap another TokenStorage and return a preconfigured client_info if provided."""
+
+    def __init__(
+        self, inner: TokenStorage, client_info: OAuthClientInformationFull | None
+    ) -> None:
+        self._inner = inner
+        self._client_info = client_info
+
+    async def get_tokens(self) -> OAuthToken | None:
+        return await self._inner.get_tokens()
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        await self._inner.set_tokens(tokens)
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        if self._client_info is not None:
+            return self._client_info
+        return await self._inner.get_client_info()
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        self._client_info = client_info
+        await self._inner.set_client_info(client_info)
+
+
 @dataclass
 class _CallbackResult:
     authorization_code: str | None = None
@@ -417,6 +442,10 @@ def build_oauth_provider(server_config: MCPServerSettings) -> OAuthClientProvide
     redirect_path = "/callback"
     scope_value: str | None = None
     persist_mode: str = "keyring"
+    client_id: str | None = None
+    client_secret: str | None = None
+    token_auth_method: str | None = None
+    client_metadata_url: str | None = None
 
     if server_config.auth is not None:
         try:
@@ -425,6 +454,12 @@ def build_oauth_provider(server_config: MCPServerSettings) -> OAuthClientProvide
             redirect_path = getattr(server_config.auth, "redirect_path", "/callback")
             scope_field = getattr(server_config.auth, "scope", None)
             persist_mode = getattr(server_config.auth, "persist", "keyring")
+            client_id = getattr(server_config.auth, "client_id", None)
+            client_secret = getattr(server_config.auth, "client_secret", None)
+            token_auth_method = getattr(
+                server_config.auth, "token_endpoint_auth_method", None
+            )
+            client_metadata_url = getattr(server_config.auth, "client_metadata_url", None)
             if isinstance(scope_field, list):
                 scope_value = " ".join(scope_field)
             elif isinstance(scope_field, str):
@@ -448,10 +483,23 @@ def build_oauth_provider(server_config: MCPServerSettings) -> OAuthClientProvide
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
     }
+    if token_auth_method:
+        metadata_kwargs["token_endpoint_auth_method"] = token_auth_method
+    elif client_secret:
+        metadata_kwargs["token_endpoint_auth_method"] = "client_secret_post"
+    elif client_id:
+        metadata_kwargs["token_endpoint_auth_method"] = "none"
     if scope_value:
         metadata_kwargs["scope"] = scope_value
 
     client_metadata = OAuthClientMetadata.model_validate(metadata_kwargs)
+    client_info: OAuthClientInformationFull | None = None
+    if client_id:
+        client_info_kwargs = dict(metadata_kwargs)
+        client_info_kwargs["client_id"] = client_id
+        if client_secret:
+            client_info_kwargs["client_secret"] = client_secret
+        client_info = OAuthClientInformationFull.model_validate(client_info_kwargs)
 
     # Local callback server handler
     async def _redirect_handler(authorization_url: str) -> None:
@@ -497,6 +545,8 @@ def build_oauth_provider(server_config: MCPServerSettings) -> OAuthClientProvide
         storage = KeyringTokenStorage(service_name="fast-agent-mcp", server_identity=identity)
     else:
         storage = InMemoryTokenStorage()
+    if client_info is not None:
+        storage = _PreloadedClientInfoStorage(storage, client_info)
 
     provider = OAuthClientProvider(
         server_url=base_url,
@@ -504,6 +554,7 @@ def build_oauth_provider(server_config: MCPServerSettings) -> OAuthClientProvide
         storage=storage,
         redirect_handler=_redirect_handler,
         callback_handler=_callback_handler,
+        client_metadata_url=client_metadata_url,
     )
 
     return provider
