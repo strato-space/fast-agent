@@ -6,6 +6,13 @@ from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
+from fast_agent.agents.tool_hooks import (
+    ToolCallArgs,
+    ToolCallFn,
+    ToolHookContext,
+    ToolHookFn,
+    run_tool_with_hooks,
+)
 from fast_agent.agents.tool_runner import ToolRunner, ToolRunnerHooks, _ToolLoopAgent
 from fast_agent.constants import (
     FAST_AGENT_ERROR_CHANNEL,
@@ -35,16 +42,22 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
     def __init__(
         self,
         config: AgentConfig,
-        tools: Sequence[FastMCPTool | Callable] = [],
+        tools: Sequence[FastMCPTool | Callable] | None = None,
         context: Context | None = None,
+        tool_runner_hooks: ToolRunnerHooks | None = None,
+        tool_hooks: Sequence[ToolHookFn] | None = None,
     ) -> None:
         super().__init__(config=config, context=context)
+
+        self._local_tools: list[FastMCPTool | Callable] = list(tools) if tools else []
+        self._tool_runner_hooks_value: ToolRunnerHooks | None = tool_runner_hooks
+        self._tool_hooks: list[ToolHookFn] = list(tool_hooks) if tool_hooks else []
 
         self._execution_tools: dict[str, FastMCPTool] = {}
         self._tool_schemas: list[Tool] = []
 
         # Build a working list of tools and auto-inject human-input tool if missing
-        working_tools: list[FastMCPTool | Callable] = list(tools) if tools else []
+        working_tools: list[FastMCPTool | Callable] = list(self._local_tools)
         # Only auto-inject if enabled via AgentConfig
         if self.config.human_input:
             existing_names = {
@@ -103,6 +116,22 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             return self.tool_runner_hooks
         return None
 
+    @property
+    def tool_runner_hooks(self) -> ToolRunnerHooks | None:
+        return self._tool_runner_hooks_value
+
+    @tool_runner_hooks.setter
+    def tool_runner_hooks(self, hooks: ToolRunnerHooks | None) -> None:
+        self._tool_runner_hooks_value = hooks
+
+    @property
+    def tool_hooks(self) -> list[ToolHookFn]:
+        return self._tool_hooks
+
+    @tool_hooks.setter
+    def tool_hooks(self, hooks: Sequence[ToolHookFn] | None) -> None:
+        self._tool_hooks = list(hooks) if hooks else []
+
     async def _tool_runner_llm_step(
         self,
         messages: list[PromptMessageExtended],
@@ -110,6 +139,41 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         tools: list[Tool] | None = None,
     ) -> PromptMessageExtended:
         return await super().generate_impl(messages, request_params=request_params, tools=tools)
+
+    async def _call_tool_with_hooks(
+        self,
+        *,
+        tool_name: str,
+        server_name: str | None,
+        tool_source: str,
+        arguments: ToolCallArgs,
+        original_tool_func: ToolCallFn,
+        tool_use_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> CallToolResult:
+        if not self._tool_hooks:
+            return await original_tool_func(arguments)
+
+        context = ToolHookContext(
+            agent_name=self.name,
+            server_name=server_name,
+            tool_name=tool_name,
+            tool_source=tool_source,
+            tool_use_id=tool_use_id,
+            correlation_id=correlation_id,
+            original_tool_func=original_tool_func,
+        )
+        return await run_tool_with_hooks(self._tool_hooks, context, arguments)
+
+    def _clone_constructor_kwargs(self) -> dict[str, Any]:
+        kwargs = super()._clone_constructor_kwargs()
+        if self._local_tools:
+            kwargs["tools"] = list(self._local_tools)
+        if self._tool_runner_hooks_value is not None:
+            kwargs["tool_runner_hooks"] = self._tool_runner_hooks_value
+        if self._tool_hooks:
+            kwargs["tool_hooks"] = list(self._tool_hooks)
+        return kwargs
 
     # we take care of tool results, so skip displaying them
     def show_user_message(self, message: PromptMessageExtended) -> None:
@@ -169,7 +233,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 correlation_id: str, tool_name: str, tool_args: dict[str, Any]
             ) -> tuple[str, CallToolResult, float]:
                 start_time = time.perf_counter()
-                result = await self.call_tool(tool_name, tool_args)
+                result = await self.call_tool(
+                    tool_name,
+                    tool_args,
+                    tool_use_id=correlation_id,
+                    correlation_id=correlation_id,
+                )
                 end_time = time.perf_counter()
                 return correlation_id, result, round((end_time - start_time) * 1000, 2)
 
@@ -219,7 +288,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
 
             # Track timing for tool execution
             start_time = time.perf_counter()
-            result = await self.call_tool(tool_name, tool_args)
+            result = await self.call_tool(
+                tool_name,
+                tool_args,
+                tool_use_id=correlation_id,
+                correlation_id=correlation_id,
+            )
             end_time = time.perf_counter()
             duration_ms = round((end_time - start_time) * 1000, 2)
 
@@ -292,8 +366,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         """Return available tools for this agent. Overridable by subclasses."""
         return ListToolsResult(tools=list(self._tool_schemas))
 
-    async def call_tool(self, name: str, arguments: Dict[str, Any] | None = None) -> CallToolResult:
-        """Execute a tool by name using local FastMCP tools. Overridable by subclasses."""
+    async def _call_tool_raw(
+        self, name: str, arguments: Dict[str, Any] | None = None
+    ) -> CallToolResult:
+        """Execute a local FastMCP tool without applying tool hooks."""
         fast_tool = self._execution_tools.get(name)
         if not fast_tool:
             logger.warning(f"Unknown tool: {name}")
@@ -314,3 +390,25 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 content=[text_content(f"Error: {str(e)}")],
                 isError=True,
             )
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: Dict[str, Any] | None = None,
+        tool_use_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> CallToolResult:
+        """Execute a tool by name using local FastMCP tools."""
+
+        async def original_tool_func(args: ToolCallArgs) -> CallToolResult:
+            return await self._call_tool_raw(name, args or {})
+
+        return await self._call_tool_with_hooks(
+            tool_name=name,
+            server_name=None,
+            tool_source="function",
+            arguments=arguments,
+            original_tool_func=original_tool_func,
+            tool_use_id=tool_use_id,
+            correlation_id=correlation_id,
+        )

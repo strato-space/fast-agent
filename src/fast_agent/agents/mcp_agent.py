@@ -42,6 +42,7 @@ from fast_agent.core.exceptions import PromptExitError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.mcp.common import (
+    create_namespaced_name,
     get_resource_name,
     get_server_name,
     is_namespaced_name,
@@ -92,10 +93,18 @@ class McpAgent(ABC, ToolAgent):
         context: "Context | None" = None,
         **kwargs,
     ) -> None:
+        tool_agent_kwargs: dict[str, Any] = {}
+        if "tools" in kwargs:
+            tool_agent_kwargs["tools"] = kwargs.pop("tools")
+        if "tool_runner_hooks" in kwargs:
+            tool_agent_kwargs["tool_runner_hooks"] = kwargs.pop("tool_runner_hooks")
+        if "tool_hooks" in kwargs:
+            tool_agent_kwargs["tool_hooks"] = kwargs.pop("tool_hooks")
+
         super().__init__(
             config=config,
             context=context,
-            **kwargs,
+            **tool_agent_kwargs,
         )
 
         # Create aggregator with composition
@@ -514,7 +523,11 @@ class McpAgent(ABC, ToolAgent):
         )
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None = None, tool_use_id: str | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        tool_use_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> CallToolResult:
         """
         Call a tool by name with the given arguments.
@@ -530,36 +543,129 @@ class McpAgent(ABC, ToolAgent):
         # Check external runtime first (e.g., ACP terminal)
         if self._external_runtime and hasattr(self._external_runtime, "tool"):
             if self._external_runtime.tool and name == self._external_runtime.tool.name:
-                return await self._external_runtime.execute(arguments, tool_use_id)
+
+                async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                    return await self._external_runtime.execute(args, tool_use_id)
+
+                return await self._call_tool_with_hooks(
+                    tool_name=name,
+                    server_name="external",
+                    tool_source="runtime",
+                    arguments=arguments,
+                    original_tool_func=original_tool_func,
+                    tool_use_id=tool_use_id,
+                    correlation_id=correlation_id,
+                )
 
         # Check filesystem runtime (e.g., ACP filesystem)
         if self._filesystem_runtime and hasattr(self._filesystem_runtime, "tools"):
             for tool in self._filesystem_runtime.tools:
                 if tool.name == name:
-                    # Route to the appropriate method based on tool name
-                    if name == "read_text_file":
-                        return await self._filesystem_runtime.read_text_file(arguments, tool_use_id)
-                    elif name == "write_text_file":
-                        return await self._filesystem_runtime.write_text_file(
-                            arguments, tool_use_id
+
+                    async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                        if name == "read_text_file":
+                            return await self._filesystem_runtime.read_text_file(args, tool_use_id)
+                        if name == "write_text_file":
+                            return await self._filesystem_runtime.write_text_file(args, tool_use_id)
+                        return CallToolResult(
+                            isError=True,
+                            content=[
+                                TextContent(type="text", text=f"Unknown filesystem tool: {name}")
+                            ],
                         )
+
+                    return await self._call_tool_with_hooks(
+                        tool_name=name,
+                        server_name="filesystem",
+                        tool_source="runtime",
+                        arguments=arguments,
+                        original_tool_func=original_tool_func,
+                        tool_use_id=tool_use_id,
+                        correlation_id=correlation_id,
+                    )
 
         # Check skill reader (non-ACP context with skills)
         if self._skill_reader and name == "read_skill":
-            return await self._skill_reader.execute(arguments)
+
+            async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                return await self._skill_reader.execute(args)
+
+            return await self._call_tool_with_hooks(
+                tool_name=name,
+                server_name="skills",
+                tool_source="runtime",
+                arguments=arguments,
+                original_tool_func=original_tool_func,
+                tool_use_id=tool_use_id,
+                correlation_id=correlation_id,
+            )
 
         # Fall back to shell runtime
         if self._shell_runtime.tool and name == self._shell_runtime.tool.name:
-            return await self._shell_runtime.execute(arguments)
+
+            async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                return await self._shell_runtime.execute(args)
+
+            return await self._call_tool_with_hooks(
+                tool_name=name,
+                server_name="shell",
+                tool_source="runtime",
+                arguments=arguments,
+                original_tool_func=original_tool_func,
+                tool_use_id=tool_use_id,
+                correlation_id=correlation_id,
+            )
 
         if name == HUMAN_INPUT_TOOL_NAME:
             # Call the elicitation-backed human input tool
-            return await self._call_human_input_tool(arguments)
+
+            async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                return await self._call_human_input_tool(args)
+
+            return await self._call_tool_with_hooks(
+                tool_name=name,
+                server_name="human_input",
+                tool_source="runtime",
+                arguments=arguments,
+                original_tool_func=original_tool_func,
+                tool_use_id=tool_use_id,
+                correlation_id=correlation_id,
+            )
 
         if name in self._execution_tools:
-            return await super().call_tool(name, arguments)
+            return await super().call_tool(
+                name,
+                arguments,
+                tool_use_id=tool_use_id,
+                correlation_id=correlation_id,
+            )
+
+        async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+            return await self._aggregator.call_tool(name, args, tool_use_id)
+
+        tool_name = name
+        server_name = None
+        if is_namespaced_name(name):
+            server_name = get_server_name(name)
         else:
-            return await self._aggregator.call_tool(name, arguments, tool_use_id)
+            try:
+                server_name, local_name = await self._aggregator._parse_resource_name(
+                    name, "tool"
+                )
+                if server_name:
+                    tool_name = create_namespaced_name(server_name, local_name)
+            except Exception:
+                server_name = None
+
+        return await self._call_tool_with_hooks(
+            tool_name=tool_name,
+            server_name=server_name,
+            tool_source="mcp",
+            arguments=arguments,
+            original_tool_func=original_tool_func,
+            tool_use_id=tool_use_id,
+            correlation_id=correlation_id,
+        )
 
     async def _call_human_input_tool(
         self, arguments: dict[str, Any] | None = None
@@ -946,7 +1052,10 @@ class McpAgent(ABC, ToolAgent):
             async def run_one(call: dict[str, Any]) -> tuple[str, CallToolResult, float]:
                 start_time = time.perf_counter()
                 result = await self.call_tool(
-                    call["tool_name"], call["tool_args"], call["correlation_id"]
+                    call["tool_name"],
+                    call["tool_args"],
+                    tool_use_id=call["correlation_id"],
+                    correlation_id=call["correlation_id"],
                 )
                 end_time = time.perf_counter()
                 return call["correlation_id"], result, round((end_time - start_time) * 1000, 2)
@@ -1009,7 +1118,12 @@ class McpAgent(ABC, ToolAgent):
 
             try:
                 start_time = time.perf_counter()
-                result = await self.call_tool(tool_name, tool_args, correlation_id)
+                result = await self.call_tool(
+                    tool_name,
+                    tool_args,
+                    tool_use_id=correlation_id,
+                    correlation_id=correlation_id,
+                )
                 end_time = time.perf_counter()
                 duration_ms = round((end_time - start_time) * 1000, 2)
 

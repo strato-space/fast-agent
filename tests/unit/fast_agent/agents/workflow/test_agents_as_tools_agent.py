@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from mcp import CallToolRequest, Tool
-from mcp.types import CallToolRequestParams
+from mcp.types import CallToolRequestParams, CallToolResult
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
@@ -11,6 +11,7 @@ from fast_agent.agents.workflow.agents_as_tools_agent import (
     AgentsAsToolsAgent,
     AgentsAsToolsOptions,
 )
+from fast_agent.agents.tool_hooks import ToolHookContext
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.types import PromptMessageExtended
@@ -45,6 +46,16 @@ class ErrorChannelChild(FakeChildAgent):
             content=[],
             channels={FAST_AGENT_ERROR_CHANNEL: [text_content("err-block")]},
         )
+
+
+class CountingChildAgent(FakeChildAgent):
+    def __init__(self, name: str, response_text: str = "ok", delay: float = 0):
+        super().__init__(name, response_text=response_text, delay=delay)
+        self.calls = 0
+
+    async def generate(self, messages, request_params=None):
+        self.calls += 1
+        return await super().generate(messages, request_params=request_params)
 
 
 class StubNestedAgentsAsTools(AgentsAsToolsAgent):
@@ -148,3 +159,28 @@ async def test_nested_agents_as_tools_preserves_instance_labels():
     assert not result.isError
     # Reply should include the instance-suffixed nested agent name.
     assert any("nested[1]-reply" in (block.text or "") for block in result.content)
+
+
+@pytest.mark.asyncio
+async def test_tool_hooks_apply_to_agent_tools():
+    child = CountingChildAgent("child", response_text="child-ok")
+    agent = AgentsAsToolsAgent(AgentConfig("parent"), [child])
+    await agent.initialize()
+
+    async def hook(ctx: ToolHookContext, args, call_next):
+        if ctx.tool_source == "agent":
+            return CallToolResult(content=[text_content("blocked")], isError=True)
+        return await call_next(args)
+
+    agent.tool_hooks = [hook]
+
+    tool_calls = {
+        "1": CallToolRequest(params=CallToolRequestParams(name="agent__child", arguments={"text": "hi"})),
+    }
+    request = PromptMessageExtended(role="assistant", content=[], tool_calls=tool_calls)
+
+    result_message = await agent.run_tools(request)
+    result = result_message.tool_results["1"]
+
+    assert result.isError
+    assert child.calls == 0

@@ -13,13 +13,17 @@ from typing import (
     Literal,
     ParamSpec,
     Protocol,
+    Sequence,
     TypeVar,
 )
 
+from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
 from mcp.client.session import ElicitationFnT
 from pydantic import AnyUrl
 
 from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.agents.tool_hooks import ToolHookFn
+from fast_agent.agents.tool_runner import ToolRunnerHooks
 from fast_agent.agents.workflow.iterative_planner import ITERATIVE_PLAN_SYSTEM_PROMPT_TEMPLATE
 from fast_agent.agents.workflow.router_agent import (
     ROUTING_SYSTEM_INSTRUCTION,
@@ -273,6 +277,9 @@ def agent(
     agents: list[str] | None = None,
     servers: list[str] = [],
     tools: dict[str, list[str]] | None = None,
+    function_tools: Sequence[FastMCPTool | Callable] | None = None,
+    tool_runner_hooks: ToolRunnerHooks | None = None,
+    tool_hooks: Sequence[ToolHookFn] | None = None,
     resources: dict[str, list[str]] | None = None,
     prompts: dict[str, list[str]] | None = None,
     skills: SkillManifest
@@ -301,7 +308,10 @@ def agent(
         instruction_or_kwarg: Optional positional parameter for instruction
         instruction: Base instruction for the agent (keyword arg)
         servers: List of server names the agent should connect to
-        tools: Optional list of tool names or patterns to include
+        tools: Optional list of MCP tool names or patterns to include
+        function_tools: Optional local function tools to register on the agent
+        tool_runner_hooks: Optional ToolRunner hooks to wrap the tool loop
+        tool_hooks: Optional middleware hooks for tool execution
         resources: Optional list of resource names or patterns to include
         prompts: Optional list of prompt names or patterns to include
         model: Model specification string
@@ -334,6 +344,9 @@ def agent(
         default=default,
         elicitation_handler=elicitation_handler,
         tools=tools,
+        function_tools=function_tools,
+        tool_runner_hooks=tool_runner_hooks,
+        tool_hooks=tool_hooks,
         resources=resources,
         prompts=prompts,
         skills=skills,
@@ -356,6 +369,9 @@ def custom(
     instruction: str | Path | AnyUrl = "You are a helpful agent.",
     servers: list[str] = [],
     tools: dict[str, list[str]] | None = None,
+    function_tools: Sequence[FastMCPTool | Callable] | None = None,
+    tool_runner_hooks: ToolRunnerHooks | None = None,
+    tool_hooks: Sequence[ToolHookFn] | None = None,
     resources: dict[str, list[str]] | None = None,
     prompts: dict[str, list[str]] | None = None,
     skills: SkillManifest
@@ -380,6 +396,10 @@ def custom(
         instruction_or_kwarg: Optional positional parameter for instruction
         instruction: Base instruction for the agent (keyword arg)
         servers: List of server names the agent should connect to
+        tools: Optional list of MCP tool names or patterns to include
+        function_tools: Optional local function tools to register on the agent
+        tool_runner_hooks: Optional ToolRunner hooks to wrap the tool loop
+        tool_hooks: Optional middleware hooks for tool execution
         model: Model specification string
         use_history: Whether to maintain conversation history
         request_params: Additional request parameters for the LLM
@@ -409,6 +429,9 @@ def custom(
         elicitation_handler=elicitation_handler,
         api_key=api_key,
         tools=tools,
+        function_tools=function_tools,
+        tool_runner_hooks=tool_runner_hooks,
+        tool_hooks=tool_hooks,
         resources=resources,
         prompts=prompts,
         skills=skills,

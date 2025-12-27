@@ -123,6 +123,28 @@ The Agent can then be run with `uv run sizer.py`.
 
 Specify a model with the `--model` switch - for example `uv run sizer.py --model sonnet`.
 
+### Function tools and hooks
+
+You can register local Python tools and tool runner hooks directly on any standard agent:
+
+```python
+def add_one(x: int) -> int:
+    return x + 1
+
+async def audit_hook(ctx, args, call_next):
+    # mutate args, enforce limits, or short-circuit
+    result = await call_next(args)
+    return result
+
+@fast.agent(
+    name="assistant",
+    function_tools=[add_one],
+    tool_hooks=[audit_hook],
+)
+```
+
+`tools={...}` remains reserved for MCP tool filtering; use `function_tools` for local callables. `tool_hooks` is experimental; use `ToolRunnerHooks` when you need before/after LLM-step hooks instead of tool execution middleware.
+
 ### Combining Agents and using MCP Servers
 
 _To generate examples use `fast-agent quickstart workflow`. This example can be run with `uv run workflow/chaining.py`. fast-agent looks for configuration files in the current directory before checking parent directories recursively._

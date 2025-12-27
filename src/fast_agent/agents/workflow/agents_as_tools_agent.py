@@ -458,6 +458,7 @@ class AgentsAsToolsAgent(McpAgent):
         name: str,
         arguments: dict[str, Any] | None = None,
         tool_use_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> CallToolResult:
         """Route tool execution to child agents first, then MCP/local tools.
 
@@ -469,9 +470,26 @@ class AgentsAsToolsAgent(McpAgent):
         if child is not None:
             # Child agents don't currently use tool_use_id, they operate via
             # a plain PromptMessageExtended tool call.
-            return await self._invoke_child_agent(child, arguments)
 
-        return await super().call_tool(name, arguments, tool_use_id)
+            async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
+                return await self._invoke_child_agent(child, args)
+
+            return await self._call_tool_with_hooks(
+                tool_name=name,
+                server_name="agent",
+                tool_source="agent",
+                arguments=arguments,
+                original_tool_func=original_tool_func,
+                tool_use_id=tool_use_id,
+                correlation_id=correlation_id,
+            )
+
+        return await super().call_tool(
+            name,
+            arguments,
+            tool_use_id=tool_use_id,
+            correlation_id=correlation_id,
+        )
 
     def _show_parallel_tool_calls(self, descriptors: list[dict[str, Any]]) -> None:
         """Display tool call headers for parallel agent execution.
@@ -701,100 +719,113 @@ class AgentsAsToolsAgent(McpAgent):
             base_name = getattr(child, "_name", child.name)
             instance_name = f"{base_name}[{instance}]"
 
-            try:
-                clone = await child.spawn_detached_instance(name=instance_name)
-            except Exception as exc:
-                logger.error(
-                    "Failed to spawn dedicated child instance",
-                    data={
-                        "tool_name": tool_name,
-                        "agent_name": base_name,
-                        "error": str(exc),
-                    },
-                )
-                return CallToolResult(content=[text_content(f"Spawn failed: {exc}")], isError=True)
-
-            # Prepare history according to mode
-            history_mode = self._options.history_mode
-            base_history = child.message_history
-            fork_index = len(base_history)
-            try:
-                if history_mode == HistoryMode.SCRATCH:
-                    clone.load_message_history([])
-                    fork_index = 0
-                else:
-                    clone.load_message_history(base_history)
-            except Exception as hist_exc:
-                logger.warning(
-                    "Failed to load history into clone",
-                    data={"instance_name": instance_name, "error": str(hist_exc)},
-                )
-
-            progress_started = False
-            try:
-                outer_progress_display.update(
-                    ProgressEvent(
-                        action=ProgressAction.CHATTING,
-                        target=instance_name,
-                        details="",
-                        agent_name=instance_name,
-                        correlation_id=correlation_id,
-                        instance_name=instance_name,
-                        tool_name=tool_name,
-                    )
-                )
-                progress_started = True
-                call_coro = self._invoke_child_agent(clone, tool_args)
-                timeout = self._options.child_timeout_sec
-                if timeout:
-                    return await asyncio.wait_for(call_coro, timeout=timeout)
-                return await call_coro
-            finally:
+            async def original_tool_func(args: dict[str, Any] | None) -> CallToolResult:
                 try:
-                    await clone.shutdown()
-                except Exception as shutdown_exc:
-                    logger.warning(
-                        "Error shutting down dedicated child instance",
+                    clone = await child.spawn_detached_instance(name=instance_name)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to spawn dedicated child instance",
                         data={
-                            "instance_name": instance_name,
-                            "error": str(shutdown_exc),
+                            "tool_name": tool_name,
+                            "agent_name": base_name,
+                            "error": str(exc),
                         },
                     )
-                try:
-                    child.merge_usage_from(clone)
-                except Exception as merge_exc:
-                    logger.warning(
-                        "Failed to merge usage from child instance",
-                        data={
-                            "instance_name": instance_name,
-                            "error": str(merge_exc),
-                        },
+                    return CallToolResult(
+                        content=[text_content(f"Spawn failed: {exc}")], isError=True
                     )
-                if history_mode == HistoryMode.FORK_AND_MERGE:
-                    try:
-                        await self._merge_child_history(
-                            target=child, clone=clone, start_index=fork_index
-                        )
-                    except Exception as merge_hist_exc:
-                        logger.warning(
-                            "Failed to merge child history",
-                            data={
-                                "instance_name": instance_name,
-                                "error": str(merge_hist_exc),
-                            },
-                        )
-                if progress_started and instance_name:
+
+                # Prepare history according to mode
+                history_mode = self._options.history_mode
+                base_history = child.message_history
+                fork_index = len(base_history)
+                try:
+                    if history_mode == HistoryMode.SCRATCH:
+                        clone.load_message_history([])
+                        fork_index = 0
+                    else:
+                        clone.load_message_history(base_history)
+                except Exception as hist_exc:
+                    logger.warning(
+                        "Failed to load history into clone",
+                        data={"instance_name": instance_name, "error": str(hist_exc)},
+                    )
+
+                progress_started = False
+                try:
                     outer_progress_display.update(
                         ProgressEvent(
-                            action=ProgressAction.FINISHED,
+                            action=ProgressAction.CHATTING,
                             target=instance_name,
-                            details="Completed",
+                            details="",
                             agent_name=instance_name,
                             correlation_id=correlation_id,
                             instance_name=instance_name,
                             tool_name=tool_name,
                         )
                     )
+                    progress_started = True
+                    call_coro = self._invoke_child_agent(clone, args)
+                    timeout = self._options.child_timeout_sec
+                    if timeout:
+                        return await asyncio.wait_for(call_coro, timeout=timeout)
+                    return await call_coro
+                finally:
+                    try:
+                        await clone.shutdown()
+                    except Exception as shutdown_exc:
+                        logger.warning(
+                            "Error shutting down dedicated child instance",
+                            data={
+                                "instance_name": instance_name,
+                                "error": str(shutdown_exc),
+                            },
+                        )
+                    try:
+                        child.merge_usage_from(clone)
+                    except Exception as merge_exc:
+                        logger.warning(
+                            "Failed to merge usage from child instance",
+                            data={
+                                "instance_name": instance_name,
+                                "error": str(merge_exc),
+                            },
+                        )
+                    if history_mode == HistoryMode.FORK_AND_MERGE:
+                        try:
+                            await self._merge_child_history(
+                                target=child, clone=clone, start_index=fork_index
+                            )
+                        except Exception as merge_hist_exc:
+                            logger.warning(
+                                "Failed to merge child history",
+                                data={
+                                    "instance_name": instance_name,
+                                    "error": str(merge_hist_exc),
+                                },
+                            )
+                    if progress_started and instance_name:
+                        outer_progress_display.update(
+                            ProgressEvent(
+                                action=ProgressAction.FINISHED,
+                                target=instance_name,
+                                details="Completed",
+                                agent_name=instance_name,
+                                correlation_id=correlation_id,
+                                instance_name=instance_name,
+                                tool_name=tool_name,
+                            )
+                        )
+
+            return await self._call_tool_with_hooks(
+                tool_name=tool_name,
+                server_name="agent",
+                tool_source="agent",
+                arguments=tool_args,
+                original_tool_func=original_tool_func,
+                tool_use_id=correlation_id,
+                correlation_id=correlation_id,
+            )
 
         self._show_parallel_tool_calls(call_descriptors)
 

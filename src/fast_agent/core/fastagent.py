@@ -353,6 +353,10 @@ class FastAgent:
         from collections.abc import Coroutine
         from pathlib import Path
 
+        from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
+
+        from fast_agent.agents.tool_hooks import ToolHookFn
+        from fast_agent.agents.tool_runner import ToolRunnerHooks
         from fast_agent.skills import SkillManifest, SkillRegistry
         from fast_agent.types import RequestParams
 
@@ -368,6 +372,9 @@ class FastAgent:
             agents: list[str] | None = None,
             servers: list[str] = [],
             tools: dict[str, list[str]] | None = None,
+            function_tools: Sequence[FastMCPTool | Callable] | None = None,
+            tool_runner_hooks: ToolRunnerHooks | None = None,
+            tool_hooks: Sequence[ToolHookFn] | None = None,
             resources: dict[str, list[str]] | None = None,
             prompts: dict[str, list[str]] | None = None,
             skills: SkillManifest
@@ -400,6 +407,9 @@ class FastAgent:
             instruction: str | Path | AnyUrl = "You are a helpful agent.",
             servers: list[str] = [],
             tools: dict[str, list[str]] | None = None,
+            function_tools: Sequence[FastMCPTool | Callable] | None = None,
+            tool_runner_hooks: ToolRunnerHooks | None = None,
+            tool_hooks: Sequence[ToolHookFn] | None = None,
             resources: dict[str, list[str]] | None = None,
             prompts: dict[str, list[str]] | None = None,
             skills: SkillManifest

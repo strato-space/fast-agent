@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from fast_agent.acp.acp_aware_mixin import ACPCommand, ACPModeInfo
     from fast_agent.acp.acp_context import ACPContext
     from fast_agent.agents.agent_types import AgentConfig, AgentType
+    from fast_agent.agents.tool_hooks import ToolHookFn
     from fast_agent.agents.tool_runner import ToolRunnerHooks
     from fast_agent.context import Context
     from fast_agent.llm.model_info import ModelInfo
@@ -43,6 +44,7 @@ __all__ = [
     "LlmAgentProtocol",
     "AgentProtocol",
     "ToolRunnerHookCapable",
+    "ToolHookCapable",
     "ACPAwareProtocol",
     "LLMFactoryProtocol",
     "ModelFactoryFunctionProtocol",
@@ -273,6 +275,20 @@ class ToolRunnerHookCapable(Protocol):
 
     @property
     def tool_runner_hooks(self) -> "ToolRunnerHooks | None": ...
+
+    @tool_runner_hooks.setter
+    def tool_runner_hooks(self, hooks: "ToolRunnerHooks | None") -> None: ...
+
+
+@runtime_checkable
+class ToolHookCapable(Protocol):
+    """Optional capability for agents to expose declarative tool hooks."""
+
+    @property
+    def tool_hooks(self) -> list["ToolHookFn"]: ...
+
+    @tool_hooks.setter
+    def tool_hooks(self, hooks: list["ToolHookFn"] | None) -> None: ...
 
 
 @runtime_checkable

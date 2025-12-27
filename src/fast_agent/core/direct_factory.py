@@ -7,7 +7,7 @@ import os
 from functools import partial
 from typing import Any, Protocol, TypeVar, cast
 
-from fast_agent.agents import McpAgent
+from fast_agent.agents import McpAgent, ToolAgent
 from fast_agent.agents.agent_types import AgentConfig, AgentType
 from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.agents.workflow.evaluator_optimizer import (
@@ -26,6 +26,8 @@ from fast_agent.interfaces import (
     AgentProtocol,
     LLMFactoryProtocol,
     ModelFactoryFunctionProtocol,
+    ToolHookCapable,
+    ToolRunnerHookCapable,
 )
 from fast_agent.llm.model_factory import ModelFactory
 from fast_agent.mcp.ui_agent import McpAgentWithUI
@@ -44,6 +46,7 @@ def _create_agent_with_ui_if_needed(
     agent_class: type,
     config: Any,
     context: Any,
+    **kwargs: Any,
 ) -> Any:
     """
     Create an agent with UI support if MCP UI mode is enabled.
@@ -62,10 +65,36 @@ def _create_agent_with_ui_if_needed(
 
     if ui_mode != "disabled" and agent_class == McpAgent:
         # Use the UI-enhanced agent class instead of the base class
-        return McpAgentWithUI(config=config, context=context, ui_mode=ui_mode)
+        return McpAgentWithUI(config=config, context=context, ui_mode=ui_mode, **kwargs)
     else:
         # Create the original agent instance
-        return agent_class(config=config, context=context)
+        return agent_class(config=config, context=context, **kwargs)
+
+
+def _apply_tool_runner_hooks(agent: AgentProtocol, hooks: Any | None) -> None:
+    if hooks is None:
+        return
+    if isinstance(agent, ToolRunnerHookCapable):
+        try:
+            setattr(agent, "tool_runner_hooks", hooks)
+        except Exception as exc:
+            logger.warning(
+                "Failed to attach tool runner hooks",
+                data={"agent_name": getattr(agent, "name", None), "error": str(exc)},
+            )
+
+
+def _apply_tool_hooks(agent: AgentProtocol, hooks: Any | None) -> None:
+    if hooks is None:
+        return
+    if isinstance(agent, ToolHookCapable):
+        try:
+            agent.tool_hooks = hooks
+        except Exception as exc:
+            logger.warning(
+                "Failed to attach tool hooks",
+                data={"agent_name": getattr(agent, "name", None), "error": str(exc)},
+            )
 
 
 class AgentCreatorProtocol(Protocol):
@@ -208,6 +237,13 @@ async def create_agents_by_type(
             # Type-specific initialization based on the Enum type
             # Note: Above we compared string values from config, here we compare Enum objects directly
             if agent_type == AgentType.BASIC:
+                function_tools = agent_data.get("function_tools")
+                tool_runner_hooks = agent_data.get("tool_runner_hooks")
+                tool_hooks = agent_data.get("tool_hooks")
+                agent_kwargs: dict[str, Any] = {}
+                if function_tools is not None:
+                    agent_kwargs["tools"] = function_tools
+
                 # If BASIC agent declares child_agents, build an Agents-as-Tools wrapper
                 child_names = agent_data.get("child_agents", []) or []
                 if child_names:
@@ -232,6 +268,7 @@ async def create_agents_by_type(
                         context=app_instance.context,
                         agents=cast("list[LlmAgent]", child_agents),  # expose children as tools
                         options=options,
+                        **agent_kwargs,
                     )
 
                     await agent.initialize()
@@ -243,6 +280,8 @@ async def create_agents_by_type(
                         request_params=config.default_request_params,
                         api_key=config.api_key,
                     )
+                    _apply_tool_runner_hooks(agent, tool_runner_hooks)
+                    _apply_tool_hooks(agent, tool_hooks)
                     result_agents[name] = agent
 
                     # Log successful agent creation
@@ -260,6 +299,7 @@ async def create_agents_by_type(
                         McpAgent,
                         config,
                         app_instance.context,
+                        **agent_kwargs,
                     )
 
                     await agent.initialize()
@@ -271,6 +311,8 @@ async def create_agents_by_type(
                         request_params=config.default_request_params,
                         api_key=config.api_key,
                     )
+                    _apply_tool_runner_hooks(agent, tool_runner_hooks)
+                    _apply_tool_hooks(agent, tool_hooks)
                     result_agents[name] = agent
 
                     # Log successful agent creation
@@ -291,11 +333,17 @@ async def create_agents_by_type(
                         f"Custom agent '{name}' missing class reference ('agent_class' or 'cls')"
                     )
 
+                custom_kwargs: dict[str, Any] = {}
+                function_tools = agent_data.get("function_tools")
+                if function_tools is not None and issubclass(cls, ToolAgent):
+                    custom_kwargs["tools"] = function_tools
+
                 # Create agent with UI support if needed
                 agent = _create_agent_with_ui_if_needed(
                     cls,
                     config,
                     app_instance.context,
+                    **custom_kwargs,
                 )
 
                 await agent.initialize()
@@ -306,6 +354,8 @@ async def create_agents_by_type(
                     request_params=config.default_request_params,
                     api_key=config.api_key,
                 )
+                _apply_tool_runner_hooks(agent, agent_data.get("tool_runner_hooks"))
+                _apply_tool_hooks(agent, agent_data.get("tool_hooks"))
                 result_agents[name] = agent
 
                 # Log successful agent creation
