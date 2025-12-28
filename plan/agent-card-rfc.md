@@ -198,5 +198,9 @@ Expose loader utilities via internal MCP tools, including update by name:
 - CLI `--prompt-file` loads a prompt file and calls `agent.generate(...)`.
   - Source: `src/fast_agent/cli/commands/go.py`
 
+## Open Question
+- How should AgentCard reference Python callables for `function_tools` and
+  `tool_hooks`? This is still unresolved; likely follow SKILL.md semantics.
+
 ## Appendix: AgentCard Samples
 See `plan/agent-card-rfc-sample.md`.
