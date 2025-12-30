@@ -1,6 +1,6 @@
 # AgentCard RFC Samples (MD)
 
-Note: samples mirror README.md code blocks in order. Each block is a full markdown file; the multi-card example at the end shows multiple cards in one file. Agent cards use YAML frontmatter and body for instruction/history; non-card snippets (CLI/config/usage) are included as plain markdown file content.
+Note: samples mirror README.md code blocks in order. Each block is a full markdown file. Some samples group multiple cards for brevity; in practice, each card lives in its own file (one card per file by default). Non-card snippets (CLI/config/usage) are included as plain markdown file content.
 
 ## Sample 1: Quickstart commands
 ```md
@@ -29,12 +29,9 @@ instruction: "Given an object, respond only with an estimate of its size."
 ---
 type: agent
 name: sizer
+instruction: "Given an object, respond only with an estimate of its size."
+messages: ./history.md
 ---
----SYSTEM
-Given an object, respond only with an estimate of its size.
-
----USER
-the moon
 ```
 
 ## Sample 4: Interactive chat (no preloaded messages)
@@ -70,6 +67,7 @@ instruction: "Use local tools when needed and return concise results."
 ```
 
 ## Sample 7: Combining agents and a chain
+Card: url_fetcher
 ```md
 ---
 type: agent
@@ -78,14 +76,18 @@ servers:
   - fetch
 instruction: "Given a URL, provide a complete and comprehensive summary."
 ---
+```
+Card: social_media
+```md
 ---
 type: agent
 name: social_media
 ---
 Write a 280 character social media post for any given text.
 Respond only with the post, never use hashtags.
-
----
+```
+Card: post_writer
+```md
 type: chain
 name: post_writer
 sequence:
@@ -93,8 +95,6 @@ sequence:
   - social_media
 instruction: "Generate a short social media post from a URL summary."
 ---
----USER
-http://llmindset.co.uk
 ```
 
 ## Sample 8: Run a chain from the CLI
@@ -103,12 +103,16 @@ uv run workflow/chaining.py --agent post_writer --message "<url>"
 ```
 
 ## Sample 9: MAKER workflow
+Card: classifier
 ```md
 ---
 type: agent
 name: classifier
 instruction: "Reply with only: A, B, or C."
 ---
+```
+Card: reliable_classifier
+```md
 ---
 type: MAKER
 name: reliable_classifier
@@ -119,28 +123,35 @@ match_strategy: normalized
 red_flag_max_length: 16
 instruction: "Repeat the worker and return the k-vote winner."
 ---
----USER
-Classify: ...
 ```
 
 ## Sample 10: Agents as tools (orchestrator-workers)
+Card: NY-Project-Manager
 ```md
 ---
 type: agent
 name: NY-Project-Manager
 servers:
-  - time:
-      tools: [get_time]
+  - time
+tools:
+  time: [get_time]
 instruction: "Return NY time + timezone, plus a one-line project status."
 ---
+```
+Card: London-Project-Manager
+```md
 ---
 type: agent
 name: London-Project-Manager
 servers:
-  - time:
-      tools: [get_time]
+  - time
+tools:
+  time: [get_time]
 instruction: "Return London time + timezone, plus a one-line news update."
 ---
+```
+Card: PMO-orchestrator
+```md
 ---
 type: agent
 name: PMO-orchestrator
@@ -150,8 +161,6 @@ agents:
   - London-Project-Manager
 instruction: "Get reports. Always use one tool call per project/news. Responsibilities: NY projects: [OpenAI, Fast-Agent, Anthropic]. London news: [Economics, Art, Culture]. Aggregate results and add a one-line PMO summary."
 ---
----USER
-Get PMO report. Projects: all. News: Art, Culture
 ```
 
 ## Sample 11: MCP OAuth minimal config
@@ -200,27 +209,35 @@ name: assistant
 human_input: true
 instruction: "An AI agent that assists with basic tasks. Request Human Input when needed."
 ---
----USER
-print the next number in the sequence
 ```
 
 ## Sample 15: Parallel workflow + chain
+Card: translate_fr
 ```md
 ---
 type: agent
 name: translate_fr
 instruction: "Translate the text to French."
 ---
+```
+Card: translate_de
+```md
 ---
 type: agent
 name: translate_de
 instruction: "Translate the text to German."
 ---
+```
+Card: translate_es
+```md
 ---
 type: agent
 name: translate_es
 instruction: "Translate the text to Spanish."
 ---
+```
+Card: translate (parallel)
+```md
 ---
 type: parallel
 name: translate
@@ -230,6 +247,9 @@ fan_out:
   - translate_es
 instruction: "Translate input text to multiple languages and return the combined results."
 ---
+```
+Card: post_writer (chain)
+```md
 ---
 type: chain
 name: post_writer
@@ -252,8 +272,6 @@ min_rating: EXCELLENT
 max_refinements: 3
 instruction: "Iterate until the evaluator approves the research output."
 ---
----USER
-produce a report on how to make the perfect espresso
 ```
 
 ## Sample 17: Router
@@ -283,18 +301,24 @@ instruction: "Plan work across agents and aggregate the results."
 ```
 
 ## Sample 19: Calling agents (usage patterns)
-`````md
+Card: default
+```md
 ---
 type: agent
 name: default
 default: true
 instruction: "You are a helpful agent."
 ---
+```
+Card: greeter
+```md
 ---
 type: agent
 name: greeter
 instruction: "Respond cheerfully!"
 ---
+```
+Usage:
 ```python
 moon_size = await agent("the moon")
 result = await agent.greeter("Good morning!")
@@ -304,7 +328,6 @@ await agent.greeter.prompt()
 await agent.greeter.prompt(default_prompt="OK")
 agent["greeter"].send("Good Evening!")
 ```
-`````
 
 ## Sample 20: Basic agent definition (full params)
 ```md
@@ -427,7 +450,6 @@ instruction: "instruction"
 ```
 
 ## Sample 28: with_resource usage
-``````md
 ```python
 summary: str = await agent.with_resource(
     "Summarise this PDF please",
@@ -435,7 +457,6 @@ summary: str = await agent.with_resource(
     "resource://fast-agent/sample.pdf",
 )
 ```
-``````
 
 ## Sample 29: Sampling config
 ```md
@@ -448,21 +469,7 @@ mcp:
         model: "haiku"
 ```
 
-## Sample 30: Multi-agent single file (md)
-```md
----
-type: agent
-name: agent-name
-instruction: "You are a helpful assistant."
----
----
-type: agent
-name: agent-name2
-instruction: "You are a helpful assistant #2."
----
-```
-
-## Sample 31: Name defaults to filename (single card)
+## Sample 30: Name defaults to filename (single card)
 ```md
 ---
 type: agent
