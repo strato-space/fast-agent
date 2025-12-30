@@ -130,6 +130,8 @@ Why:
 1) Decorator/API
 - Add `function_tools` and `tool_hooks` to `@fast.agent` and `@fast.custom`.
 - Store on agent registry and pass through factory/constructor.
+- For `@fast.custom`, `function_tools` / `tool_hooks` only apply if the custom class
+  implements `ToolHookCapable` or subclasses `ToolAgent`; otherwise they are ignored.
 
 2) Execution wiring
 - Build a `ToolHookChain` around each tool call in the tool runner loop.
@@ -142,8 +144,8 @@ Why:
 - Agents-as-tools wrap child agent call (detached instance).
 - Built-ins (shell/filesystem/human-input/skills) go through the same hook chain.
 
-4) Experimental flag
-- Gate behind config or a visible "experimental" note in docs.
+4) Experimental note
+- Keep docs labeled experimental; no config gate required.
 
 ## Examples (new, declarative)
 
@@ -190,3 +192,7 @@ async def timeout_hook(ctx, args, call_next):
 - Agents-as-tools: `examples/workflows/agents_as_tools_simple.py` and `examples/workflows/agents_as_tools_extended.py`
 
 These should be referenced from the new declarative examples to show the evolution from current patterns.
+
+## Still Missing in This Spec
+- Explicit test plan / coverage checklist for tool hook middleware behavior.
+- Detailed failure-mode guidance (e.g., hook exceptions, timeouts, cancellation).
