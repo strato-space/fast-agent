@@ -88,6 +88,7 @@ Respond only with the post, never use hashtags.
 ```
 Card: post_writer
 ```md
+---
 type: chain
 name: post_writer
 sequence:

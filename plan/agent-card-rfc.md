@@ -84,6 +84,78 @@ Given an object, respond only with an estimate of its size.
 
 ---
 
+## 1:1 Card ↔ Decorator Mapping (Strict Validator)
+Use this mapping to validate allowed fields for each `type`. Fields not listed for a
+type are invalid. Card-only fields (`schema_version`, `messages`) are listed explicitly.
+
+Code-only decorator args that are **not** representable in AgentCard:
+- `instruction_or_kwarg` (positional instruction)
+- `elicitation_handler` (callable)
+- `tool_runner_hooks` (hook object)
+
+### type: `agent` (maps to `@fast.agent`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `agents` (agents-as-tools)
+- `servers`, `tools`, `resources`, `prompts`, `skills`
+- `model`, `use_history`, `request_params`, `human_input`, `api_key`
+- `history_mode`, `max_parallel`, `child_timeout_sec`, `max_display_instances`
+- `function_tools`, `tool_hooks` (see separate spec)
+- `messages` (card-only history file)
+
+### type: `chain` (maps to `@fast.chain`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `sequence`, `cumulative`
+
+### type: `parallel` (maps to `@fast.parallel`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `fan_out`, `fan_in`, `include_request`
+
+### type: `evaluator_optimizer` (maps to `@fast.evaluator_optimizer`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `generator`, `evaluator`
+- `min_rating`, `max_refinements`, `refinement_instruction`
+- `messages` (card-only history file)
+
+### type: `router` (maps to `@fast.router`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `agents`
+- `servers`, `tools`, `resources`, `prompts`
+- `model`, `use_history`, `request_params`, `human_input`, `api_key`
+- `messages` (card-only history file)
+
+### type: `orchestrator` (maps to `@fast.orchestrator`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `agents`
+- `model`, `use_history`, `request_params`, `human_input`, `api_key`
+- `plan_type`, `plan_iterations`
+- `messages` (card-only history file)
+
+### type: `iterative_planner` (maps to `@fast.iterative_planner`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `agents`
+- `model`, `request_params`, `api_key`
+- `plan_iterations`
+- `messages` (card-only history file)
+
+### type: `MAKER` (maps to `@fast.maker`)
+Allowed fields:
+- `name`, `instruction`, `default`
+- `worker`
+- `k`, `max_samples`, `match_strategy`, `red_flag_max_length`
+- `messages` (card-only history file)
+
+### Card-only fields (all types)
+- `schema_version` (optional)
+
+---
+
 ## Instruction Source
 - **One source only**: either the body **or** the `instruction` attribute.
 - If both are present, the loader must raise an error.
