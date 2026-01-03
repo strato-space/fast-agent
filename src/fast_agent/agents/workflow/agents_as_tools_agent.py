@@ -230,6 +230,48 @@ class HistoryMode(str, Enum):
             return cls.FORK
 
 
+class HistorySource(str, Enum):
+    """History source for detached child instances."""
+
+    NONE = "none"
+    MESSAGES = "messages"
+    CHILD = "child"
+    ORCHESTRATOR = "orchestrator"
+    CUMULATIVE = "cumulative"
+
+    @classmethod
+    def from_input(cls, value: Any | None) -> HistorySource | None:
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value))
+        except Exception:
+            return None
+
+
+class HistoryMergeTarget(str, Enum):
+    """History merge target for detached child instances."""
+
+    NONE = "none"
+    MESSAGES = "messages"
+    CHILD = "child"
+    ORCHESTRATOR = "orchestrator"
+    CUMULATIVE = "cumulative"
+
+    @classmethod
+    def from_input(cls, value: Any | None) -> HistoryMergeTarget | None:
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value))
+        except Exception:
+            return None
+
+
 @dataclass(kw_only=True)
 class AgentsAsToolsOptions:
     """Configuration knobs for the Agents-as-Tools wrapper.
@@ -242,18 +284,38 @@ class AgentsAsToolsOptions:
     """
 
     history_mode: HistoryMode = HistoryMode.FORK
+    history_source: HistorySource | None = None
+    history_merge_target: HistoryMergeTarget | None = None
     max_parallel: int | None = None
     child_timeout_sec: float | None = None
     max_display_instances: int = 20
 
     def __post_init__(self) -> None:
         self.history_mode = HistoryMode.from_input(self.history_mode)
+        self.history_source = HistorySource.from_input(self.history_source)
+        self.history_merge_target = HistoryMergeTarget.from_input(
+            self.history_merge_target
+        )
         if self.max_parallel is not None and self.max_parallel <= 0:
             raise ValueError("max_parallel must be > 0 when set")
         if self.max_display_instances is not None and self.max_display_instances <= 0:
             raise ValueError("max_display_instances must be > 0")
         if self.child_timeout_sec is not None and self.child_timeout_sec <= 0:
             raise ValueError("child_timeout_sec must be > 0 when set")
+
+    def resolve_history_controls(self) -> tuple[HistorySource, HistoryMergeTarget]:
+        """Resolve effective history controls, favoring explicit source/merge."""
+        if self.history_source is not None or self.history_merge_target is not None:
+            return (
+                self.history_source or HistorySource.NONE,
+                self.history_merge_target or HistoryMergeTarget.NONE,
+            )
+
+        if self.history_mode == HistoryMode.SCRATCH:
+            return HistorySource.NONE, HistoryMergeTarget.NONE
+        if self.history_mode == HistoryMode.FORK_AND_MERGE:
+            return HistorySource.CHILD, HistoryMergeTarget.CHILD
+        return HistorySource.CHILD, HistoryMergeTarget.NONE
 
 
 class AgentsAsToolsAgent(McpAgent):
@@ -403,6 +465,54 @@ class AgentsAsToolsAgent(McpAgent):
         async with self._history_merge_lock:
             new_messages = clone.message_history[start_index:]
             target.append_history(new_messages)
+
+    def _load_clone_history(
+        self,
+        child: LlmAgent,
+        clone: LlmAgent,
+        source: HistorySource,
+    ) -> int:
+        """Load history into a clone and return the fork index for merging."""
+        if source == HistorySource.NONE:
+            clone.load_message_history([])
+            return 0
+
+        if source == HistorySource.ORCHESTRATOR:
+            base_history = self.message_history
+        elif source in {HistorySource.CHILD, HistorySource.MESSAGES}:
+            base_history = child.message_history
+        else:
+            logger.warning(
+                "History source not implemented; defaulting to empty history",
+                data={"history_source": source.value},
+            )
+            clone.load_message_history([])
+            return 0
+
+        clone.load_message_history(base_history)
+        return len(base_history)
+
+    async def _merge_clone_history(
+        self,
+        *,
+        child: LlmAgent,
+        clone: LlmAgent,
+        start_index: int,
+        target: HistoryMergeTarget,
+    ) -> None:
+        """Merge clone history into the requested target."""
+        if target == HistoryMergeTarget.NONE:
+            return
+        if target == HistoryMergeTarget.CHILD:
+            await self._merge_child_history(child, clone, start_index)
+            return
+        if target == HistoryMergeTarget.ORCHESTRATOR:
+            await self._merge_child_history(self, clone, start_index)
+            return
+        logger.warning(
+            "History merge target not implemented; skipping merge",
+            data={"history_merge_target": target.value},
+        )
 
     async def _invoke_child_agent(
         self,
@@ -721,16 +831,10 @@ class AgentsAsToolsAgent(McpAgent):
                 )
                 return CallToolResult(content=[text_content(f"Spawn failed: {exc}")], isError=True)
 
-            # Prepare history according to mode
-            history_mode = self._options.history_mode
-            base_history = child.message_history
-            fork_index = len(base_history)
+            history_source, history_merge_target = self._options.resolve_history_controls()
+            fork_index = 0
             try:
-                if history_mode == HistoryMode.SCRATCH:
-                    clone.load_message_history([])
-                    fork_index = 0
-                else:
-                    clone.load_message_history(base_history)
+                fork_index = self._load_clone_history(child, clone, history_source)
             except Exception as hist_exc:
                 logger.warning(
                     "Failed to load history into clone",
@@ -777,10 +881,13 @@ class AgentsAsToolsAgent(McpAgent):
                             "error": str(merge_exc),
                         },
                     )
-                if history_mode == HistoryMode.FORK_AND_MERGE:
+                if history_merge_target != HistoryMergeTarget.NONE:
                     try:
-                        await self._merge_child_history(
-                            target=child, clone=clone, start_index=fork_index
+                        await self._merge_clone_history(
+                            child=child,
+                            clone=clone,
+                            start_index=fork_index,
+                            target=history_merge_target,
                         )
                     except Exception as merge_hist_exc:
                         logger.warning(
