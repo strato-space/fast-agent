@@ -219,8 +219,9 @@ def _set_keyring_password(payload: str) -> None:
             "Keyring unavailable",
             "Codex OAuth tokens could not be saved to the keyring. "
             "Install/enable a keyring backend (e.g., SecretService/gnome-keyring), "
-            "or set PYTHON_KEYRING_BACKEND to a file-based backend "
-            "(e.g., keyrings.alt.file.PlaintextKeyring).",
+            "or install a file-based backend (`uv run python -m pip install keyrings.alt`) "
+            "and set PYTHON_KEYRING_BACKEND "
+            "(e.g., PYTHON_KEYRING_BACKEND=keyrings.alt.file.PlaintextKeyring).",
         ) from exc
 
 
