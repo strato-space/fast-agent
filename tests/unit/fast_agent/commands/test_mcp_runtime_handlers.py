@@ -152,7 +152,6 @@ class _OAuthFailureManager(_Manager):
             "for this connection mode."
         )
 
-
 @pytest.mark.asyncio
 async def test_handle_mcp_connect_and_disconnect() -> None:
     manager = _Manager()
