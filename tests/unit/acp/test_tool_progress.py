@@ -10,8 +10,41 @@ import asyncio
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
+from fast_agent.acp.tool_call_context import acp_tool_call_context
 from fast_agent.acp.tool_progress import ACPToolProgressManager
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_logging():
+    yield
+    from fast_agent.core.logging.logger import LoggingConfig
+    from fast_agent.core.logging.transport import AsyncEventBus
+
+    await LoggingConfig.shutdown()
+    bus = AsyncEventBus._instance
+    if bus is not None:
+        bus_task = getattr(bus, "_task", None)
+        await bus.stop()
+        # bus.stop() is best-effort (it may swallow cancellation/timeouts). Ensure
+        # the underlying processing task is fully awaited so pytest doesn't warn.
+        if bus_task is not None and hasattr(bus_task, "done") and not bus_task.done():
+            bus_task.cancel()
+            await asyncio.gather(bus_task, return_exceptions=True)
+    AsyncEventBus.reset()
+    pending = []
+    for task in asyncio.all_tasks():
+        if task is asyncio.current_task():
+            continue
+        qn = getattr(task.get_coro(), "__qualname__", "")
+        if "AsyncEventBus._process_events" in qn and not task.done():
+            pending.append(task)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.sleep(0)
+        await asyncio.gather(*pending, return_exceptions=True)
 
 # =============================================================================
 # Test Doubles
@@ -73,6 +106,7 @@ class TestACPToolProgressManager:
         # Verify it's a tool_call with pending status
         assert notification.sessionUpdate == "tool_call"
         assert notification.status == "pending"
+        assert notification.content == []
 
     @pytest.mark.asyncio
     async def test_on_tool_start_includes_all_args_in_title(self) -> None:
@@ -98,6 +132,123 @@ class TestACPToolProgressManager:
         assert "media-gen/openai-images-generate" in notification.title
         assert "prompt=lion" in notification.title
         assert "tool_result=image" in notification.title
+        assert notification.content == []
+
+    @pytest.mark.asyncio
+    async def test_on_tool_start_omits_builtin_server_name(self) -> None:
+        """Built-in ACP tools should not display the server name in titles."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        await manager.on_tool_start(
+            tool_name="execute",
+            server_name="acp_terminal",
+            arguments={"command": "ls"},
+        )
+
+        assert len(connection.notifications) == 1
+        notification = connection.notifications[0]
+        assert notification.sessionUpdate == "tool_call"
+        assert notification.title.startswith("execute")
+        assert "acp_terminal" not in notification.title
+
+    @pytest.mark.asyncio
+    async def test_on_tool_start_does_not_emit_empty_meta(self) -> None:
+        """When no contextual meta is set, `_meta` should not be serialized."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        await manager.on_tool_start(
+            tool_name="list_chats",
+            server_name="tg-ro",
+            arguments={"chat_type": "group"},
+        )
+
+        assert len(connection.notifications) == 1
+        notification = connection.notifications[0]
+        assert getattr(notification, "field_meta", None) is None
+        payload = notification.model_dump(by_alias=True, exclude_none=True)
+        assert "_meta" not in payload
+
+    @pytest.mark.asyncio
+    async def test_on_tool_start_attaches_meta_from_context(self) -> None:
+        """Tool calls should include contextual `_meta` for client-side grouping."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        with acp_tool_call_context(
+            parent_tool_call_id="parent-abc",
+        ):
+            await manager.on_tool_start(
+                tool_name="list_chats",
+                server_name="tg-ro",
+                arguments={"chat_type": "group"},
+            )
+
+        assert len(connection.notifications) == 1
+        notification = connection.notifications[0]
+        meta = getattr(notification, "field_meta", None)
+        assert meta is not None
+        assert meta.get("parentToolCallId") == "parent-abc"
+
+    @pytest.mark.asyncio
+    async def test_on_tool_progress_drops_self_parent_link(self) -> None:
+        """When parentToolCallId equals toolCallId, omit it to avoid self edges."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        await manager.on_tool_start(
+            tool_name="list_chats",
+            server_name="tg-ro",
+            arguments={"chat_type": "group"},
+        )
+        assert len(connection.notifications) == 1
+        tool_call_id = connection.notifications[0].tool_call_id
+
+        with acp_tool_call_context(
+            parent_tool_call_id=tool_call_id,
+        ):
+            await manager.on_tool_progress(
+                tool_call_id=tool_call_id,
+                progress=1,
+                total=2,
+                message="tick",
+            )
+
+        assert len(connection.notifications) == 2
+        progress_update = connection.notifications[1]
+        meta = getattr(progress_update, "field_meta", None)
+        # With only `parentToolCallId` in contextual meta, the manager drops self-parent links,
+        # so the resulting update carries no `_meta`.
+        assert meta is None or "parentToolCallId" not in meta
+        payload = progress_update.model_dump(by_alias=True, exclude_none=True)
+        assert "_meta" not in payload
+
+    @pytest.mark.asyncio
+    async def test_on_tool_complete_keeps_raw_input_for_clients(self) -> None:
+        """Completion updates should include rawInput so clients can show INPUT reliably."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        arguments = {"chat_id": "-1001", "message": "hello"}
+        tool_call_id = await manager.on_tool_start(
+            tool_name="send_bot_message",
+            server_name="tgbot",
+            arguments=arguments,
+        )
+
+        await manager.on_tool_complete(
+            tool_call_id=tool_call_id,
+            success=True,
+            content=None,
+            error=None,
+        )
+
+        assert len(connection.notifications) == 2
+        complete = connection.notifications[1]
+        assert complete.sessionUpdate == "tool_call_update"
+        assert complete.status == "completed"
+        assert complete.rawInput == arguments
 
     @pytest.mark.asyncio
     async def test_delta_events_only_notify_after_threshold(self) -> None:
@@ -384,6 +535,95 @@ class TestACPToolProgressManager:
         assert "use-b" not in manager._stream_tool_use_ids
         assert "use-a" not in manager._stream_chunk_counts
         assert "use-b" not in manager._stream_chunk_counts
+
+    @pytest.mark.asyncio
+    async def test_stream_start_then_on_tool_start_updates_same_tool_call_id(self) -> None:
+        """
+        If the LLM emits tool stream metadata first, on_tool_start must update
+        the same ACP toolCallId (no duplicate tool cards in the client).
+        """
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        manager.handle_tool_stream_event(
+            "start",
+            {
+                "tool_name": "server__tool_a",
+                "tool_use_id": "use-a",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+        assert len(connection.notifications) == 1
+        stream_start = connection.notifications[0]
+        assert stream_start.sessionUpdate == "tool_call"
+
+        tool_call_id = await manager.on_tool_start(
+            tool_name="tool_a",
+            server_name="server",
+            arguments={"path": "/tmp/a.txt"},
+            tool_use_id="use-a",
+        )
+
+        # A single call should be updated (tool_call_update), not duplicated.
+        assert tool_call_id == stream_start.tool_call_id
+        assert len(connection.notifications) == 2
+        assert connection.notifications[1].sessionUpdate == "tool_call_update"
+
+    @pytest.mark.asyncio
+    async def test_on_tool_start_before_stream_start_dedups_late_stream_start(self) -> None:
+        """
+        If tool execution starts before (or without) tool stream metadata,
+        a late stream start event must not create a second ToolCallStart.
+        """
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        _ = await manager.on_tool_start(
+            tool_name="tool_a",
+            server_name="server",
+            arguments={"path": "/tmp/a.txt"},
+            tool_use_id="use-a",
+        )
+
+        assert len(connection.notifications) == 1
+        assert connection.notifications[0].sessionUpdate == "tool_call"
+
+        manager.handle_tool_stream_event(
+            "start",
+            {
+                "tool_name": "server__tool_a",
+                "tool_use_id": "use-a",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+        # Still only one notification: no duplicate start card.
+        assert len(connection.notifications) == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_stream_start_events_are_deduped(self) -> None:
+        """Duplicate stream start events for the same tool_use_id should be ignored."""
+        connection = FakeAgentSideConnection()
+        manager = ACPToolProgressManager(connection, "test-session")
+
+        manager.handle_tool_stream_event(
+            "start",
+            {
+                "tool_name": "server__tool_a",
+                "tool_use_id": "use-a",
+            },
+        )
+        manager.handle_tool_stream_event(
+            "start",
+            {
+                "tool_name": "server__tool_a",
+                "tool_use_id": "use-a",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+        assert len(connection.notifications) == 1
 
     @pytest.mark.asyncio
     async def test_progress_updates_title_with_progress_and_total(self) -> None:

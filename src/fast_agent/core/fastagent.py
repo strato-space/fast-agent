@@ -65,11 +65,13 @@ from fast_agent.ui.console import configure_console_stream
 from fast_agent.ui.usage_display import display_usage_report
 
 if TYPE_CHECKING:
-
+    from fast_agent.config import MCPServerSettings
     from fast_agent.context import Context
     from fast_agent.core.agent_card_loader import LoadedAgentCard
     from fast_agent.core.agent_card_types import AgentCardData
     from fast_agent.interfaces import AgentProtocol
+    from fast_agent.mcp.mcp_aggregator import MCPAttachOptions, MCPAttachResult, MCPDetachResult
+    from fast_agent.mcp.types import McpAgentProtocol
     from fast_agent.types import PromptMessageExtended
 
 F = TypeVar("F", bound=Callable[..., Any])  # For decorated functions
@@ -128,8 +130,8 @@ class FastAgent(DecoratorMixin):
             )
             parser.add_argument(
                 "--agent",
-                default="default",
-                help="Specify the agent to send a message to (used with --message)",
+                default=None,
+                help="Agent name for --message/--prompt-file (defaults to the app default agent)",
             )
             parser.add_argument(
                 "-m",
@@ -326,6 +328,9 @@ class FastAgent(DecoratorMixin):
             # Create settings and update global settings so resolve_skill_directories() works
             instance_settings = config.Settings(**self.config) if hasattr(self, "config") else None
             if instance_settings is not None:
+                instance_settings._config_file = getattr(self, "_loaded_config_file", None)
+                instance_settings._secrets_file = getattr(self, "_loaded_secrets_file", None)
+            if instance_settings is not None:
                 config.update_global_settings(instance_settings)
 
             # Create the app with our local settings
@@ -363,6 +368,8 @@ class FastAgent(DecoratorMixin):
         self._agent_card_file_cache: dict[Path, tuple[int, int]] = {}
         self._agent_card_name_by_path: dict[Path, str] = {}
         self._agent_card_histories: dict[str, list[Path]] = {}
+        self._agent_card_history_mtime: dict[str, float] = {}
+        self._agent_card_history_len: dict[str, int] = {}
         self._agent_card_tool_files: dict[Path, set[Path]] = {}
         self._agent_card_last_changed: set[str] = set()
         self._agent_card_last_removed: set[str] = set()
@@ -389,28 +396,31 @@ class FastAgent(DecoratorMixin):
     def _normalize_environment_dir(value: str | Path | None) -> Path | None:
         if value is None:
             return None
-        return Path(value).expanduser()
+        env_dir = Path(value).expanduser()
+        if not env_dir.is_absolute():
+            return (Path.cwd() / env_dir).resolve()
+        return env_dir.resolve()
 
     def _load_config(self) -> None:
         """Load configuration from YAML file including secrets using get_settings
         but without relying on the global cache."""
 
-        # Import but make a local copy to avoid affecting the global state
-        from fast_agent.config import _settings, get_settings
+        import fast_agent.config as _config_module
 
         # Temporarily clear the global settings to ensure a fresh load
-        old_settings = _settings
-        _settings = None
+        old_settings = _config_module._settings
+        _config_module._settings = None
 
         try:
             # Use get_settings to load config - this handles all paths and secrets merging
-            settings = get_settings(self.config_path)
-
+            settings = _config_module.get_settings(self.config_path)
+            self._loaded_config_file = settings._config_file if settings else None
+            self._loaded_secrets_file = settings._secrets_file if settings else None
             # Convert to dict for backward compatibility
             self.config = settings.model_dump() if settings else {}
         finally:
             # Restore the original global settings
-            _settings = old_settings
+            _config_module._settings = old_settings
 
     @property
     def context(self) -> Context:
@@ -697,7 +707,23 @@ class FastAgent(DecoratorMixin):
         for card_path in current_card_files:
             current_tool_files.update(self._agent_card_tool_files.get(card_path, set()))
 
-        watch_files = set(current_card_files) | current_tool_files
+        current_history_files: set[Path] = set()
+        for history_files in self._agent_card_histories.values():
+            for history_file in history_files:
+                try:
+                    if history_file.is_relative_to(root):
+                        current_history_files.add(history_file)
+                except ValueError:
+                    continue
+        for card in cards:
+            for history_file in card.message_files or []:
+                try:
+                    if history_file.is_relative_to(root):
+                        current_history_files.add(history_file)
+                except ValueError:
+                    continue
+
+        watch_files = set(current_card_files) | current_tool_files | current_history_files
         previous_watch_files = self._agent_card_root_watch_files.get(root, set())
         removed_watch_files = previous_watch_files - watch_files
 
@@ -910,6 +936,8 @@ class FastAgent(DecoratorMixin):
             self.agents.pop(name, None)
             self._agent_card_sources.pop(name, None)
             self._agent_card_histories.pop(name, None)
+            self._agent_card_history_mtime.pop(name, None)
+            self._agent_card_history_len.pop(name, None)
 
         for path_entry in removed_files:
             self._agent_card_name_by_path.pop(path_entry, None)
@@ -925,6 +953,8 @@ class FastAgent(DecoratorMixin):
                 self._agent_card_histories[card.name] = card.message_files
             else:
                 self._agent_card_histories.pop(card.name, None)
+                self._agent_card_history_mtime.pop(card.name, None)
+                self._agent_card_history_len.pop(card.name, None)
 
         if removed_names:
             removed_set = set(removed_names)
@@ -1040,6 +1070,8 @@ class FastAgent(DecoratorMixin):
         if config:
             config.model_source = model_source  # type: ignore[attr-defined]
             config.cli_model_override = cli_model_override  # type: ignore[attr-defined]
+            if getattr(self.args, "noenv", False):
+                config.session_history = False
 
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(self.name):
@@ -1157,6 +1189,7 @@ class FastAgent(DecoratorMixin):
                                     card_collision_warnings=self._card_collision_warnings,
                                 )
                                 app = app_override
+                            setattr(app, "_noenv_mode", bool(getattr(self.args, "noenv", False)))
                             instance = AgentInstance(
                                 app,
                                 agents_map,
@@ -1287,17 +1320,37 @@ class FastAgent(DecoratorMixin):
                                             for msg in history
                                         ]
                                         new_agent.message_history.extend(copied_history)
+                                        existing_mtime = self._agent_card_history_mtime.get(name)
+                                        self._record_history_snapshot(
+                                            name, len(new_agent.message_history), existing_mtime
+                                        )
                                     for name, new_agent in updated_agents.items():
-                                        if new_agent.message_history:
-                                            continue
                                         history_files = self._agent_card_histories.get(name)
                                         if not history_files:
+                                            continue
+                                        files_mtime = self._get_history_files_mtime(history_files)
+                                        if files_mtime is None:
+                                            continue
+                                        last_mtime = self._agent_card_history_mtime.get(name)
+                                        last_len = self._agent_card_history_len.get(name)
+                                        current_len = len(new_agent.message_history)
+                                        if last_mtime is None:
+                                            if current_len != 0:
+                                                continue
+                                        elif files_mtime <= last_mtime:
+                                            continue
+                                        elif last_len is not None and current_len != last_len:
                                             continue
                                         messages: list[PromptMessageExtended] = []
                                         for history_file in history_files:
                                             messages.extend(load_prompt(history_file))
-                                        if messages:
-                                            new_agent.message_history.extend(messages)
+                                        if not messages:
+                                            continue
+                                        new_agent.message_history.clear()
+                                        new_agent.message_history.extend(messages)
+                                        self._record_history_snapshot(
+                                            name, len(new_agent.message_history), files_mtime
+                                        )
                                     validate_provider_keys_post_creation(updated_agents)
 
                                     if global_prompt_context:
@@ -1370,6 +1423,61 @@ class FastAgent(DecoratorMixin):
                     ) -> list[str]:
                         return self.attach_agent_tools(parent_name, child_names)
 
+                    async def detach_agent_tools_source(
+                        parent_name: str, child_names: Sequence[str]
+                    ) -> list[str]:
+                        return self.detach_agent_tools(parent_name, child_names)
+
+                    def _resolve_runtime_mcp_agent(agent_name: str) -> "McpAgentProtocol":
+                        from fast_agent.mcp.types import McpAgentProtocol
+
+                        target_agent = active_agents.get(agent_name)
+                        if target_agent is None:
+                            raise RuntimeError(f"Agent '{agent_name}' was not found")
+                        if not isinstance(target_agent, McpAgentProtocol):
+                            raise RuntimeError(
+                                f"Agent '{agent_name}' does not support MCP server management"
+                            )
+                        return target_agent
+
+                    async def attach_mcp_server_and_refresh(
+                        agent_name: str,
+                        server_name: str,
+                        server_config: "MCPServerSettings | None" = None,
+                        options: "MCPAttachOptions | None" = None,
+                    ) -> "MCPAttachResult":
+                        from fast_agent.core.instruction_refresh import rebuild_agent_instruction
+
+                        target_agent = _resolve_runtime_mcp_agent(agent_name)
+                        result = await target_agent.attach_mcp_server(
+                            server_name=server_name,
+                            server_config=server_config,
+                            options=options,
+                        )
+                        await rebuild_agent_instruction(target_agent)
+                        return result
+
+                    async def detach_mcp_server_and_refresh(
+                        agent_name: str,
+                        server_name: str,
+                    ) -> "MCPDetachResult":
+                        from fast_agent.core.instruction_refresh import rebuild_agent_instruction
+
+                        target_agent = _resolve_runtime_mcp_agent(agent_name)
+                        result = await target_agent.detach_mcp_server(server_name)
+                        await rebuild_agent_instruction(target_agent)
+                        return result
+
+                    async def list_attached_mcp_servers_source(agent_name: str) -> list[str]:
+                        target_agent = _resolve_runtime_mcp_agent(agent_name)
+                        return target_agent.list_attached_mcp_servers()
+
+                    async def list_configured_detached_mcp_servers_source(
+                        agent_name: str,
+                    ) -> list[str]:
+                        target_agent = _resolve_runtime_mcp_agent(agent_name)
+                        return target_agent.aggregator.list_configured_detached_servers()
+
                     async def dump_agent_card(name: str) -> str:
                         return self.dump_agent_card_text(name)
 
@@ -1385,6 +1493,14 @@ class FastAgent(DecoratorMixin):
                     wrapper.set_attach_agent_tools_callback(attach_agent_tools_and_refresh)
                     wrapper.set_detach_agent_tools_callback(detach_agent_tools_and_refresh)
                     wrapper.set_dump_agent_callback(dump_agent_card)
+                    wrapper.set_attach_mcp_server_callback(attach_mcp_server_and_refresh)
+                    wrapper.set_detach_mcp_server_callback(detach_mcp_server_and_refresh)
+                    wrapper.set_list_attached_mcp_servers_callback(
+                        list_attached_mcp_servers_source
+                    )
+                    wrapper.set_list_configured_detached_mcp_servers_callback(
+                        list_configured_detached_mcp_servers_source
+                    )
                     self._agent_card_watch_reload = reload_and_refresh if reload_enabled else None
 
                     if getattr(self.args, "watch", False) and self._agent_card_roots:
@@ -1492,6 +1608,15 @@ class FastAgent(DecoratorMixin):
                                     permissions_enabled=permissions_enabled,
                                     load_card_callback=load_card_source,
                                     attach_agent_tools_callback=attach_agent_tools_source,
+                                    detach_agent_tools_callback=detach_agent_tools_source,
+                                    attach_mcp_server_callback=attach_mcp_server_and_refresh,
+                                    detach_mcp_server_callback=detach_mcp_server_and_refresh,
+                                    list_attached_mcp_servers_callback=(
+                                        list_attached_mcp_servers_source
+                                    ),
+                                    list_configured_detached_mcp_servers_callback=(
+                                        list_configured_detached_mcp_servers_source
+                                    ),
                                     dump_agent_card_callback=dump_agent_card,
                                     reload_callback=reload_callback,
                                 )
@@ -1548,10 +1673,10 @@ class FastAgent(DecoratorMixin):
 
                     # Handle direct message sending if  --message is provided
                     if hasattr(self.args, "message") and self.args.message:
-                        agent_name = self.args.agent
+                        agent_name = getattr(self.args, "agent", None)
                         message = self.args.message
 
-                        if agent_name not in active_agents:
+                        if agent_name and agent_name not in active_agents:
                             available_agents = ", ".join(active_agents.keys())
                             print(
                                 f"\n\nError: Agent '{agent_name}' not found. Available agents: {available_agents}"
@@ -1560,7 +1685,8 @@ class FastAgent(DecoratorMixin):
 
                         try:
                             # Get response from the agent
-                            agent = active_agents[agent_name]
+                            # If agent_name is omitted, resolve the app default agent (config.default=True)
+                            agent = wrapper._agent(agent_name)
                             response = await agent.send(message)
 
                             # In quiet mode, just print the raw response
@@ -1570,15 +1696,16 @@ class FastAgent(DecoratorMixin):
 
                             raise SystemExit(0)
                         except Exception as e:
-                            print(f"\n\nError sending message to agent '{agent_name}': {str(e)}")
+                            display_agent = agent_name or "<default>"
+                            print(f"\n\nError sending message to agent '{display_agent}': {str(e)}")
                             raise SystemExit(1)
 
                     if hasattr(self.args, "prompt_file") and self.args.prompt_file:
-                        agent_name = self.args.agent
+                        agent_name = getattr(self.args, "agent", None)
                         prompt: list[PromptMessageExtended] = load_prompt(
                             Path(self.args.prompt_file)
                         )
-                        if agent_name not in active_agents:
+                        if agent_name and agent_name not in active_agents:
                             available_agents = ", ".join(active_agents.keys())
                             print(
                                 f"\n\nError: Agent '{agent_name}' not found. Available agents: {available_agents}"
@@ -1587,7 +1714,8 @@ class FastAgent(DecoratorMixin):
 
                         try:
                             # Get response from the agent
-                            agent = active_agents[agent_name]
+                            # If agent_name is omitted, resolve the app default agent (config.default=True)
+                            agent = wrapper._agent(agent_name)
                             prompt_result = await agent.generate(prompt)
 
                             # In quiet mode, just print the raw response
@@ -1597,7 +1725,8 @@ class FastAgent(DecoratorMixin):
 
                             raise SystemExit(0)
                         except Exception as e:
-                            print(f"\n\nError sending message to agent '{agent_name}': {str(e)}")
+                            display_agent = agent_name or "<default>"
+                            print(f"\n\nError sending message to agent '{display_agent}': {str(e)}")
                             raise SystemExit(1)
 
                     yield wrapper
@@ -1675,6 +1804,21 @@ class FastAgent(DecoratorMixin):
         """Resolve late-binding placeholders for all agents in the provided instance."""
         await apply_instruction_context(instance.agents.values(), context_vars)
 
+    @staticmethod
+    def _get_history_files_mtime(history_files: Sequence[Path]) -> float | None:
+        mtimes: list[float] = []
+        for history_file in history_files:
+            try:
+                mtimes.append(history_file.stat().st_mtime)
+            except OSError:
+                continue
+        return max(mtimes) if mtimes else None
+
+    def _record_history_snapshot(self, name: str, history_len: int, mtime: float | None) -> None:
+        self._agent_card_history_len[name] = history_len
+        if mtime is not None:
+            self._agent_card_history_mtime[name] = mtime
+
     def _apply_agent_card_histories(self, agents: dict[str, "AgentProtocol"]) -> None:
         if not self._agent_card_histories:
             return
@@ -1687,6 +1831,8 @@ class FastAgent(DecoratorMixin):
                 messages.extend(load_prompt(history_file))
             agent.clear(clear_prompts=True)
             agent.message_history.extend(messages)
+            mtime = self._get_history_files_mtime(history_files)
+            self._record_history_snapshot(name, len(messages), mtime)
 
     def _handle_dump_requests(self) -> None:
         dump_dir = getattr(self.args, "dump_agents", None)

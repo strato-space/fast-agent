@@ -4,7 +4,7 @@ Direct AgentApp implementation for interacting with agents without proxies.
 
 import time
 from datetime import datetime
-from typing import Awaitable, Callable, Mapping, Sequence, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Sequence, Union
 
 from deprecated import deprecated
 from mcp.types import GetPromptResult, PromptMessage
@@ -14,12 +14,19 @@ from rich.markup import escape
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.agents.workflow.parallel_agent import ParallelAgent
 from fast_agent.core.exceptions import AgentConfigError, ServerConfigError
+from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import AgentProtocol
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.usage_tracking import last_turn_usage
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.ui.interactive_prompt import InteractivePrompt
 from fast_agent.ui.progress_display import progress_display
+
+if TYPE_CHECKING:
+    from fast_agent.config import MCPServerSettings
+    from fast_agent.mcp.mcp_aggregator import MCPAttachOptions, MCPAttachResult, MCPDetachResult
+
+logger = get_logger(__name__)
 
 
 class AgentApp:
@@ -47,6 +54,16 @@ class AgentApp:
         detach_agent_tools_callback: Callable[[str, Sequence[str]], Awaitable[list[str]]]
         | None = None,
         dump_agent_callback: Callable[[str], Awaitable[str]] | None = None,
+        attach_mcp_server_callback: Callable[
+            [str, str, "MCPServerSettings | None", "MCPAttachOptions | None"],
+            Awaitable["MCPAttachResult"],
+        ]
+        | None = None,
+        detach_mcp_server_callback: Callable[[str, str], Awaitable["MCPDetachResult"]]
+        | None = None,
+        list_attached_mcp_servers_callback: Callable[[str], Awaitable[list[str]]] | None = None,
+        list_configured_detached_mcp_servers_callback: Callable[[str], Awaitable[list[str]]]
+        | None = None,
         tool_only_agents: set[str] | None = None,
         card_collision_warnings: list[str] | None = None,
     ) -> None:
@@ -73,14 +90,31 @@ class AgentApp:
         self._attach_agent_tools_callback = attach_agent_tools_callback
         self._detach_agent_tools_callback = detach_agent_tools_callback
         self._dump_agent_callback = dump_agent_callback
+        self._attach_mcp_server_callback = attach_mcp_server_callback
+        self._detach_mcp_server_callback = detach_mcp_server_callback
+        self._list_attached_mcp_servers_callback = list_attached_mcp_servers_callback
+        self._list_configured_detached_mcp_servers_callback = (
+            list_configured_detached_mcp_servers_callback
+        )
         self._tool_only_agents: set[str] = tool_only_agents or set()
         self._card_collision_warnings: list[str] = card_collision_warnings or []
+        self._apply_agent_registry()
+
+    def _apply_agent_registry(self) -> None:
+        for agent in self._agents.values():
+            registry_setter = getattr(agent, "set_agent_registry", None)
+            if callable(registry_setter):
+                registry_setter(self._agents)
 
     def __getitem__(self, key: str) -> AgentProtocol:
         """Allow access to agents using dictionary syntax."""
         if key not in self._agents:
             raise KeyError(f"Agent '{key}' not found")
         return self._agents[key]
+
+    def get_agent(self, name: str) -> AgentProtocol | None:
+        """Return the named agent if available, else None."""
+        return self._agents.get(name)
 
     def __getattr__(self, name: str) -> AgentProtocol:
         """Allow access to agents using attribute syntax."""
@@ -315,6 +349,14 @@ class AgentApp:
         """Return True if agent card dumping is available."""
         return self._dump_agent_callback is not None
 
+    def can_attach_mcp_servers(self) -> bool:
+        """Return True if runtime MCP attachment is available."""
+        return self._attach_mcp_server_callback is not None
+
+    def can_detach_mcp_servers(self) -> bool:
+        """Return True if runtime MCP detachment is available."""
+        return self._detach_mcp_server_callback is not None
+
     async def load_agent_card(
         self, source: str, parent_agent: str | None = None
     ) -> tuple[list[str], list[str]]:
@@ -341,6 +383,36 @@ class AgentApp:
             raise RuntimeError("Agent card dumping is not available.")
         return await self._dump_agent_callback(agent_name)
 
+    async def attach_mcp_server(
+        self,
+        agent_name: str,
+        server_name: str,
+        server_config: "MCPServerSettings | None" = None,
+        options: "MCPAttachOptions | None" = None,
+    ) -> "MCPAttachResult":
+        """Attach an MCP server to a running MCP agent."""
+        if not self._attach_mcp_server_callback:
+            raise RuntimeError("Runtime MCP server attachment is not available.")
+        return await self._attach_mcp_server_callback(agent_name, server_name, server_config, options)
+
+    async def detach_mcp_server(self, agent_name: str, server_name: str) -> "MCPDetachResult":
+        """Detach an MCP server from a running MCP agent."""
+        if not self._detach_mcp_server_callback:
+            raise RuntimeError("Runtime MCP server detachment is not available.")
+        return await self._detach_mcp_server_callback(agent_name, server_name)
+
+    async def list_attached_mcp_servers(self, agent_name: str) -> list[str]:
+        """List MCP servers attached to a running MCP agent."""
+        if not self._list_attached_mcp_servers_callback:
+            raise RuntimeError("Runtime MCP server listing is not available.")
+        return await self._list_attached_mcp_servers_callback(agent_name)
+
+    async def list_configured_detached_mcp_servers(self, agent_name: str) -> list[str]:
+        """List configured MCP servers that are not currently attached."""
+        if not self._list_configured_detached_mcp_servers_callback:
+            raise RuntimeError("Configured MCP server listing is not available.")
+        return await self._list_configured_detached_mcp_servers_callback(agent_name)
+
     def set_agents(
         self,
         agents: dict[str, AgentProtocol],
@@ -351,6 +423,7 @@ class AgentApp:
         if not agents:
             raise ValueError("No agents provided!")
         self._agents = agents
+        self._apply_agent_registry()
         if tool_only_agents is not None:
             self._tool_only_agents = tool_only_agents
         if card_collision_warnings is not None:
@@ -391,6 +464,38 @@ class AgentApp:
     def set_dump_agent_callback(self, callback: Callable[[str], Awaitable[str]] | None) -> None:
         """Update the callback for dumping agent cards."""
         self._dump_agent_callback = callback
+
+    def set_attach_mcp_server_callback(
+        self,
+        callback: Callable[
+            [str, str, "MCPServerSettings | None", "MCPAttachOptions | None"],
+            Awaitable["MCPAttachResult"],
+        ]
+        | None,
+    ) -> None:
+        """Update callback for attaching MCP servers at runtime."""
+        self._attach_mcp_server_callback = callback
+
+    def set_detach_mcp_server_callback(
+        self,
+        callback: Callable[[str, str], Awaitable["MCPDetachResult"]] | None,
+    ) -> None:
+        """Update callback for detaching MCP servers at runtime."""
+        self._detach_mcp_server_callback = callback
+
+    def set_list_attached_mcp_servers_callback(
+        self,
+        callback: Callable[[str], Awaitable[list[str]]] | None,
+    ) -> None:
+        """Update callback for listing attached MCP servers."""
+        self._list_attached_mcp_servers_callback = callback
+
+    def set_list_configured_detached_mcp_servers_callback(
+        self,
+        callback: Callable[[str], Awaitable[list[str]]] | None,
+    ) -> None:
+        """Update callback for listing configured detached MCP servers."""
+        self._list_configured_detached_mcp_servers_callback = callback
 
     def agent_names(self) -> list[str]:
         """Return available agent names (excluding tool_only agents)."""
@@ -467,7 +572,12 @@ class AgentApp:
         # The agent's prompt method doesn't fully support switching between agents
 
         # Create agent_types dictionary mapping agent names to their types (excluding tool_only)
-        visible_names = set(self.agent_names())
+        # but keep an explicitly targeted tool-only agent available for direct testing.
+        available_names = self.agent_names()
+        if agent_name and agent_name in self._agents and agent_name not in available_names:
+            available_names = [agent_name, *available_names]
+
+        visible_names = set(available_names)
         agent_types = {
             name: agent.agent_type for name, agent in self._agents.items() if name in visible_names
         }
@@ -500,7 +610,7 @@ class AgentApp:
                 clean_detail = clean_detail[:297] + "..."
             clean_detail = escape(clean_detail)
             return (
-                f"⚠️ **System Error:** The agent failed after repeated attempts.\n"
+                f"▲ **System Error:** The agent failed after repeated attempts.\n"
                 f"Error details: {clean_detail}\n"
                 f"\n*Your context is preserved. You can try sending the message again.*"
             )
@@ -519,14 +629,22 @@ class AgentApp:
                 if isinstance(e, (KeyboardInterrupt, AgentConfigError, ServerConfigError)):
                     raise e
 
+                logger.exception(
+                    "Agent failed after repeated attempts",
+                    agent_name=agent_name,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
                 # Return pretty text for API failures (keeps session alive)
                 return _format_final_error(e)
 
         return await prompt.prompt_loop(
             send_func=send_wrapper,
             default_agent=target_name,  # Pass the agent name, not the agent object
-            available_agents=self.agent_names(),  # Excludes tool_only agents
+            available_agents=available_names,
             prompt_provider=self,  # Pass self as the prompt provider
+            pinned_agent=agent_name,
             default=default_prompt,
         )
 

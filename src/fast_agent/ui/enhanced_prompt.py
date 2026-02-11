@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -56,6 +57,10 @@ from fast_agent.ui.command_payloads import (
     LoadAgentCardCommand,
     LoadHistoryCommand,
     LoadPromptCommand,
+    McpConnectCommand,
+    McpConnectMode,
+    McpDisconnectCommand,
+    McpListCommand,
     ModelReasoningCommand,
     ModelVerbosityCommand,
     PinSessionCommand,
@@ -131,6 +136,39 @@ def _show_markdown_cmd() -> ShowMarkdownCommand:
 
 def _show_mcp_status_cmd() -> ShowMcpStatusCommand:
     return ShowMcpStatusCommand()
+
+
+def _mcp_list_cmd() -> McpListCommand:
+    return McpListCommand()
+
+
+def _mcp_connect_cmd(
+    target_text: str,
+    *,
+    parsed_mode: McpConnectMode,
+    server_name: str | None,
+    auth_token: str | None,
+    timeout_seconds: float | None,
+    trigger_oauth: bool | None,
+    reconnect_on_disconnect: bool | None,
+    force_reconnect: bool,
+    error: str | None,
+) -> McpConnectCommand:
+    return McpConnectCommand(
+        target_text=target_text,
+        parsed_mode=parsed_mode,
+        server_name=server_name,
+        auth_token=auth_token,
+        timeout_seconds=timeout_seconds,
+        trigger_oauth=trigger_oauth,
+        reconnect_on_disconnect=reconnect_on_disconnect,
+        force_reconnect=force_reconnect,
+        error=error,
+    )
+
+
+def _mcp_disconnect_cmd(server_name: str | None, error: str | None) -> McpDisconnectCommand:
+    return McpDisconnectCommand(server_name=server_name, error=error)
 
 
 def _list_tools_cmd() -> ListToolsCommand:
@@ -232,6 +270,33 @@ def _select_prompt_cmd(prompt_index: int | None, prompt_name: str | None) -> Sel
 
 def _skills_cmd(action: str, argument: str | None) -> SkillsCommand:
     return SkillsCommand(action=action, argument=argument)
+
+
+def _infer_mcp_connect_mode(target_text: str) -> McpConnectMode:
+    stripped = target_text.strip()
+    if stripped.startswith(("http://", "https://")):
+        return "url"
+    if stripped.startswith("@"):
+        return "npx"
+    if stripped.startswith("npx "):
+        return "npx"
+    if stripped.startswith("uvx "):
+        return "uvx"
+    return "stdio"
+
+
+def _rebuild_mcp_target_text(tokens: list[str]) -> str:
+    """Rebuild target text while preserving whitespace-grouped arguments."""
+    if not tokens:
+        return ""
+
+    rebuilt_parts: list[str] = []
+    for token in tokens:
+        if token == "" or any(char.isspace() for char in token):
+            rebuilt_parts.append(shlex.quote(token))
+        else:
+            rebuilt_parts.append(token)
+    return " ".join(rebuilt_parts)
 
 
 def _extract_alert_flags_from_meta(blocks) -> set[str]:
@@ -593,13 +658,16 @@ class AgentCompleter(Completer):
         is_human_input: bool = False,
         current_agent: str | None = None,
         agent_provider: "AgentApp | None" = None,
+        noenv_mode: bool = False,
     ) -> None:
         self.agents = agents
         self.current_agent = current_agent
         self.agent_provider = agent_provider
+        self.noenv_mode = noenv_mode
         # Map commands to their descriptions for better completion hints
         self.commands = {
-            "mcp": "Show MCP server status",
+            "mcp": "Manage MCP runtime servers (/mcp list|connect|disconnect)",
+            "connect": "Alias for /mcp connect with target auto-detection",
             "history": "Show conversation history overview (or /history save|load|clear|rewind|review|fix)",
             "tools": "List tools",
             "model": "Update model settings (/model reasoning <value> | /model verbosity <value>)",
@@ -623,25 +691,48 @@ class AgentCompleter(Completer):
             self.commands.pop("usage", None)  # Remove usage command in human input mode
         self.agent_types = agent_types or {}
 
-    def _resolve_completion_search(self, partial: str) -> tuple[Path, str] | None:
+    @dataclass(frozen=True)
+    class _CompletionSearch:
+        search_dir: Path
+        prefix: str
+        completion_prefix: str
+
+    def _resolve_completion_search(self, partial: str) -> _CompletionSearch | None:
+        raw_dir = ""
+        prefix = ""
+        explicit_current_dir = False
         if partial:
-            partial_path = Path(partial)
-            if partial.endswith("/") or partial.endswith(os.sep):
-                search_dir = partial_path
+            if (
+                partial.endswith("/")
+                or partial.endswith(os.sep)
+                or (os.altsep is not None and partial.endswith(os.altsep))
+            ):
+                raw_dir = partial
                 prefix = ""
             else:
-                search_dir = (
-                    partial_path.parent if partial_path.parent != partial_path else Path(".")
+                raw_dir, prefix = os.path.split(partial)
+                explicit_current_dir = partial.startswith(f".{os.sep}") or (
+                    os.altsep is not None and partial.startswith(f".{os.altsep}")
                 )
-                prefix = partial_path.name
-        else:
-            search_dir = Path(".")
-            prefix = ""
 
-        if not search_dir.exists():
+        raw_dir = raw_dir or "."
+        expanded_dir = Path(os.path.expandvars(os.path.expanduser(raw_dir)))
+        if not expanded_dir.exists() or not expanded_dir.is_dir():
             return None
 
-        return search_dir, prefix
+        completion_prefix = ""
+        if raw_dir not in {"", "."}:
+            completion_prefix = raw_dir
+            if not completion_prefix.endswith(("/", os.sep)):
+                completion_prefix = f"{completion_prefix}{os.sep}"
+        elif explicit_current_dir:
+            completion_prefix = f".{os.sep}"
+
+        return self._CompletionSearch(
+            search_dir=expanded_dir,
+            prefix=prefix,
+            completion_prefix=completion_prefix,
+        )
 
     def _iter_file_completions(
         self,
@@ -655,7 +746,9 @@ class AgentCompleter(Completer):
         if not resolved:
             return []
 
-        search_dir, prefix = resolved
+        search_dir = resolved.search_dir
+        prefix = resolved.prefix
+        completion_prefix = resolved.completion_prefix
         completions: list[Completion] = []
         try:
             for entry in sorted(search_dir.iterdir()):
@@ -666,7 +759,7 @@ class AgentCompleter(Completer):
                 if not name.lower().startswith(prefix.lower()):
                     continue
 
-                completion_text = name if search_dir == Path(".") else str(search_dir / name)
+                completion_text = f"{completion_prefix}{name}" if completion_prefix else name
 
                 if entry.is_dir():
                     completions.append(
@@ -686,7 +779,7 @@ class AgentCompleter(Completer):
                             display_meta=file_meta(entry),
                         )
                     )
-        except PermissionError:
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
             return []
 
         return completions
@@ -811,17 +904,17 @@ class AgentCompleter(Completer):
 
     def _complete_session_ids(self, partial: str, *, start_position: int | None = None):
         """Generate completions for recent session ids."""
+        if self.noenv_mode:
+            return
+
         from fast_agent.session import (
+            apply_session_window,
             display_session_name,
-            get_session_history_window,
             get_session_manager,
         )
 
         manager = get_session_manager()
-        sessions = manager.list_sessions()
-        limit = get_session_history_window()
-        if limit > 0:
-            sessions = sessions[:limit]
+        sessions = apply_session_window(manager.list_sessions())
         partial_lower = partial.lower()
         for session_info in sessions:
             session_id = session_info.name
@@ -977,6 +1070,17 @@ class AgentCompleter(Completer):
             except (PermissionError, FileNotFoundError):
                 pass
 
+    def _is_shell_path_token(self, token: str) -> bool:
+        if not token:
+            return False
+        if token.startswith((".", "~", os.sep)):
+            return True
+        if os.sep in token:
+            return True
+        if os.altsep and os.altsep in token:
+            return True
+        return False
+
     def _complete_shell_paths(self, partial: str, delete_len: int, max_results: int = 100):
         """Complete file/directory paths for shell commands.
 
@@ -985,22 +1089,13 @@ class AgentCompleter(Completer):
             delete_len: Number of characters to delete for the completion.
             max_results: Maximum number of completions to yield (default 100).
         """
-        if partial:
-            partial_path = Path(partial)
-            if partial.endswith("/") or partial.endswith(os.sep):
-                search_dir = partial_path
-                prefix = ""
-            else:
-                search_dir = (
-                    partial_path.parent if partial_path.parent != partial_path else Path(".")
-                )
-                prefix = partial_path.name
-        else:
-            search_dir = Path(".")
-            prefix = ""
-
-        if not search_dir.exists():
+        resolved = self._resolve_completion_search(partial)
+        if not resolved:
             return
+
+        search_dir = resolved.search_dir
+        prefix = resolved.prefix
+        completion_prefix = resolved.completion_prefix
 
         try:
             count = 0
@@ -1013,7 +1108,7 @@ class AgentCompleter(Completer):
                 if not name.lower().startswith(prefix.lower()):
                     continue
 
-                completion_text = str(search_dir / name) if search_dir != Path(".") else name
+                completion_text = f"{completion_prefix}{name}" if completion_prefix else name
 
                 if entry.is_dir():
                     yield Completion(
@@ -1030,7 +1125,7 @@ class AgentCompleter(Completer):
                         display_meta="file",
                     )
                 count += 1
-        except PermissionError:
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
             pass
 
     def _complete_subcommands(
@@ -1065,16 +1160,21 @@ class AgentCompleter(Completer):
 
         # Shell completion mode - detect ! prefix
         if text.lstrip().startswith("!"):
-            if not completion_requested:
+            if complete_event and complete_event.text_inserted:
                 return
             # Text after "!" with leading/trailing whitespace stripped
             shell_text = text.lstrip()[1:].lstrip()
             if not shell_text:
+                if completion_requested:
+                    yield from self._complete_executables("", max_results=100)
                 return
 
             if " " not in shell_text:
-                # First token: complete executables
-                yield from self._complete_executables(shell_text)
+                # First token: complete executables or paths.
+                if self._is_shell_path_token(shell_text):
+                    yield from self._complete_shell_paths(shell_text, len(shell_text))
+                else:
+                    yield from self._complete_executables(shell_text)
             else:
                 # After first token: complete paths
                 _, path_part = shell_text.rsplit(" ", 1)
@@ -1216,7 +1316,7 @@ class AgentCompleter(Completer):
             parts = remainder.split(maxsplit=1)
             subcommands = {
                 "reasoning": (
-                    "Set reasoning effort (off/low/medium/high/xhigh or budgets like "
+                    "Set reasoning effort (off/low/medium/high/max/xhigh or budgets like "
                     "0/1024/16000/32000)"
                 ),
             }
@@ -1249,6 +1349,39 @@ class AgentCompleter(Completer):
                         )
                 return
 
+            return
+
+        if text_lower.startswith("/mcp disconnect "):
+            partial = text[len("/mcp disconnect ") :]
+            attached: list[str] = []
+            if self.agent_provider is not None and self.current_agent:
+                try:
+                    agent = self.agent_provider._agent(self.current_agent)
+                    aggregator = getattr(agent, "aggregator", None)
+                    list_attached = getattr(aggregator, "list_attached_servers", None)
+                    if callable(list_attached):
+                        attached = list_attached()
+                except Exception:
+                    attached = []
+            for server in attached:
+                if server.lower().startswith(partial.lower()):
+                    yield Completion(
+                        server,
+                        start_position=-len(partial),
+                        display=server,
+                        display_meta="attached mcp server",
+                    )
+            return
+
+        if text_lower.startswith("/mcp "):
+            remainder = text[len("/mcp ") :]
+            parts = remainder.split(maxsplit=1) if remainder else []
+            subcommands = {
+                "list": "List currently attached MCP servers",
+                "connect": "Connect a new MCP server",
+                "disconnect": "Disconnect an attached MCP server",
+            }
+            yield from self._complete_subcommands(parts, remainder, subcommands)
             return
 
         if text_lower.startswith("/history "):
@@ -1486,7 +1619,7 @@ def create_keybindings(
         if not stripped:
             return True
         if stripped.startswith("!"):
-            return bool(stripped[1:].lstrip())
+            return True
         if stripped.startswith(("/", "@", "#")):
             return True
         return True
@@ -1498,6 +1631,14 @@ def create_keybindings(
         if not _should_start_completion(text):
             return
         event.current_buffer.start_completion()
+
+    @kb.add("tab")
+    @kb.add("c-i")
+    def _(event) -> None:
+        text = event.current_buffer.document.text_before_cursor
+        if not _should_start_completion(text):
+            return
+        event.current_buffer.start_completion(insert_common_part=True)
 
     @kb.add("c-m", filter=Condition(lambda: not in_multiline_mode))
     def _(event) -> None:
@@ -1748,8 +1889,6 @@ def parse_special_input(text: str) -> str | CommandPayload:
                     "false",
                     "yes",
                     "no",
-                    "1",
-                    "0",
                     "enable",
                     "enabled",
                     "disable",
@@ -1862,8 +2001,144 @@ def parse_special_input(text: str) -> str | CommandPayload:
             return _agent_cmd(agent_name, add_tool, remove_tool, dump, None)
         if cmd == "reload":
             return _reload_agents_cmd()
-        if cmd in ("mcpstatus", "mcp"):
+        if cmd == "mcpstatus":
             return _show_mcp_status_cmd()
+        if cmd == "mcp":
+            remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            if not remainder:
+                return _show_mcp_status_cmd()
+            try:
+                tokens = shlex.split(remainder)
+            except ValueError as exc:
+                return _mcp_connect_cmd(
+                    "",
+                    parsed_mode="stdio",
+                    server_name=None,
+                    auth_token=None,
+                    timeout_seconds=None,
+                    trigger_oauth=None,
+                    reconnect_on_disconnect=None,
+                    force_reconnect=False,
+                    error=f"Invalid arguments: {exc}",
+                )
+
+            subcmd = tokens[0].lower() if tokens else ""
+            if subcmd == "list":
+                return _mcp_list_cmd()
+            if subcmd == "disconnect":
+                name = tokens[1] if len(tokens) > 1 else None
+                error = None if name else "Usage: /mcp disconnect <server_name>"
+                return _mcp_disconnect_cmd(name, error)
+            if subcmd == "connect":
+                if len(tokens) < 2:
+                    return _mcp_connect_cmd(
+                        "",
+                        parsed_mode="stdio",
+                        server_name=None,
+                        auth_token=None,
+                        timeout_seconds=None,
+                        trigger_oauth=None,
+                        reconnect_on_disconnect=None,
+                        force_reconnect=False,
+                        error=(
+                            "Usage: /mcp connect <target> [--name <server>] [--auth <token>] [--timeout <seconds>] "
+                            "[--oauth|--no-oauth] [--reconnect|--no-reconnect]"
+                        ),
+                    )
+                connect_args = tokens[1:]
+                target_tokens: list[str] = []
+                server_name: str | None = None
+                auth_token: str | None = None
+                timeout_seconds: float | None = None
+                trigger_oauth: bool | None = None
+                reconnect_on_disconnect: bool | None = None
+                force_reconnect = False
+                parse_error: str | None = None
+                idx = 0
+                while idx < len(connect_args):
+                    token = connect_args[idx]
+                    if token in {"--name", "-n"}:
+                        idx += 1
+                        if idx >= len(connect_args):
+                            parse_error = "Missing value for --name"
+                            break
+                        server_name = connect_args[idx]
+                    elif token == "--timeout":
+                        idx += 1
+                        if idx >= len(connect_args):
+                            parse_error = "Missing value for --timeout"
+                            break
+                        try:
+                            timeout_seconds = float(connect_args[idx])
+                        except ValueError:
+                            parse_error = "--timeout must be a number"
+                            break
+                    elif token == "--auth":
+                        idx += 1
+                        if idx >= len(connect_args):
+                            parse_error = "Missing value for --auth"
+                            break
+                        auth_token = connect_args[idx]
+                    elif token.startswith("--auth="):
+                        auth_token = token.split("=", 1)[1]
+                        if not auth_token:
+                            parse_error = "Missing value for --auth"
+                            break
+                    elif token == "--oauth":
+                        trigger_oauth = True
+                    elif token == "--no-oauth":
+                        trigger_oauth = False
+                    elif token == "--reconnect":
+                        force_reconnect = True
+                    elif token == "--no-reconnect":
+                        reconnect_on_disconnect = False
+                    else:
+                        target_tokens.append(token)
+                    idx += 1
+
+                target_text = _rebuild_mcp_target_text(target_tokens).strip()
+                parsed_mode = _infer_mcp_connect_mode(target_text)
+                if not parse_error and not target_text:
+                    parse_error = "Connection target is required"
+
+                return _mcp_connect_cmd(
+                    target_text,
+                    parsed_mode=parsed_mode,
+                    server_name=server_name,
+                    auth_token=auth_token,
+                    timeout_seconds=timeout_seconds,
+                    trigger_oauth=trigger_oauth,
+                    reconnect_on_disconnect=reconnect_on_disconnect,
+                    force_reconnect=force_reconnect,
+                    error=parse_error,
+                )
+            return UnknownCommand(command=cmd)
+        if cmd == "connect":
+            remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            parsed_mode = _infer_mcp_connect_mode(remainder)
+            if not remainder:
+                return _mcp_connect_cmd(
+                    "",
+                    parsed_mode="stdio",
+                    server_name=None,
+                    auth_token=None,
+                    timeout_seconds=None,
+                    trigger_oauth=None,
+                    reconnect_on_disconnect=None,
+                    force_reconnect=False,
+                    error="Usage: /connect <target>",
+                )
+            return _mcp_connect_cmd(
+                remainder,
+                parsed_mode=parsed_mode,
+                server_name=None,
+                auth_token=None,
+                timeout_seconds=None,
+                trigger_oauth=None,
+                reconnect_on_disconnect=None,
+                force_reconnect=False,
+                error=None,
+            )
         if cmd == "prompt":
             remainder = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
             if not remainder:
@@ -1953,6 +2228,7 @@ async def get_enhanced_input(
     is_human_input: bool = False,
     toolbar_color: str = "ansiblue",
     agent_provider: "AgentApp | None" = None,
+    noenv_mode: bool = False,
     pre_populate_buffer: str = "",
 ) -> str | CommandPayload:
     """
@@ -1969,6 +2245,7 @@ async def get_enhanced_input(
         is_human_input: Whether this is a human input request (disables agent selection features)
         toolbar_color: Color to use for the agent name in the toolbar (default: "ansiblue")
         agent_provider: Optional AgentApp for displaying agent info
+        noenv_mode: Whether session operations should be disabled for --noenv mode
         pre_populate_buffer: Text to pre-populate in the input buffer for editing (one-off)
 
     Returns:
@@ -2277,6 +2554,7 @@ async def get_enhanced_input(
             is_human_input=is_human_input,
             current_agent=agent_name,
             agent_provider=agent_provider,
+            noenv_mode=noenv_mode,
         ),
         lexer=ShellPrefixLexer(),
         complete_while_typing=True,
@@ -2486,6 +2764,21 @@ async def get_enhanced_input(
 
     # Get the input - using async version
     prompt_mark_started = False
+    accept_state: dict[str, Any] = {}
+    prompt_shutdown_warn_seconds = 0.5
+    buffer = session.default_buffer
+    original_accept_handler = buffer.accept_handler
+
+    def _track_accept(buffer_obj) -> bool:
+        accept_state["accepted_at"] = time.perf_counter()
+        accept_state["text"] = buffer_obj.text
+        accept_state["completer"] = type(buffer_obj.completer).__name__
+        accept_state["had_completions"] = buffer_obj.complete_state is not None
+        if original_accept_handler is not None:
+            return original_accept_handler(buffer_obj)
+        return True
+
+    buffer.accept_handler = _track_accept
     try:
         emit_prompt_mark("A")
         prompt_mark_started = True
@@ -2493,10 +2786,26 @@ async def get_enhanced_input(
             _resolve_prompt_text,
             default=buffer_default,
         )
+        prompt_returned_at = time.perf_counter()
         emit_prompt_mark("B")
         # Echo slash command input if the prompt was erased.
         if erase_when_done:
             stripped = result.lstrip()
+            accepted_at = accept_state.get("accepted_at")
+            if accepted_at:
+                shutdown_delay = prompt_returned_at - accepted_at
+                if shutdown_delay >= prompt_shutdown_warn_seconds and stripped.startswith("!"):
+                    text_preview = str(accept_state.get("text") or "").strip()
+                    if len(text_preview) > 80:
+                        text_preview = text_preview[:77] + "..."
+                    rich_print(
+                        "[yellow]Prompt shutdown delay[/yellow] "
+                        f"{shutdown_delay:.2f}s | "
+                        f"completer={accept_state.get('completer')} "
+                        f"completions_active={accept_state.get('had_completions')} "
+                        f"cwd={Path.cwd()} "
+                        f"input={text_preview!r}"
+                    )
             if stripped.startswith("/"):
                 rich_print(f"[dim]{agent_name} ❯ {stripped.splitlines()[0]}[/dim]")
             elif stripped.startswith("!"):
@@ -2656,7 +2965,7 @@ async def handle_special_commands(
         rich_print("  /skills add    - Install a skill from the marketplace")
         rich_print("  /skills remove - Remove a skill from the manager directory")
         rich_print(
-            "  /model reasoning <value> - Set reasoning effort (off/low/medium/high/xhigh or budgets like 0/1024/16000/32000)"
+            "  /model reasoning <value> - Set reasoning effort (off/low/medium/high/max/xhigh or budgets like 0/1024/16000/32000)"
         )
         rich_print("  /model verbosity <value> - Set text verbosity (low/medium/high)")
         rich_print("  /history [agent_name] - Show chat history overview")
@@ -2668,6 +2977,11 @@ async def handle_special_commands(
         )
         rich_print("  /markdown      - Show last assistant message without markdown formatting")
         rich_print("  /mcpstatus     - Show MCP server status summary for the active agent")
+        rich_print("  /mcp list      - List attached runtime MCP servers")
+        rich_print("  /mcp connect <target> - Connect MCP server at runtime")
+        rich_print("      [dim]flags: --name --auth --timeout --oauth/--no-oauth --reconnect[/dim]")
+        rich_print("  /mcp disconnect <name> - Disconnect attached MCP server")
+        rich_print("  /connect <target> - Alias for /mcp connect")
         rich_print("  /history save [filename] - Save current chat history to a file")
         rich_print(
             "      [dim]Tip: Use a .json extension for MCP-compatible JSON; any other extension saves Markdown.[/dim]"

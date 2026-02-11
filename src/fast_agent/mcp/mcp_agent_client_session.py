@@ -103,6 +103,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
 
         # Track the effective elicitation mode for diagnostics
         self.effective_elicitation_mode: str | None = "none"
+        self._offline_notified = False
 
         fast_agent_version = version("fast-agent-mcp") or "dev"
         fast_agent: Implementation = Implementation(name="fast-agent-mcp", version=fast_agent_version)
@@ -235,7 +236,12 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
             self._transport_metrics.register_ping_request(request_id)
         try:
             result = await super().send_request(
-                request=request,
+                # NOTE: request must be positional due to an upstream bug in
+                # opentelemetry-instrumentation-mcp (seen in 0.52.1) where the
+                # wrapper expects args[0] and can return None when request is
+                # only provided via kwargs.
+                # TODO: revert to keyword argument once upstream handles kwargs.
+                request,
                 result_type=result_type,
                 request_read_timeout_seconds=request_read_timeout_seconds,
                 metadata=metadata,
@@ -252,6 +258,7 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 and self._transport_metrics is not None
             ):
                 self._transport_metrics.discard_ping_request(request_id)
+            self._offline_notified = False
             return result
         except Exception as e:
             if (
@@ -273,11 +280,13 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
 
             # Handle connection closure errors (transport closed)
             if isinstance(e, ClosedResourceError):
-                from fast_agent.ui import console
+                if not self._offline_notified:
+                    from fast_agent.ui import console
 
-                console.console.print(
-                    f"[dim red]MCP server {self.session_server_name} offline[/dim red]"
-                )
+                    console.console.print(
+                        f"[dim red]MCP server {self.session_server_name} offline[/dim red]"
+                    )
+                    self._offline_notified = True
                 raise ConnectionError(f"MCP server {self.session_server_name} offline") from e
 
             logger.error(f"send_request failed: {str(e)}")

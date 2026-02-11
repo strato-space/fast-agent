@@ -3,13 +3,35 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
+from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
 import fast_agent.config as config_module
 from fast_agent.config import Settings, SkillsSettings, get_settings, update_global_settings
 from fast_agent.session import get_session_manager, reset_session_manager
 from fast_agent.ui.enhanced_prompt import AgentCompleter
+
+if TYPE_CHECKING:
+    from fast_agent.core.agent_app import AgentApp
+
+
+class _McpAgentStub:
+    def __init__(self, attached: list[str]) -> None:
+        self.aggregator = self
+        self._attached = attached
+
+    def list_attached_servers(self) -> list[str]:
+        return list(self._attached)
+
+
+class _ProviderStub:
+    def __init__(self, agent: object) -> None:
+        self._agent_obj = agent
+
+    def _agent(self, _name: str) -> object:
+        return self._agent_obj
 
 
 def test_complete_history_files_finds_json_and_md():
@@ -128,6 +150,51 @@ def test_get_completions_for_history_load_command():
             os.chdir(original_cwd)
 
 
+def test_get_completions_for_shell_path_prefix():
+    """Ensure shell completions treat path-like tokens as paths."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "script.sh").touch()
+        subdir = Path(tmpdir) / "data"
+        subdir.mkdir()
+
+        completer = AgentCompleter(agents=["agent1"])
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+
+            doc = Document("!./", cursor_position=len("!./"))
+            event = CompleteEvent(completion_requested=True)
+            completions = list(completer.get_completions(doc, event))
+            names = [c.text for c in completions]
+
+            assert "./script.sh" in names
+            assert "./data/" in names
+        finally:
+            os.chdir(original_cwd)
+
+
+def test_get_completions_for_shell_path_prefix_with_current_dir_partial():
+    """Ensure ./ prefix is preserved when completing in the current directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "script.sh").touch()
+
+        completer = AgentCompleter(agents=["agent1"])
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+
+            doc = Document("!./s", cursor_position=len("!./s"))
+            event = CompleteEvent(completion_requested=True)
+            completions = list(completer.get_completions(doc, event))
+            names = [c.text for c in completions]
+
+            assert "./script.sh" in names
+        finally:
+            os.chdir(original_cwd)
+
+
 def test_get_completions_for_history_subcommands():
     """Test get_completions suggests /history subcommands."""
     completer = AgentCompleter(agents=["agent1"])
@@ -170,6 +237,25 @@ def test_get_completions_for_session_pin(tmp_path: Path) -> None:
         reset_session_manager()
 
 
+def test_noenv_session_completion_does_not_create_session_storage(tmp_path: Path) -> None:
+    old_settings = get_settings()
+    env_dir = tmp_path / "env"
+    override = old_settings.model_copy(update={"environment_dir": str(env_dir)})
+    update_global_settings(override)
+    reset_session_manager()
+
+    try:
+        completer = AgentCompleter(agents=["agent1"], noenv_mode=True)
+        doc = Document("/resume ", cursor_position=len("/resume "))
+        completions = list(completer.get_completions(doc, None))
+
+        assert completions == []
+        assert not (env_dir / "sessions").exists()
+    finally:
+        update_global_settings(old_settings)
+        reset_session_manager()
+
+
 def _write_skill(skill_root: Path, name: str) -> None:
     skill_dir = skill_root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +278,33 @@ def test_get_completions_for_skills_subcommands():
     assert "add" in names
     assert "remove" in names
     assert "registry" in names
+
+
+def test_get_completions_for_mcp_subcommands() -> None:
+    completer = AgentCompleter(agents=["agent1"])
+
+    doc = Document("/mcp ", cursor_position=len("/mcp "))
+    completions = list(completer.get_completions(doc, None))
+    names = [c.text for c in completions]
+
+    assert "list" in names
+    assert "connect" in names
+    assert "disconnect" in names
+
+
+def test_get_completions_for_mcp_disconnect_servers() -> None:
+    provider = _ProviderStub(_McpAgentStub(["local", "docs"]))
+    completer = AgentCompleter(
+        agents=["agent1"],
+        current_agent="agent1",
+        agent_provider=cast("AgentApp", provider),
+    )
+
+    doc = Document("/mcp disconnect d", cursor_position=len("/mcp disconnect d"))
+    completions = list(completer.get_completions(doc, None))
+    names = [c.text for c in completions]
+
+    assert "docs" in names
 
 
 def test_get_completions_for_skills_remove(monkeypatch):

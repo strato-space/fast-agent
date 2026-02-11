@@ -195,13 +195,17 @@ from typing import TYPE_CHECKING, Any
 from mcp import ListToolsResult, Tool
 from mcp.types import CallToolResult
 
+from fast_agent.acp.tool_call_context import acp_tool_call_context
 from fast_agent.agents.mcp_agent import McpAgent
 from fast_agent.agents.tool_runner import ToolRunnerHooks
-from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL, FORCE_SEQUENTIAL_TOOL_CALLS
+from fast_agent.constants import (
+    FAST_AGENT_ERROR_CHANNEL,
+    FORCE_SEQUENTIAL_TOOL_CALLS,
+    should_parallelize_tool_calls,
+)
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt import Prompt
 from fast_agent.interfaces import ToolRunnerHookCapable
-from fast_agent.mcp.common import get_resource_name, get_server_name, is_namespaced_name
 from fast_agent.mcp.helpers.content_helpers import get_text, text_content
 from fast_agent.mcp.prompts.prompt_load import load_prompt
 from fast_agent.types import PromptMessageExtended, RequestParams
@@ -485,22 +489,25 @@ class AgentsAsToolsAgent(McpAgent):
         tool_call_id: str | None = None
         progress_step = 0
 
-        resolved_tool_name = tool_name or child.name
-        if resolved_tool_name and is_namespaced_name(resolved_tool_name):
-            server_name = get_server_name(resolved_tool_name)
-            base_tool_name = get_resource_name(resolved_tool_name)
-        else:
-            server_name = "agent"
-            base_tool_name = resolved_tool_name
+        # ACP/Nexus UX: treat "agent tool calls" as task-like tool calls and expose
+        # the detached instance suffix (e.g. `PM-1-DayStatusSummarizer[1]`) in the title.
+        # NOTE: detached instances set the runtime name on a private `_name` field.
+        # Using `.name` here would drop the `[i]` suffix, and ACP progress updates
+        # would then show a bracketed counter (e.g. `[7]`) which is easy to confuse
+        # with the instance index. Prefer `_name` when available.
+        agent_instance_name = getattr(child, "_name", child.name)
+        server_name = "agent"
+        base_tool_name = agent_instance_name
 
         if tool_handler and base_tool_name:
             try:
-                tool_call_id = await tool_handler.on_tool_start(
-                    base_tool_name,
-                    server_name,
-                    args,
-                    tool_use_id,
-                )
+                with acp_tool_call_context():
+                    tool_call_id = await tool_handler.on_tool_start(
+                        base_tool_name,
+                        server_name,
+                        args,
+                        tool_use_id,
+                    )
             except Exception:
                 tool_call_id = None
 
@@ -509,16 +516,16 @@ class AgentsAsToolsAgent(McpAgent):
             if not tool_handler or not tool_call_id:
                 return
             progress_step += 1
-            message = f"{base_tool_name} step {progress_step}" if base_tool_name else "step"
-            if label:
-                message = f"{message} ({label})"
             try:
-                await tool_handler.on_tool_progress(
-                    tool_call_id,
-                    float(progress_step),
-                    None,
-                    message,
-                )
+                # Title already includes the agent instance name; keep progress updates minimal.
+                # The progress counter itself is shown as `[N]` in ACP tool titles.
+                with acp_tool_call_context():
+                    await tool_handler.on_tool_progress(
+                        tool_call_id,
+                        float(progress_step),
+                        None,
+                        None,
+                    )
             except Exception:
                 pass
 
@@ -554,10 +561,18 @@ class AgentsAsToolsAgent(McpAgent):
             hooks_set = True
 
         try:
-            with self._child_display_suppressed(child) if suppress_display else nullcontext():
-                if tool_handler and tool_call_id and not hooks_set:
-                    await emit_progress("run")
-                response: PromptMessageExtended = await child.generate([child_request], None)
+            scope = (
+                acp_tool_call_context(
+                    parent_tool_call_id=tool_call_id
+                )
+                if tool_handler and tool_call_id
+                else acp_tool_call_context()
+            )
+            with scope:
+                with self._child_display_suppressed(child) if suppress_display else nullcontext():
+                    if tool_handler and tool_call_id and not hooks_set:
+                        await emit_progress("run")
+                    response: PromptMessageExtended = await child.generate([child_request], None)
             content_blocks = list(response.content or [])
 
             error_blocks = None
@@ -576,19 +591,21 @@ class AgentsAsToolsAgent(McpAgent):
                         error_text = None
                         if error_blocks:
                             error_text = get_text(error_blocks[0])
-                        await tool_handler.on_tool_complete(
-                            tool_call_id,
-                            False,
-                            None,
-                            error_text,
-                        )
+                        with acp_tool_call_context():
+                            await tool_handler.on_tool_complete(
+                                tool_call_id,
+                                False,
+                                None,
+                                error_text,
+                            )
                     else:
-                        await tool_handler.on_tool_complete(
-                            tool_call_id,
-                            True,
-                            tool_result.content,
-                            None,
-                        )
+                        with acp_tool_call_context():
+                            await tool_handler.on_tool_complete(
+                                tool_call_id,
+                                True,
+                                tool_result.content,
+                                None,
+                            )
                 except Exception:
                     pass
             return tool_result
@@ -606,7 +623,10 @@ class AgentsAsToolsAgent(McpAgent):
             )
             if tool_handler and tool_call_id:
                 try:
-                    await tool_handler.on_tool_complete(tool_call_id, False, None, str(exc))
+                    with acp_tool_call_context():
+                        await tool_handler.on_tool_complete(
+                            tool_call_id, False, None, str(exc)
+                        )
                 except Exception:
                     pass
             return CallToolResult(content=[text_content(f"Error: {exc}")], isError=True)
@@ -647,7 +667,12 @@ class AgentsAsToolsAgent(McpAgent):
             name, arguments, tool_use_id, request_params=request_params
         )
 
-    def _show_parallel_tool_calls(self, descriptors: list[dict[str, Any]]) -> None:
+    def _show_parallel_tool_calls(
+        self,
+        descriptors: list[dict[str, Any]],
+        *,
+        show_tool_call_id: bool = False,
+    ) -> None:
         """Display tool call headers for parallel agent execution.
 
         Args:
@@ -690,6 +715,7 @@ class AgentsAsToolsAgent(McpAgent):
                 bottom_items=[bottom_item],  # Only this instance's label
                 max_item_length=28,
                 metadata={"correlation_id": corr_id, "instance_name": display_tool_name},
+                tool_call_id=corr_id if show_tool_call_id else None,
                 type_label="subagent",
                 show_hook_indicator=self.has_external_hooks,
             )
@@ -706,7 +732,12 @@ class AgentsAsToolsAgent(McpAgent):
                 show_hook_indicator=self.has_external_hooks,
             )
 
-    def _show_parallel_tool_results(self, records: list[dict[str, Any]]) -> None:
+    def _show_parallel_tool_results(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        show_tool_call_id: bool = False,
+    ) -> None:
         """Display tool result panels for parallel agent execution.
 
         Args:
@@ -723,6 +754,7 @@ class AgentsAsToolsAgent(McpAgent):
             descriptor = record.get("descriptor", {})
             result = record.get("result")
             tool_name = descriptor.get("tool", "(unknown)")
+            corr_id = descriptor.get("id")
 
             if result:
                 base_tool_name = tool_name[7:] if tool_name.startswith("agent__") else tool_name
@@ -734,6 +766,7 @@ class AgentsAsToolsAgent(McpAgent):
                     tool_name=display_tool_name,
                     type_label="subagent response",
                     result=result,
+                    tool_call_id=corr_id if show_tool_call_id else None,
                     show_hook_indicator=self.has_external_hooks,
                 )
         if total > limit:
@@ -1006,7 +1039,23 @@ class AgentsAsToolsAgent(McpAgent):
                         )
                     )
 
-        self._show_parallel_tool_calls(call_descriptors)
+        show_tool_call_id = should_parallelize_tool_calls(len(id_list))
+        if len(id_list) > 1:
+            try:
+                did_close = self.close_active_streaming_display(reason="parallel tool calls")
+            except AttributeError:
+                did_close = False
+            if did_close:
+                logger.info(
+                    "Closing streaming display due to parallel subagent tool calls",
+                    tool_call_count=len(id_list),
+                    agent_name=self.name,
+                )
+
+        self._show_parallel_tool_calls(
+            call_descriptors,
+            show_tool_call_id=show_tool_call_id,
+        )
 
         results: list[CallToolResult | BaseException] = []
         if id_list:
@@ -1052,7 +1101,10 @@ class AgentsAsToolsAgent(McpAgent):
             descriptor = descriptor_by_id.get(cid, {})
             ordered_records.append({"descriptor": descriptor, "result": result})
 
-        self._show_parallel_tool_results(ordered_records)
+        self._show_parallel_tool_results(
+            ordered_records,
+            show_tool_call_id=show_tool_call_id,
+        )
 
         return tool_results, tool_loop_error
 
