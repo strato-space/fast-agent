@@ -178,6 +178,7 @@ uv.lock
 project_contents.md
 
 # example logs
+*.jsonl
 examples/**/*.jsonl
 fastagent.secrets.yaml
 CLAUDE.md
