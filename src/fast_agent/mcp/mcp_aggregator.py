@@ -1,3 +1,5 @@
+import os
+import sys
 from asyncio import Lock
 from collections import Counter
 from dataclasses import dataclass, field
@@ -18,8 +20,12 @@ from mcp.client.session import ClientSession
 from mcp.shared.session import ProgressFnT
 from mcp.types import (
     CallToolResult,
+    CompleteResult,
+    Completion,
     ListToolsResult,
     Prompt,
+    ResourceTemplate,
+    ResourceTemplateReference,
     ServerCapabilities,
     TextContent,
     Tool,
@@ -31,9 +37,11 @@ from fast_agent.config import MCPServerSettings
 from fast_agent.context_dependent import ContextDependent
 from fast_agent.core.exceptions import ServerSessionTerminatedError
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.core.logging.progress_payloads import build_progress_payload
 from fast_agent.core.model_resolution import HARDCODED_DEFAULT_MODEL, resolve_model_spec
 from fast_agent.event_progress import ProgressAction
 from fast_agent.mcp.common import SEP, create_namespaced_name, is_namespaced_name
+from fast_agent.mcp.experimental_session_client import ExperimentalSessionClient
 from fast_agent.mcp.gen_client import gen_client
 from fast_agent.mcp.interfaces import ServerRegistryProtocol
 from fast_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
@@ -57,9 +65,24 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)  # This will be replaced per-instance when agent_name is available
 
+
+def _progress_trace_enabled() -> bool:
+    value = os.environ.get("FAST_AGENT_TRACE_MCP_PROGRESS", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _progress_trace(message: str) -> None:
+    if not _progress_trace_enabled():
+        return
+    print(f"[mcp-progress-trace] {message}", file=sys.stderr, flush=True)
+
+
 # Define type variables for the generalized method
 T = TypeVar("T")
 R = TypeVar("R")
+
+SESSION_NOT_FOUND_ERROR_CODE = -32043
+LEGACY_SESSION_REQUIRED_ERROR_CODE = -32002
 
 
 class NamespacedTool(BaseModel):
@@ -115,6 +138,10 @@ class ServerStatus(BaseModel):
     sampling_mode: str | None = None
     spoofing_enabled: bool | None = None
     session_id: str | None = None
+    experimental_session_supported: bool | None = None
+    experimental_session_features: list[str] | None = None
+    session_cookie: dict[str, Any] | None = None
+    session_title: str | None = None
     transport_channels: TransportSnapshot | None = None
     skybridge: SkybridgeServerConfig | None = None
     reconnect_count: int = 0
@@ -152,6 +179,8 @@ class MCPAttachResult:
     tools_added: list[str]
     prompts_added: list[str]
     warnings: list[str]
+    tools_total: int | None = None
+    prompts_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +321,9 @@ class MCPAggregator(ContextDependent):
         # Track discovered Skybridge configurations per server
         self._skybridge_configs: dict[str, SkybridgeServerConfig] = {}
 
+        # Focused API for experimental data-layer session metadata controls.
+        self.experimental_sessions = ExperimentalSessionClient(self)
+
     def _require_context(self) -> "Context":
         if self.context is None:
             raise RuntimeError("MCPAggregator requires a context")
@@ -314,6 +346,7 @@ class MCPAggregator(ContextDependent):
         server_name: str,
         tool_name: str,
         tool_call_id: str,
+        tool_use_id: str | None = None,
         request_tool_handler: ToolExecutionHandler | None = None,
     ) -> "ProgressFnT":
         """Create a progress callback function for tool execution."""
@@ -323,24 +356,34 @@ class MCPAggregator(ContextDependent):
             progress: float, total: float | None, message: str | None
         ) -> None:
             """Handle progress notifications from MCP tool execution."""
+            _progress_trace(
+                "callback-progress "
+                f"server={server_name} "
+                f"tool={tool_name} "
+                f"tool_call_id={tool_call_id} "
+                f"progress={progress!r} "
+                f"total={total!r} "
+                f"message={message!r}"
+            )
+
             logger.info(
                 "Tool progress update",
-                data={
-                    "progress_action": ProgressAction.TOOL_PROGRESS,
-                    "tool_name": tool_name,
-                    "server_name": server_name,
-                    "agent_name": self.agent_name,
-                    "progress": progress,
-                    "total": total,
-                    "details": message or "",  # Put the message in details column
-                },
+                data=build_progress_payload(
+                    action=ProgressAction.TOOL_PROGRESS,
+                    tool_name=tool_name,
+                    server_name=server_name,
+                    agent_name=self.agent_name,
+                    tool_call_id=tool_call_id,
+                    tool_use_id=tool_use_id,
+                    progress=progress,
+                    total=total,
+                    details=message or "",  # Put the message in details column
+                ),
             )
 
             # Forward progress to tool handler (e.g., for ACP notifications)
             try:
-                await handler_for_request.on_tool_progress(
-                    tool_call_id, progress, total, message
-                )
+                await handler_for_request.on_tool_progress(tool_call_id, progress, total, message)
             except Exception as e:
                 logger.error(f"Error in tool progress handler: {e}", exc_info=True)
 
@@ -418,9 +461,7 @@ class MCPAggregator(ContextDependent):
             if self.config:
                 cli_model_override = None
                 if self.context and getattr(self.context, "config", None):
-                    cli_model_override = getattr(
-                        self.context.config, "cli_model_override", None
-                    )
+                    cli_model_override = getattr(self.context.config, "cli_model_override", None)
                 agent_model, model_source = resolve_model_spec(
                     self.context,
                     model=self.config.model,
@@ -437,7 +478,7 @@ class MCPAggregator(ContextDependent):
                 elicitation_handler = self.config.elicitation_handler
                 api_key = self.config.api_key
 
-            return MCPAgentClientSession(
+            session = MCPAgentClientSession(
                 read_stream,
                 write_stream,
                 read_timeout,
@@ -449,6 +490,12 @@ class MCPAggregator(ContextDependent):
                 tool_list_changed_callback=self._handle_tool_list_changed,
                 **kwargs,  # Pass through any additional kwargs like server_config
             )
+
+            bootstrap_cookie = self.experimental_sessions.bootstrap_cookie_for_server(server_name)
+            if isinstance(bootstrap_cookie, dict):
+                session.set_experimental_session_cookie(bootstrap_cookie)
+
+            return session
 
         return session_factory
 
@@ -590,6 +637,11 @@ class MCPAggregator(ContextDependent):
             )
             server_registry.registry[server_name] = resolved_config
 
+        existing_tool_names = {
+            tool.namespaced_tool_name for tool in self._server_to_tool_map.get(server_name, [])
+        }
+        existing_prompt_names = {prompt.name for prompt in self._prompt_cache.get(server_name, [])}
+
         already_attached = server_name in self._attached_server_names
         if already_attached and not attach_options.force_reconnect:
             return MCPAttachResult(
@@ -600,20 +652,15 @@ class MCPAggregator(ContextDependent):
                 tools_added=[],
                 prompts_added=[],
                 warnings=[],
+                tools_total=len(existing_tool_names),
+                prompts_total=len(existing_prompt_names),
             )
-
-        existing_tool_names = {
-            tool.namespaced_tool_name for tool in self._server_to_tool_map.get(server_name, [])
-        }
-        existing_prompt_names = {
-            prompt.name for prompt in self._prompt_cache.get(server_name, [])
-        }
 
         if self.connection_persistence:
             logger.info(
                 f"Creating persistent connection to server: {server_name}",
                 data={
-                    "progress_action": ProgressAction.STARTING,
+                    "progress_action": ProgressAction.CONNECTING,
                     "server_name": server_name,
                     "agent_name": self.agent_name,
                 },
@@ -694,6 +741,8 @@ class MCPAggregator(ContextDependent):
             tools_added=sorted(tool_names - existing_tool_names),
             prompts_added=sorted(prompt_names - existing_prompt_names),
             warnings=list(skybridge_config.warnings),
+            tools_total=len(tool_names),
+            prompts_total=len(prompt_names),
         )
 
     async def detach_server(self, server_name: str) -> MCPDetachResult:
@@ -750,9 +799,7 @@ class MCPAggregator(ContextDependent):
         if not target_servers:
             return
 
-        tasks = [
-            self._evaluate_skybridge_for_server(server_name) for server_name in target_servers
-        ]
+        tasks = [self._evaluate_skybridge_for_server(server_name) for server_name in target_servers]
         results = await gather_with_cancel(tasks)
 
         for result in results:
@@ -1168,6 +1215,10 @@ class MCPAggregator(ContextDependent):
             spoofing_enabled = None
             server_cfg = None
             session_id = None
+            experimental_session_supported: bool | None = None
+            experimental_session_features: list[str] | None = None
+            session_cookie: dict[str, Any] | None = None
+            session_title: str | None = None
             server_conn = None
             transport: str | None = None
             transport_snapshot: TransportSnapshot | None = None
@@ -1222,12 +1273,39 @@ class MCPAggregator(ContextDependent):
                         ping_last_error = server_conn._ping_last_error
                         if session:
                             elicitation_mode = session.effective_elicitation_mode
+                            experimental_session_supported = getattr(
+                                session, "experimental_session_supported", None
+                            )
+                            raw_features = getattr(session, "experimental_session_features", None)
+                            if raw_features is not None:
+                                experimental_session_features = [
+                                    str(feature)
+                                    for feature in raw_features
+                                    if isinstance(feature, str) and feature
+                                ]
+                            raw_cookie = getattr(session, "experimental_session_cookie", None)
+                            if isinstance(raw_cookie, dict):
+                                session_cookie = dict(raw_cookie)
+                            raw_title = getattr(session, "experimental_session_title", None)
+                            if isinstance(raw_title, str) and raw_title.strip():
+                                session_title = raw_title.strip()
+                            if session_title is None and isinstance(session_cookie, dict):
+                                cookie_data = session_cookie.get("data")
+                                if isinstance(cookie_data, dict):
+                                    cookie_title = cookie_data.get("title") or cookie_data.get("label")
+                                    if isinstance(cookie_title, str) and cookie_title.strip():
+                                        session_title = cookie_title.strip()
+
                             session_id = server_conn.session_id
                             if not session_id and server_conn._get_session_id_cb:
                                 try:
                                     session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
                                 except Exception:
                                     session_id = None
+                            if not session_id and isinstance(session_cookie, dict):
+                                cookie_id = session_cookie.get("id")
+                                if isinstance(cookie_id, str) and cookie_id:
+                                    session_id = cookie_id
                         metrics = server_conn.transport_metrics
                         if metrics is not None:
                             try:
@@ -1335,6 +1413,10 @@ class MCPAggregator(ContextDependent):
                 sampling_mode=sampling_mode,
                 spoofing_enabled=spoofing_enabled,
                 session_id=session_id,
+                experimental_session_supported=experimental_session_supported,
+                experimental_session_features=experimental_session_features,
+                session_cookie=session_cookie,
+                session_title=session_title,
                 transport_channels=transport_snapshot,
                 skybridge=self._skybridge_configs.get(server_name),
                 reconnect_count=reconnect_count,
@@ -1405,14 +1487,28 @@ class MCPAggregator(ContextDependent):
                 # Prepare kwargs
                 kwargs = method_args or {}
                 if metadata:
-                    kwargs["_meta"] = metadata
+                    # call_tool expects `meta=` (matching MCP ClientSession API)
+                    # while read_resource/get_prompt use our local `_meta=` adapter.
+                    if method_name == "call_tool":
+                        kwargs["meta"] = metadata
+                    else:
+                        kwargs["_meta"] = metadata
 
                 # For call_tool method, check if we need to add progress_callback
                 if method_name == "call_tool" and progress_callback:
                     # The call_tool method signature includes progress_callback parameter
-                    return await method(progress_callback=progress_callback, **kwargs)
+                    result = await method(progress_callback=progress_callback, **kwargs)
                 else:
-                    return await method(**(kwargs or {}))
+                    result = await method(**(kwargs or {}))
+
+                if method_name == "call_tool":
+                    self._maybe_mark_rejected_session_cookie_from_tool_result(
+                        server_name=server_name,
+                        client=client,
+                        result=result,
+                    )
+
+                return result
             except ConnectionError:
                 # Let ConnectionError pass through for reconnection logic
                 raise
@@ -1420,12 +1516,20 @@ class MCPAggregator(ContextDependent):
                 # Let ServerSessionTerminatedError pass through for reconnection logic
                 raise
             except Exception as e:
+                self._maybe_mark_rejected_session_cookie(server_name=server_name, client=client, exc=e)
                 error_msg = (
                     f"Failed to {method_name} '{operation_name}' on server '{server_name}': {e}"
                 )
                 logger.error(error_msg)
                 if error_factory:
-                    return error_factory(error_msg)
+                    error_result = error_factory(error_msg)
+                    payload = MCPAgentClientSession.get_url_elicitation_required_payload(e)
+                    if payload is not None:
+                        try:
+                            setattr(error_result, "_fast_agent_url_elicitation_required", payload)
+                        except Exception:
+                            pass
+                    return error_result
                 else:
                     # Re-raise the original exception to propagate it
                     raise e
@@ -1449,15 +1553,13 @@ class MCPAggregator(ContextDependent):
                 logger.debug(
                     f"Creating temporary connection to server: {server_name}",
                     data={
-                        "progress_action": ProgressAction.STARTING,
+                        "progress_action": ProgressAction.CONNECTING,
                         "server_name": server_name,
                         "agent_name": self.agent_name,
                     },
                 )
                 server_registry = self._require_server_registry()
-                async with gen_client(
-                    server_name, server_registry=server_registry
-                ) as client:
+                async with gen_client(server_name, server_registry=server_registry) as client:
                     result = await try_execute(client)
                     logger.debug(
                         f"Closing temporary connection to server: {server_name}",
@@ -1486,13 +1588,136 @@ class MCPAggregator(ContextDependent):
                 await self._record_server_call(server_name, operation_type, success_flag)
 
         if result is None:
-            error_msg = (
-                f"Failed to {method_name} '{operation_name}' on server '{server_name}'"
-            )
+            error_msg = f"Failed to {method_name} '{operation_name}' on server '{server_name}'"
             if error_factory:
                 return error_factory(error_msg)
             raise RuntimeError(error_msg)
         return result
+
+    @staticmethod
+    def _is_session_required_error(exc: Exception) -> bool:
+        from mcp.shared.exceptions import McpError
+
+        if not isinstance(exc, McpError):
+            return False
+
+        error_data = getattr(exc, "error", None)
+        if error_data is None:
+            return False
+
+        code = getattr(error_data, "code", None)
+        return code in {
+            SESSION_NOT_FOUND_ERROR_CODE,
+            LEGACY_SESSION_REQUIRED_ERROR_CODE,
+        }
+
+    def _maybe_mark_rejected_session_cookie(
+        self,
+        *,
+        server_name: str,
+        client: ClientSession,
+        exc: Exception,
+    ) -> None:
+        if not self._is_session_required_error(exc):
+            return
+
+        error_data = getattr(exc, "error", None)
+        reason = getattr(error_data, "message", None)
+        reason_text = str(reason) if isinstance(reason, str) and reason else None
+
+        self._invalidate_session_cookie(
+            server_name=server_name,
+            client=client,
+            reason=reason_text,
+        )
+
+    def _maybe_mark_rejected_session_cookie_from_tool_result(
+        self,
+        *,
+        server_name: str,
+        client: ClientSession,
+        result: Any,
+    ) -> None:
+        if not self._is_session_required_tool_error_result(result):
+            return
+
+        self._invalidate_session_cookie(
+            server_name=server_name,
+            client=client,
+            reason=self._extract_tool_error_text(result),
+        )
+
+    @staticmethod
+    def _extract_tool_error_text(result: Any) -> str | None:
+        content = getattr(result, "content", None)
+        if not isinstance(content, list):
+            return None
+
+        for item in content:
+            if isinstance(item, TextContent):
+                text = item.text.strip()
+                if text:
+                    return text
+                continue
+
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+        return None
+
+    @classmethod
+    def _is_session_required_tool_error_result(cls, result: Any) -> bool:
+        if not bool(getattr(result, "isError", False)):
+            return False
+
+        text = cls._extract_tool_error_text(result)
+        if not text:
+            return False
+
+        normalized = text.lower()
+        return (
+            "session not found" in normalized
+            or "session required" in normalized
+            or "send sessions/create" in normalized
+        )
+
+    def _invalidate_session_cookie(
+        self,
+        *,
+        server_name: str,
+        client: ClientSession,
+        reason: str | None,
+    ) -> None:
+        session_id = getattr(client, "experimental_session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            return
+
+        clear_cookie = getattr(client, "set_experimental_session_cookie", None)
+        if callable(clear_cookie):
+            try:
+                clear_cookie(None)
+            except Exception:
+                logger.debug(
+                    "Failed clearing rejected MCP session metadata",
+                    server_name=server_name,
+                    session_id=session_id,
+                    exc_info=True,
+                )
+
+        try:
+            self.experimental_sessions.mark_cookie_invalidated(
+                server_name,
+                session_id=session_id,
+                reason=reason,
+            )
+        except Exception:
+            logger.debug(
+                "Failed marking MCP session entry invalidated",
+                server_name=server_name,
+                session_id=session_id,
+                exc_info=True,
+            )
 
     async def _handle_connection_error(
         self,
@@ -1520,9 +1745,7 @@ class MCPAggregator(ContextDependent):
             else:
                 # For non-persistent connections, just try again
                 server_registry = self._require_server_registry()
-                async with gen_client(
-                    server_name, server_registry=server_registry
-                ) as client:
+                async with gen_client(server_name, server_registry=server_registry) as client:
                     result = await try_execute(client)
 
             # Success!
@@ -1606,9 +1829,7 @@ class MCPAggregator(ContextDependent):
             else:
                 # For non-persistent connections, just try again
                 server_registry = self._require_server_registry()
-                async with gen_client(
-                    server_name, server_registry=server_registry
-                ) as client:
+                async with gen_client(server_name, server_registry=server_registry) as client:
                     result = await try_execute(client)
 
             # Success! Record the reconnection
@@ -1645,9 +1866,7 @@ class MCPAggregator(ContextDependent):
             else:
                 raise Exception(error_msg)
 
-    async def _parse_resource_name(
-        self, name: str, resource_type: str
-    ) -> tuple[str | None, str]:
+    async def _parse_resource_name(self, name: str, resource_type: str) -> tuple[str | None, str]:
         """
         Parse a possibly namespaced resource name into server name and local resource name.
 
@@ -1766,16 +1985,6 @@ class MCPAggregator(ContextDependent):
                 content=[TextContent(type="text", text=f"Permission check failed: {e}")],
             )
 
-        logger.info(
-            "Requesting tool call",
-            data={
-                "progress_action": ProgressAction.CALLING_TOOL,
-                "tool_name": local_tool_name,
-                "server_name": server_name,
-                "agent_name": self.agent_name,
-            },
-        )
-
         # Notify tool handler that execution is starting
         try:
             tool_call_id = await active_tool_handler.on_tool_start(
@@ -1788,6 +1997,18 @@ class MCPAggregator(ContextDependent):
 
             tool_call_id = str(uuid.uuid4())
 
+        logger.info(
+            "Requesting tool call",
+            data=build_progress_payload(
+                action=ProgressAction.CALLING_TOOL,
+                tool_name=local_tool_name,
+                server_name=server_name,
+                agent_name=self.agent_name,
+                tool_call_id=tool_call_id,
+                tool_use_id=tool_use_id,
+            ),
+        )
+
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(f"MCP Tool: {namespaced_tool_name}"):
             trace.get_current_span().set_attribute("tool_name", local_tool_name)
@@ -1799,6 +2020,7 @@ class MCPAggregator(ContextDependent):
                 server_name,
                 local_tool_name,
                 tool_call_id,
+                tool_use_id,
                 active_tool_handler,
             )
 
@@ -1816,6 +2038,22 @@ class MCPAggregator(ContextDependent):
                         isError=True, content=[TextContent(type="text", text=msg)]
                     ),
                     progress_callback=progress_callback,
+                )
+
+                completion_state = "completed" if not result.isError else "failed"
+                logger.info(
+                    "Tool call completed",
+                    data=build_progress_payload(
+                        action=ProgressAction.TOOL_PROGRESS,
+                        tool_name=local_tool_name,
+                        server_name=server_name,
+                        agent_name=self.agent_name,
+                        tool_call_id=tool_call_id,
+                        tool_use_id=tool_use_id,
+                        progress=1.0,
+                        total=1.0,
+                        details=completion_state,
+                    ),
                 )
 
                 # Notify tool handler of completion
@@ -1854,11 +2092,23 @@ class MCPAggregator(ContextDependent):
                 return result
 
             except Exception as e:
+                logger.info(
+                    "Tool call failed",
+                    data=build_progress_payload(
+                        action=ProgressAction.TOOL_PROGRESS,
+                        tool_name=local_tool_name,
+                        server_name=server_name,
+                        agent_name=self.agent_name,
+                        tool_call_id=tool_call_id,
+                        tool_use_id=tool_use_id,
+                        progress=1.0,
+                        total=1.0,
+                        details=f"failed: {e}",
+                    ),
+                )
                 # Notify tool handler of error
                 try:
-                    await active_tool_handler.on_tool_complete(
-                        tool_call_id, False, None, str(e)
-                    )
+                    await active_tool_handler.on_tool_complete(tool_call_id, False, None, str(e))
                 except Exception as handler_error:
                     logger.error(f"Error in tool complete handler: {handler_error}", exc_info=True)
                 raise
@@ -2338,12 +2588,12 @@ class MCPAggregator(ContextDependent):
 
         logger.info(
             "Requesting resource",
-            data={
-                "progress_action": ProgressAction.CALLING_TOOL,
-                "resource_uri": resource_uri,
-                "server_name": server_name,
-                "agent_name": self.agent_name,
-            },
+            data=build_progress_payload(
+                action=ProgressAction.CALLING_TOOL,
+                server_name=server_name,
+                agent_name=self.agent_name,
+                extra={"resource_uri": resource_uri},
+            ),
         )
 
         try:
@@ -2394,6 +2644,24 @@ class MCPAggregator(ContextDependent):
 
         return getattr(result, "resources", []) or []
 
+    async def _list_resource_templates_from_server(
+        self, server_name: str, *, check_support: bool = True
+    ) -> list[ResourceTemplate]:
+        """Internal helper to list resource templates from a specific server."""
+        if check_support and not await self.server_supports_feature(server_name, "resources"):
+            return []
+
+        result = await self._execute_on_server(
+            server_name=server_name,
+            operation_type="resources/templates/list",
+            operation_name="",
+            method_name="list_resource_templates",
+            method_args={},
+            error_factory=lambda _: None,
+        )
+
+        return getattr(result, "resourceTemplates", []) or []
+
     async def list_resources(self, server_name: str | None = None) -> dict[str, list[str]]:
         """
         List available resources from one or all servers.
@@ -2439,6 +2707,67 @@ class MCPAggregator(ContextDependent):
                 logger.error(f"Error fetching resources from {s_name}: {e}")
 
         return results
+
+    async def list_resource_templates(
+        self, server_name: str | None = None
+    ) -> dict[str, list[ResourceTemplate]]:
+        """List available resource templates from one or all servers."""
+        if not self.initialized:
+            await self.load_servers()
+
+        results: dict[str, list[ResourceTemplate]] = {}
+        servers_to_check = [server_name] if server_name else self.server_names
+
+        for s_name in servers_to_check:
+            if s_name not in self.server_names:
+                logger.error(f"Server '{s_name}' not found")
+                continue
+
+            results[s_name] = []
+
+            if not await self.server_supports_feature(s_name, "resources"):
+                logger.debug(f"Server '{s_name}' does not support resources")
+                continue
+
+            try:
+                templates = await self._list_resource_templates_from_server(
+                    s_name, check_support=False
+                )
+                results[s_name] = list(templates)
+            except Exception as e:
+                logger.error(f"Error fetching resource templates from {s_name}: {e}")
+
+        return results
+
+    async def complete_resource_argument(
+        self,
+        server_name: str,
+        template_uri: str,
+        argument_name: str,
+        value: str,
+        context_args: dict[str, str] | None = None,
+    ) -> Completion:
+        """Request MCP completion for resource template argument values."""
+        if not await self.validate_server(server_name):
+            return Completion(values=[])
+
+        if not await self.server_supports_feature(server_name, "completions"):
+            return Completion(values=[])
+
+        result: CompleteResult = await self._execute_on_server(
+            server_name=server_name,
+            operation_type="completion/complete",
+            operation_name=template_uri,
+            method_name="complete",
+            method_args={
+                "ref": ResourceTemplateReference(type="ref/resource", uri=template_uri),
+                "argument": {"name": argument_name, "value": value},
+                "context_arguments": context_args,
+            },
+            error_factory=lambda _msg: CompleteResult(completion=Completion(values=[])),
+        )
+
+        return result.completion
 
     async def list_mcp_tools(self, server_name: str | None = None) -> dict[str, list[Tool]]:
         """

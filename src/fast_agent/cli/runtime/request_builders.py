@@ -33,15 +33,35 @@ def is_multi_model(model: str | None) -> bool:
 
 
 def use_smart_agent(model: str | None, mode: Literal["interactive", "serve"]) -> bool:
+    return resolve_smart_agent_enabled(model, mode, force_smart=False)
+
+
+def resolve_smart_agent_enabled(
+    model: str | None,
+    mode: Literal["interactive", "serve"],
+    *,
+    force_smart: bool,
+) -> bool:
     if is_multi_model(model):
         return False
+    if force_smart:
+        return True
     if mode == "serve":
         return DEFAULT_SERVE_AGENT_TYPE == "smart"
     return DEFAULT_GO_AGENT_TYPE == "smart"
 
 
-def resolve_default_instruction(model: str | None, mode: Literal["interactive", "serve"]) -> str:
-    return SMART_AGENT_INSTRUCTION if use_smart_agent(model, mode) else DEFAULT_AGENT_INSTRUCTION
+def resolve_default_instruction(
+    model: str | None,
+    mode: Literal["interactive", "serve"],
+    *,
+    force_smart: bool = False,
+) -> str:
+    return (
+        SMART_AGENT_INSTRUCTION
+        if resolve_smart_agent_enabled(model, mode, force_smart=force_smart)
+        else DEFAULT_AGENT_INSTRUCTION
+    )
 
 
 def merge_card_sources(
@@ -100,13 +120,46 @@ def validate_noenv_conflicts(
         raise typer.BadParameter("Cannot combine --noenv with --resume.")
 
 
+def validate_multi_model_card_conflicts(
+    *,
+    model: str | None,
+    merged_agent_cards: list[str] | None,
+    merged_card_tools: list[str] | None,
+    explicit_agent_cards: bool,
+    explicit_card_tools: bool,
+) -> None:
+    """Reject unsupported combinations of multi-model mode and card loading."""
+    if not is_multi_model(model):
+        return
+
+    if not merged_agent_cards and not merged_card_tools:
+        return
+
+    message = (
+        "Cannot use multiple models with AgentCards or card tools. "
+        "Multi-model mode (--model a,b) uses automatic parallel fan-out and requires no cards."
+    )
+
+    if explicit_agent_cards or explicit_card_tools:
+        message += " Remove --agent-cards/--card-tool, or use a single --model value."
+    else:
+        message += (
+            " Implicit cards were found in your environment; re-run with --noenv "
+            "(or --env pointing to a directory without cards)."
+        )
+
+    raise typer.BadParameter(message, param_hint="--model")
+
+
 def resolve_instruction_option(
     instruction: str | None,
     model: str | None,
     mode: Literal["interactive", "serve"],
+    *,
+    force_smart: bool = False,
 ) -> tuple[str, str]:
     """Resolve the instruction option (file or URL) to text and inferred agent name."""
-    resolved_instruction = resolve_default_instruction(model, mode)
+    resolved_instruction = resolve_default_instruction(model, mode, force_smart=force_smart)
     agent_name = "agent"
 
     if instruction:
@@ -147,6 +200,7 @@ def _merge_url_servers(
     server_list: list[str] | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
 ) -> tuple[dict[str, UrlServerConfig] | None, list[str] | None]:
     url_servers: dict[str, UrlServerConfig] | None = None
 
@@ -167,6 +221,11 @@ def _merge_url_servers(
                 normalized_config["headers"] = {
                     str(key): str(value)
                     for key, value in headers.items()
+                }
+            if client_metadata_url:
+                normalized_config["auth"] = {
+                    "oauth": True,
+                    "client_metadata_url": client_metadata_url,
                 }
             url_servers[server_name] = normalized_config
 
@@ -238,6 +297,7 @@ def build_agent_run_request(
     servers: str | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
     agent_cards: list[str] | None,
     card_tools: list[str] | None,
     model: str | None,
@@ -261,6 +321,9 @@ def build_agent_run_request(
     permissions_enabled: bool,
     reload: bool,
     watch: bool,
+    quiet: bool = False,
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
+    force_smart: bool = False,
     noenv: bool = False,
 ) -> AgentRunRequest:
     """Build a normalized runtime request from legacy CLI kwargs."""
@@ -272,7 +335,12 @@ def build_agent_run_request(
 
     server_list = servers.split(",") if servers else None
 
-    url_servers, server_list = _merge_url_servers(server_list, urls, auth)
+    url_servers, server_list = _merge_url_servers(
+        server_list,
+        urls,
+        auth,
+        client_metadata_url,
+    )
     stdio_servers, server_list = _merge_stdio_servers(server_list, stdio_commands)
 
     if environment_dir:
@@ -292,6 +360,14 @@ def build_agent_run_request(
         normalize_explicit_card_sources(card_tools)
         if noenv
         else merge_card_sources(card_tools, default_tool_cards_dir)
+    )
+
+    validate_multi_model_card_conflicts(
+        model=model,
+        merged_agent_cards=merged_agent_cards,
+        merged_card_tools=merged_card_tools,
+        explicit_agent_cards=bool(agent_cards),
+        explicit_card_tools=bool(card_tools),
     )
 
     effective_permissions_enabled = (
@@ -317,6 +393,7 @@ def build_agent_run_request(
         skills_directory=skills_directory,
         environment_dir=None if noenv else environment_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_runtime=shell_enabled,
         mode=mode,
         transport=transport,
@@ -328,6 +405,8 @@ def build_agent_run_request(
         permissions_enabled=effective_permissions_enabled,
         reload=reload,
         watch=watch,
+        quiet=quiet,
+        missing_shell_cwd_policy=missing_shell_cwd_policy,
     )
 
 
@@ -339,6 +418,7 @@ def build_run_agent_kwargs(
     servers: str | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
     agent_cards: list[str] | None,
     card_tools: list[str] | None,
     model: str | None,
@@ -362,6 +442,9 @@ def build_run_agent_kwargs(
     permissions_enabled: bool,
     reload: bool,
     watch: bool,
+    quiet: bool = False,
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
+    force_smart: bool = False,
     noenv: bool = False,
 ) -> dict[str, Any]:
     request = build_agent_run_request(
@@ -371,6 +454,7 @@ def build_run_agent_kwargs(
         servers=servers,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         agent_cards=agent_cards,
         card_tools=card_tools,
         model=model,
@@ -384,6 +468,7 @@ def build_run_agent_kwargs(
         skills_directory=skills_directory,
         environment_dir=environment_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_enabled=shell_enabled,
         mode=mode,
         transport=transport,
@@ -395,6 +480,8 @@ def build_run_agent_kwargs(
         permissions_enabled=permissions_enabled,
         reload=reload,
         watch=watch,
+        quiet=quiet,
+        missing_shell_cwd_policy=missing_shell_cwd_policy,
     )
     return request.to_agent_setup_kwargs()
 
@@ -407,6 +494,7 @@ def build_command_run_request(
     servers: str | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
     agent_cards: list[str] | None,
     card_tools: list[str] | None,
     model: str | None,
@@ -431,6 +519,9 @@ def build_command_run_request(
     permissions_enabled: bool = True,
     reload: bool = False,
     watch: bool = False,
+    quiet: bool = False,
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
+    force_smart: bool = False,
     noenv: bool = False,
 ) -> AgentRunRequest:
     """Build a normalized request directly from command option values."""
@@ -445,6 +536,7 @@ def build_command_run_request(
         instruction_option,
         model,
         mode,
+        force_smart=force_smart,
     )
 
     return build_agent_run_request(
@@ -454,6 +546,7 @@ def build_command_run_request(
         servers=servers,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         agent_cards=agent_cards,
         card_tools=card_tools,
         model=model,
@@ -467,6 +560,7 @@ def build_command_run_request(
         skills_directory=skills_directory,
         environment_dir=environment_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_enabled=shell_enabled,
         mode=mode,
         transport=transport,
@@ -478,4 +572,6 @@ def build_command_run_request(
         permissions_enabled=permissions_enabled,
         reload=reload,
         watch=watch,
+        quiet=quiet,
+        missing_shell_cwd_policy=missing_shell_cwd_policy,
     )

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from fast_agent.core.agent_card_loader import _resolve_name
+from fast_agent.core.agent_card_loader import _resolve_name, dump_agent_to_string, load_agent_cards
 from fast_agent.core.exceptions import AgentConfigError
 
 if TYPE_CHECKING:
@@ -63,3 +63,198 @@ class TestResolveName:
         dummy_path = tmp_path / "test.md"
         with pytest.raises(AgentConfigError):
             _resolve_name("   ", dummy_path)
+
+
+def test_load_agent_card_parses_mcp_connect_entries(tmp_path: Path) -> None:
+    card_path = tmp_path / "mcp_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                '  - target: "https://demo.hf.space"',
+                '  - target: "@foo/bar"',
+                '    name: "foo_bar"',
+                "    headers:",
+                '      Authorization: "Bearer abc"',
+                "    auth:",
+                "      oauth: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_cards(card_path)
+    assert len(loaded) == 1
+
+    config = loaded[0].agent_data["config"]
+    assert len(config.mcp_connect) == 2
+    assert config.mcp_connect[0].target == "https://demo.hf.space"
+    assert config.mcp_connect[0].name is None
+    assert config.mcp_connect[0].headers is None
+    assert config.mcp_connect[0].auth is None
+    assert config.mcp_connect[1].target == "@foo/bar"
+    assert config.mcp_connect[1].name == "foo_bar"
+    assert config.mcp_connect[1].headers == {"Authorization": "Bearer abc"}
+    assert config.mcp_connect[1].auth == {"oauth": False}
+
+
+def test_dump_agent_card_preserves_mcp_connect_auth_fields(tmp_path: Path) -> None:
+    card_path = tmp_path / "mcp_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                '  - target: "https://demo.hf.space"',
+                '    name: "demo"',
+                "    headers:",
+                '      Authorization: "Bearer abc"',
+                "    auth:",
+                "      oauth: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_cards(card_path)
+    dumped = dump_agent_to_string("mcp_agent", loaded[0].agent_data, as_yaml=True)
+
+    assert "mcp_connect:" in dumped
+    assert "headers:" in dumped
+    assert "auth:" in dumped
+    assert "Authorization: Bearer abc" in dumped
+
+
+def test_load_agent_card_rejects_mcp_connect_unknown_keys(tmp_path: Path) -> None:
+    card_path = tmp_path / "bad_mcp.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: bad_mcp",
+                "mcp_connect:",
+                '  - target: "@foo/bar"',
+                '    alias: "foo"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentConfigError, match="mcp_connect\\[0\\]"):
+        load_agent_cards(card_path)
+
+
+def test_load_agent_card_rejects_mcp_connect_missing_target(tmp_path: Path) -> None:
+    card_path = tmp_path / "bad_mcp_target.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: bad_mcp",
+                "mcp_connect:",
+                "  - name: test",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentConfigError, match="mcp_connect\\[0\\]\\.target"):
+        load_agent_cards(card_path)
+
+
+def test_load_agent_card_parses_tool_input_schema(tmp_path: Path) -> None:
+    card_path = tmp_path / "schema_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: schema_agent",
+                "tool_input_schema:",
+                "  type: object",
+                "  properties:",
+                "    query:",
+                '      type: string',
+                '      description: "What to investigate"',
+                "  required:",
+                "    - query",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_cards(card_path)
+    config = loaded[0].agent_data["config"]
+    assert config.tool_input_schema == {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to investigate",
+            },
+        },
+        "required": ["query"],
+    }
+
+
+def test_load_agent_card_rejects_invalid_tool_input_schema(tmp_path: Path) -> None:
+    card_path = tmp_path / "bad_schema_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: bad_schema_agent",
+                "tool_input_schema:",
+                "  type: array",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentConfigError, match="tool_input_schema"):
+        load_agent_cards(card_path)
+
+
+def test_load_agent_card_warns_when_required_property_description_missing(tmp_path: Path) -> None:
+    card_path = tmp_path / "warn_schema_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: warn_schema_agent",
+                "tool_input_schema:",
+                "  type: object",
+                "  properties:",
+                "    query:",
+                "      type: string",
+                "  required:",
+                "    - query",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.warns(UserWarning, match="required property 'query'"):
+        load_agent_cards(card_path)
+
+
+def test_dump_agent_card_preserves_tool_input_schema(tmp_path: Path) -> None:
+    card_path = tmp_path / "schema_agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: schema_agent",
+                "tool_input_schema:",
+                "  type: object",
+                "  properties:",
+                "    query:",
+                '      type: string',
+                '      description: "What to investigate"',
+                "  required:",
+                "    - query",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_cards(card_path)
+    dumped = dump_agent_to_string("schema_agent", loaded[0].agent_data, as_yaml=True)
+
+    assert "tool_input_schema:" in dumped
+    assert "query:" in dumped
+    assert "required:" in dumped

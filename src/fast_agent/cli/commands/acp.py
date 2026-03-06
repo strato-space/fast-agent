@@ -25,7 +25,7 @@ app = typer.Typer(
 ROOT_SUBCOMMANDS = {
     "go",
     "serve",
-    "setup",
+    "scaffold",
     "check",
     "auth",
     "bootstrap",
@@ -44,9 +44,11 @@ def _build_run_request(
     card_tools: list[str] | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
     model: str | None,
     env_dir: Path | None,
     noenv: bool,
+    force_smart: bool,
     skills_dir: Path | None,
     npx: str | None,
     uvx: str | None,
@@ -60,6 +62,7 @@ def _build_run_request(
     resume: str | None,
     reload: bool,
     watch: bool,
+    missing_shell_cwd: serve.MissingShellCwdPolicy | None = None,
 ) -> AgentRunRequest:
     resolved_env_dir = resolve_environment_dir_option(ctx, env_dir, set_env_var=not noenv)
     return build_command_run_request(
@@ -69,6 +72,7 @@ def _build_run_request(
         servers=servers,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         agent_cards=agent_cards,
         card_tools=card_tools,
         model=model,
@@ -83,6 +87,7 @@ def _build_run_request(
         skills_directory=skills_dir,
         environment_dir=resolved_env_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_enabled=shell,
         mode="serve",
         transport=serve.ServeTransport.ACP.value,
@@ -94,6 +99,7 @@ def _build_run_request(
         permissions_enabled=not no_permissions,
         reload=reload,
         watch=watch,
+        missing_shell_cwd_policy=missing_shell_cwd.value if missing_shell_cwd else None,
     )
 
 
@@ -101,31 +107,22 @@ def _build_run_request(
 def run_acp(
     ctx: typer.Context,
     name: str = typer.Option("fast-agent-acp", "--name", help="Name for the ACP server"),
-    instruction: str | None = typer.Option(
-        None,
-        "--instruction",
-        "-i",
-        help="Path to file or URL containing instruction for the agent",
-    ),
+    instruction: str | None = CommonAgentOptions.instruction(),
     config_path: str | None = CommonAgentOptions.config_path(),
     servers: str | None = CommonAgentOptions.servers(),
+    model: str | None = CommonAgentOptions.model(),
+    smart: bool = CommonAgentOptions.smart(),
     agent_cards: list[str] | None = CommonAgentOptions.agent_cards(),
     card_tools: list[str] | None = CommonAgentOptions.card_tools(),
     urls: str | None = CommonAgentOptions.urls(),
     auth: str | None = CommonAgentOptions.auth(),
-    model: str | None = CommonAgentOptions.model(),
+    client_metadata_url: str | None = CommonAgentOptions.client_metadata_url(),
     env_dir: Path | None = CommonAgentOptions.env_dir(),
     noenv: bool = CommonAgentOptions.noenv(),
     skills_dir: Path | None = CommonAgentOptions.skills_dir(),
     npx: str | None = CommonAgentOptions.npx(),
     uvx: str | None = CommonAgentOptions.uvx(),
     stdio: str | None = CommonAgentOptions.stdio(),
-    description: str | None = typer.Option(
-        None,
-        "--description",
-        "-d",
-        help="Description used for the exposed send tool (use {agent} to reference the agent name)",
-    ),
     host: str = typer.Option(
         "0.0.0.0",
         "--host",
@@ -135,6 +132,12 @@ def run_acp(
         8000,
         "--port",
         help="Port to use when running as a server with HTTP or SSE transport",
+    ),
+    description: str | None = typer.Option(
+        None,
+        "--description",
+        "-d",
+        help="Description used for the exposed send tool (use {agent} to reference the agent name)",
     ),
     shell: bool = CommonAgentOptions.shell(),
     instance_scope: serve.InstanceScope = typer.Option(
@@ -146,6 +149,11 @@ def run_acp(
         False,
         "--no-permissions",
         help="Disable tool permission requests (allow all tool executions without asking)",
+    ),
+    missing_shell_cwd: serve.MissingShellCwdPolicy | None = typer.Option(
+        None,
+        "--missing-shell-cwd",
+        help="Override shell_execution.missing_cwd_policy (ask, create, warn, error)",
     ),
     resume: str | None = typer.Option(
         None,
@@ -166,9 +174,11 @@ def run_acp(
         card_tools=card_tools,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         model=model,
         env_dir=env_dir,
         noenv=noenv,
+        force_smart=smart,
         skills_dir=skills_dir,
         npx=npx,
         uvx=uvx,
@@ -182,6 +192,7 @@ def run_acp(
         resume=resume,
         reload=reload,
         watch=watch,
+        missing_shell_cwd=missing_shell_cwd,
     )
     run_request(request)
 

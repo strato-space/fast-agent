@@ -31,10 +31,15 @@ class TestUrlParser:
         assert transport == "sse"
         assert url == "https://api.test.com/sse"
 
-        # URL without /mcp or /sse should append /mcp
+        # URL without /mcp or /sse gets /mcp by default
         server_name, transport, url = parse_server_url("http://localhost:8080/api")
         assert transport == "http"
         assert url == "http://localhost:8080/api/mcp"
+
+        # Query-string endpoints are considered fully formed
+        server_name, transport, url = parse_server_url("https://example.com/api?version=1")
+        assert transport == "http"
+        assert url == "https://example.com/api?version=1"
 
     def test_parse_server_url_invalid(self):
         """Test parsing invalid URLs."""
@@ -111,6 +116,18 @@ class TestUrlParser:
         assert len(result) == 2
 
         # All URLs should have auth headers
+        for server_name, transport, url, headers in result:
+            assert headers is not None
+            assert headers == {"Authorization": "Bearer test_token_123"}
+
+    def test_parse_server_urls_with_auth_accepts_optional_bearer_prefix(self):
+        """Test parsing URLs with auth values that include a Bearer prefix."""
+        urls = "http://example.com/mcp,https://api.test.com/sse"
+        auth_token = "Bearer test_token_123"
+        result = parse_server_urls(urls, auth_token)
+
+        assert len(result) == 2
+
         for server_name, transport, url, headers in result:
             assert headers is not None
             assert headers == {"Authorization": "Bearer test_token_123"}

@@ -111,6 +111,7 @@ async def _run_agent(
     skills_directory: Path | None = None,
     environment_dir: Path | None = None,
     noenv: bool = False,
+    force_smart: bool = False,
     shell_runtime: bool = False,
     mode: Literal["interactive", "serve"] = "interactive",
     transport: str = "http",
@@ -122,6 +123,8 @@ async def _run_agent(
     permissions_enabled: bool = True,
     reload: bool = False,
     watch: bool = False,
+    quiet: bool = False,
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
 ) -> None:
     """Compatibility wrapper for async request execution."""
     request = AgentRunRequest(
@@ -143,6 +146,7 @@ async def _run_agent(
         skills_directory=skills_directory,
         environment_dir=environment_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_runtime=shell_runtime,
         mode=mode,
         transport=transport,
@@ -154,6 +158,8 @@ async def _run_agent(
         permissions_enabled=permissions_enabled,
         reload=reload,
         watch=watch,
+        quiet=quiet,
+        missing_shell_cwd_policy=missing_shell_cwd_policy,
     )
     await run_agent_request(request)
 
@@ -165,6 +171,7 @@ def run_async_agent(
     servers: str | None = None,
     urls: str | None = None,
     auth: str | None = None,
+    client_metadata_url: str | None = None,
     agent_cards: list[str] | None = None,
     card_tools: list[str] | None = None,
     model: str | None = None,
@@ -178,6 +185,7 @@ def run_async_agent(
     skills_directory: Path | None = None,
     environment_dir: Path | None = None,
     noenv: bool = False,
+    force_smart: bool = False,
     shell_enabled: bool = False,
     mode: Literal["interactive", "serve"] = "interactive",
     transport: str = "http",
@@ -189,6 +197,8 @@ def run_async_agent(
     permissions_enabled: bool = True,
     reload: bool = False,
     watch: bool = False,
+    quiet: bool = False,
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
 ) -> None:
     """Run the async agent function with proper loop handling."""
     try:
@@ -206,10 +216,12 @@ def run_async_agent(
             skills_directory=skills_directory,
             environment_dir=environment_dir,
             instruction=instruction,
+            force_smart=force_smart,
             config_path=config_path,
             servers=servers,
             urls=urls,
             auth=auth,
+            client_metadata_url=client_metadata_url,
             agent_cards=agent_cards,
             card_tools=card_tools,
             stdio_commands=stdio_commands,
@@ -223,6 +235,8 @@ def run_async_agent(
             permissions_enabled=permissions_enabled,
             reload=reload,
             watch=watch,
+            quiet=quiet,
+            missing_shell_cwd_policy=missing_shell_cwd_policy,
         )
         request = AgentRunRequest(**run_kwargs)
     except ValueError as exc:
@@ -236,18 +250,14 @@ def run_async_agent(
 def go(
     ctx: typer.Context,
     name: str = typer.Option("fast-agent", "--name", help="Name for the agent"),
-    instruction: str | None = typer.Option(
-        None,
-        "--instruction",
-        "-i",
-        help="Path to file or URL containing instruction for the agent",
-    ),
+    instruction: str | None = CommonAgentOptions.instruction(),
     config_path: str | None = CommonAgentOptions.config_path(),
     servers: str | None = CommonAgentOptions.servers(),
     agent_cards: list[str] | None = CommonAgentOptions.agent_cards(),
     card_tools: list[str] | None = CommonAgentOptions.card_tools(),
     urls: str | None = CommonAgentOptions.urls(),
     auth: str | None = CommonAgentOptions.auth(),
+    client_metadata_url: str | None = CommonAgentOptions.client_metadata_url(),
     model: str | None = CommonAgentOptions.model(),
     agent: str | None = CommonAgentOptions.agent(),
     message: str | None = typer.Option(
@@ -274,6 +284,7 @@ def go(
     ),
     env_dir: Path | None = CommonAgentOptions.env_dir(),
     noenv: bool = CommonAgentOptions.noenv(),
+    smart: bool = CommonAgentOptions.smart(),
     skills_dir: Path | None = CommonAgentOptions.skills_dir(),
     npx: str | None = CommonAgentOptions.npx(),
     uvx: str | None = CommonAgentOptions.uvx(),
@@ -285,6 +296,12 @@ def go(
         help="Enable manual AgentCard reloads (/reload)",
     ),
     watch: bool = CommonAgentOptions.watch(),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Disable progress/chat/tool output and print only direct command output",
+    ),
 ) -> None:
     """Run an interactive agent directly from the command line."""
     if os.getenv(FAST_AGENT_SHELL_CHILD_ENV):
@@ -304,6 +321,7 @@ def go(
         servers=servers,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         agent_cards=agent_cards,
         card_tools=card_tools,
         model=model,
@@ -318,10 +336,12 @@ def go(
         skills_directory=skills_dir,
         environment_dir=resolved_env_dir,
         noenv=noenv,
+        force_smart=smart,
         shell_enabled=shell,
         mode="interactive",
         instance_scope="shared",
         reload=reload,
         watch=watch,
+        quiet=quiet,
     )
     run_request(request)

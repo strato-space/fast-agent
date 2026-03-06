@@ -88,7 +88,10 @@ from fast_agent.constants import (
 from fast_agent.context import Context
 from fast_agent.core.fastagent import AgentInstance
 from fast_agent.core.instruction_refresh import McpInstructionCapable, build_instruction
-from fast_agent.core.instruction_utils import get_instruction_template
+from fast_agent.core.instruction_utils import (
+    build_agent_instruction_context,
+    get_instruction_template,
+)
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt_templates import enrich_with_environment_context
 from fast_agent.interfaces import (
@@ -660,6 +663,8 @@ class AgentACPServer(ACPAgent):
             if agent.instruction_context:
                 effective_context = dict(agent.instruction_context)
 
+        effective_context = build_agent_instruction_context(agent, effective_context)
+
         return await build_instruction(
             template,
             aggregator=aggregator,
@@ -780,7 +785,8 @@ class AgentACPServer(ACPAgent):
         for agent_name, agent in instance.agents.items():
             if isinstance(agent, InstructionContextCapable):
                 try:
-                    agent.set_instruction_context(prompt_context)
+                    context_with_agent = build_agent_instruction_context(agent, prompt_context)
+                    agent.set_instruction_context(context_with_agent)
                 except Exception as exc:
                     logger.warning(
                         "Failed to set instruction context on agent",
@@ -1474,7 +1480,8 @@ class AgentACPServer(ACPAgent):
         for agent_name, agent in instance.agents.items():
             if isinstance(agent, InstructionContextCapable):
                 try:
-                    agent.set_instruction_context(session_context)
+                    context_with_agent = build_agent_instruction_context(agent, session_context)
+                    agent.set_instruction_context(context_with_agent)
                 except Exception as e:
                     logger.warning(f"Failed to set instruction context on agent {agent_name}: {e}")
 
@@ -1755,13 +1762,22 @@ class AgentACPServer(ACPAgent):
                 },
             )
 
-        session, loaded, missing_agents = result
+        session = result.session
+        loaded = result.loaded
+        missing_agents = result.missing_agents
+        usage_notices = result.usage_notices
         if missing_agents:
             logger.warning(
                 "Missing agents while loading session",
                 name="acp_load_session_missing_agents",
                 session_id=session_id,
                 missing_agents=missing_agents,
+            )
+        for usage_notice in usage_notices:
+            logger.warning(
+                usage_notice,
+                name="acp_load_session_usage_unavailable",
+                session_id=session_id,
             )
 
         current_agent = session_state.current_agent_name

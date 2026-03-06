@@ -15,6 +15,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Literal,
     Mapping,
     Sequence,
     TypeVar,
@@ -53,6 +54,7 @@ from fast_agent.mcp.common import (
     get_server_name,
     is_namespaced_name,
 )
+from fast_agent.mcp.experimental_session_client import ExperimentalSessionClient
 from fast_agent.mcp.mcp_aggregator import (
     MCPAggregator,
     MCPAttachOptions,
@@ -148,6 +150,8 @@ class McpAgent(ABC, ToolAgent):
         self._shell_notice_emitted = False
         self._allow_shell_notice = False
         self._shell_runtime_enabled = False
+        self._show_shell_tool_call_id = False
+        self._defer_shell_display_to_tool_result = False
         self._shell_access_modes: tuple[str, ...] = ()
         self._bash_tool: Tool | None = None
         # Allow external runtime injection (e.g., for ACP terminal support)
@@ -341,6 +345,11 @@ class McpAgent(ABC, ToolAgent):
         return self._aggregator
 
     @property
+    def experimental_sessions(self) -> ExperimentalSessionClient:
+        """Expose focused experimental-session cookie controls for this agent."""
+        return self._aggregator.experimental_sessions
+
+    @property
     def instruction_template(self) -> str:
         """The original instruction template with placeholders."""
         return self._instruction_template or ""
@@ -376,7 +385,7 @@ class McpAgent(ABC, ToolAgent):
         Apply template substitution to the instruction, including server instructions.
         This is called during initialization after servers are connected.
         """
-        from fast_agent.core.instruction_refresh import build_instruction
+        from fast_agent.core.instruction_refresh import build_instruction, format_agent_skills
 
         if not self._instruction_template:
             return
@@ -392,12 +401,57 @@ class McpAgent(ABC, ToolAgent):
         )
         self.set_instruction(new_instruction)
 
-        # Warn if skills configured but placeholder missing
+        # Warn when skills are configured but not surfaced in the final instruction.
+        # This check must use the rendered instruction to account for internal
+        # templates like {{internal:smart_prompt}} that include {{agentSkills}}.
         if self._skill_manifests and "{{agentSkills}}" not in self._instruction_template:
-            warning_message = f"[dim]Agent '{self._name}' skills are configured but no {{{{agentSkills}}}} in system prompt.[/dim]"
-            self._record_warning(warning_message)
+            formatted_skills = format_agent_skills(
+                self._skill_manifests,
+                self.has_filesystem_runtime,
+            )
+            if formatted_skills and formatted_skills not in new_instruction:
+                warning_message = f"[dim]Agent '{self._name}' skills are configured but no {{{{agentSkills}}}} in system prompt.[/dim]"
+                self._record_warning(warning_message, surface="startup_once")
 
         self.logger.debug(f"Applied instruction templates for agent {self._name}")
+
+    @staticmethod
+    def _resolve_shell_working_directory(path: Path) -> Path:
+        """Resolve a configured shell working directory for validation messages."""
+        if path.is_absolute():
+            return path.resolve()
+        return (Path.cwd() / path).resolve()
+
+    def _warn_if_invalid_shell_working_directory(self, working_directory: Path | None) -> None:
+        """Emit a startup warning when a configured shell cwd is missing/invalid."""
+        if working_directory is None:
+            return
+
+        resolved = self._resolve_shell_working_directory(working_directory)
+        if not resolved.exists():
+            self._record_warning(
+                " ".join(
+                    [
+                        f"[dim]Agent '{self._name}' has shell cwd that does not exist: {resolved}.",
+                        f"Configured cwd: {working_directory}.",
+                        "Shell commands will fail until this path exists.[/dim]",
+                    ]
+                ),
+                surface="startup_once",
+            )
+            return
+
+        if not resolved.is_dir():
+            self._record_warning(
+                " ".join(
+                    [
+                        f"[dim]Agent '{self._name}' has shell cwd that is not a directory: {resolved}.",
+                        f"Configured cwd: {working_directory}.",
+                        "Shell commands will fail until this points to a directory.[/dim]",
+                    ]
+                ),
+                surface="startup_once",
+            )
 
     def set_skill_manifests(self, manifests: Sequence[SkillManifest]) -> None:
         self._skill_manifests = list(manifests)
@@ -482,6 +536,8 @@ class McpAgent(ABC, ToolAgent):
         if activation_reason is not None and self._external_runtime is not None:
             return
 
+        self._warn_if_invalid_shell_working_directory(working_directory)
+
         timeout_seconds, warning_interval_seconds, output_byte_limit = (
             self._resolve_shell_runtime_settings()
         )
@@ -496,6 +552,7 @@ class McpAgent(ABC, ToolAgent):
             working_directory=working_directory,
             output_byte_limit=output_byte_limit,
             config=self._context.config if self._context else None,
+            agent_name=self._name,
         )
         self._shell_runtime_enabled = self._shell_runtime.enabled
         self._bash_tool = self._shell_runtime.tool
@@ -528,15 +585,22 @@ class McpAgent(ABC, ToolAgent):
 
         return format_shell_notice(self._shell_access_modes, self._shell_runtime)
 
-    def _record_warning(self, message: str) -> None:
+    def _record_warning(
+        self,
+        message: str,
+        *,
+        surface: Literal["runtime_toolbar", "startup_once"] = "runtime_toolbar",
+    ) -> None:
         if message in self._warning_messages_seen:
             return
         self._warning_messages_seen.add(message)
         self._warnings.append(message)
         self.logger.warning(message)
         try:
-            console.error_console.print(f"[yellow]{message}[/yellow]")
-        except Exception:  # pragma: no cover - console fallback
+            from fast_agent.ui import notification_tracker
+
+            notification_tracker.add_warning(message, surface=surface)
+        except Exception:
             pass
 
     @property
@@ -749,7 +813,12 @@ class McpAgent(ABC, ToolAgent):
             and self._shell_runtime.tool
             and name == self._shell_runtime.tool.name
         ):
-            return await self._shell_runtime.execute(arguments)
+            return await self._shell_runtime.execute(
+                arguments,
+                tool_use_id,
+                show_tool_call_id=self._show_shell_tool_call_id,
+                defer_display_to_tool_result=self._defer_shell_display_to_tool_result,
+            )
 
         if name == HUMAN_INPUT_TOOL_NAME:
             # Call the elicitation-backed human input tool
@@ -1187,6 +1256,10 @@ class McpAgent(ABC, ToolAgent):
 
         if should_parallel and planned_calls:
             smart_parallel_active = smart_parallel_calls > 1
+            previous_shell_tool_call_id_setting = self._show_shell_tool_call_id
+            previous_shell_display_setting = self._defer_shell_display_to_tool_result
+            self._show_shell_tool_call_id = True
+            self._defer_shell_display_to_tool_result = True
             if smart_parallel_active:
                 setattr(self, "_parallel_smart_tool_calls", True)
                 self.logger.info(
@@ -1210,6 +1283,8 @@ class McpAgent(ABC, ToolAgent):
 
                 results = await gather_with_cancel(run_one(call) for call in planned_calls)
             finally:
+                self._show_shell_tool_call_id = previous_shell_tool_call_id_setting
+                self._defer_shell_display_to_tool_result = previous_shell_display_setting
                 if smart_parallel_active:
                     setattr(self, "_parallel_smart_tool_calls", False)
 
@@ -1577,6 +1652,7 @@ class McpAgent(ABC, ToolAgent):
         additional_message: Union["Text", None] = None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool | None = None,
+        render_message: bool = True,
     ) -> None:
         """
         Display an assistant message with MCP servers in the bottom bar.
@@ -1653,6 +1729,7 @@ class McpAgent(ABC, ToolAgent):
             additional_message=additional_message,
             render_markdown=render_markdown,
             show_hook_indicator=show_hook_indicator,
+            render_message=render_message,
         )
 
     def _extract_servers_from_message(self, message: PromptMessageExtended) -> list[str]:

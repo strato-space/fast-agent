@@ -16,7 +16,13 @@ from mcp.types import TextContent
 from fast_agent.acp.slash_commands import SlashCommandHandler
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.config import get_settings, update_global_settings
-from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
+from fast_agent.constants import (
+    ANTHROPIC_ASSISTANT_RAW_CONTENT,
+    ANTHROPIC_CITATIONS_CHANNEL,
+    ANTHROPIC_SERVER_TOOLS_CHANNEL,
+    FAST_AGENT_ERROR_CHANNEL,
+)
+from fast_agent.llm.provider_types import Provider
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.session import display_session_name, get_session_manager, reset_session_manager
 from fast_agent.session import session_manager as session_manager_module
@@ -130,6 +136,32 @@ async def test_slash_command_available_commands() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_slash_command_available_commands_model_hint_is_dynamic() -> None:
+    class _LlmStub:
+        model_name = "gpt-5"
+        provider = Provider.RESPONSES
+        text_verbosity_spec = None
+        web_search_supported = True
+        web_fetch_supported = False
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    commands = handler.get_available_commands()
+    model_cmd = next(cmd for cmd in commands if cmd.name == "model")
+
+    assert model_cmd.input is not None
+    hint = model_cmd.input.root.hint
+    assert hint is not None
+    assert "reasoning <value>" in hint
+    assert "web_search <on|off|default>" in hint
+    assert "web_fetch <on|off|default>" not in hint
+    assert "verbosity <value>" not in hint
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_slash_command_unknown_command() -> None:
     """Test that unknown commands are handled gracefully."""
     handler = _handler(StubAgentInstance())
@@ -139,6 +171,19 @@ async def test_slash_command_unknown_command() -> None:
 
     # Should get an error message
     assert "Unknown command" in response or "not yet implemented" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_does_not_mask_handler_keyerror(monkeypatch) -> None:
+    async def _raise_handler_keyerror(*_args, **_kwargs) -> str:
+        raise KeyError("stale-agent")
+
+    monkeypatch.setattr("fast_agent.acp.slash.dispatch.execute", _raise_handler_keyerror)
+    handler = _handler(StubAgentInstance())
+
+    with pytest.raises(KeyError, match="stale-agent"):
+        await handler.execute_command("status", "")
 
 
 @pytest.mark.integration
@@ -211,6 +256,85 @@ async def test_slash_command_status_system() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_slash_command_model_web_search() -> None:
+    class _LlmStub:
+        def __init__(self) -> None:
+            self.model_name = "gpt-5"
+            self.provider = Provider.RESPONSES
+            self.reasoning_effort_spec = None
+            self.reasoning_effort = None
+            self.text_verbosity_spec = None
+            self.text_verbosity = None
+            self.configured_transport = "sse"
+            self.active_transport = None
+            self.web_search_supported = True
+            self.web_fetch_supported = False
+            self._web_search_override: bool | None = None
+
+        @property
+        def web_search_enabled(self) -> bool:
+            return bool(self._web_search_override)
+
+        @property
+        def web_fetch_enabled(self) -> bool:
+            return False
+
+        def set_web_search_enabled(self, value: bool | None) -> None:
+            self._web_search_override = value
+
+        def set_web_fetch_enabled(self, value: bool | None) -> None:
+            if value is not None:
+                raise ValueError("Current model does not support web fetch configuration.")
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("model", "web_search on")
+
+    assert "Web search: set to enabled." in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_model_web_fetch_unsupported() -> None:
+    class _LlmStub:
+        def __init__(self) -> None:
+            self.model_name = "gpt-5"
+            self.provider = Provider.RESPONSES
+            self.reasoning_effort_spec = None
+            self.reasoning_effort = None
+            self.text_verbosity_spec = None
+            self.text_verbosity = None
+            self.web_search_supported = True
+            self.web_fetch_supported = False
+
+        @property
+        def web_search_enabled(self) -> bool:
+            return False
+
+        @property
+        def web_fetch_enabled(self) -> bool:
+            return False
+
+        def set_web_search_enabled(self, value: bool | None) -> None:
+            return None
+
+        def set_web_fetch_enabled(self, value: bool | None) -> None:
+            if value is not None:
+                raise ValueError("Current model does not support web fetch configuration.")
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("model", "web_fetch on")
+
+    assert "Current model does not support web_fetch configuration." in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_slash_command_session_resume_switches_current_mode(tmp_path: Path) -> None:
     """Test /session resume switches current mode when a single agent has history."""
     original_cwd = Path.cwd()
@@ -220,11 +344,18 @@ async def test_slash_command_session_resume_switches_current_mode(tmp_path: Path
         manager = get_session_manager()
         session = manager.create_session()
 
-        history_message = PromptMessageExtended(
+        user_message = PromptMessageExtended(
             role="user",
             content=[TextContent(type="text", text="resume me")],
         )
-        alpha_agent = StubAgent(name="alpha", message_history=[history_message])
+        assistant_message = PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="welcome back")],
+        )
+        alpha_agent = StubAgent(
+            name="alpha",
+            message_history=[user_message, assistant_message],
+        )
         await session.save_history(cast("AgentProtocol", alpha_agent))
 
         beta_agent = StubAgent(name="beta")
@@ -245,6 +376,8 @@ async def test_slash_command_session_resume_switches_current_mode(tmp_path: Path
         )
 
         assert "Switched to agent: alpha" in response
+        assert "Last assistant message" in response
+        assert "welcome back" in response
         assert handler.current_agent_name == "alpha"
         assert switched == ["alpha"]
     finally:
@@ -481,6 +614,62 @@ async def test_slash_command_history_load_without_agent() -> None:
 
     assert "load conversation" in response.lower()
     assert "Unable to locate agent" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_webclear() -> None:
+    """Test that /history webclear strips web metadata channels."""
+    class _LlmStub:
+        web_tools_enabled = (True, False)
+
+    messages = [
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="done")],
+            channels={
+                ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                    TextContent(type="text", text='{"type":"server_tool_use"}')
+                ],
+                ANTHROPIC_ASSISTANT_RAW_CONTENT: [
+                    TextContent(
+                        type="text",
+                        text='{"type":"server_tool_use","name":"web_search","id":"srv_1"}',
+                    )
+                ],
+                ANTHROPIC_CITATIONS_CHANNEL: [
+                    TextContent(
+                        type="text",
+                        text='{"type":"web_search_result_location","url":"https://example.com"}',
+                    )
+                ],
+            },
+        )
+    ]
+    stub_agent = StubAgent(message_history=messages)
+    stub_agent.llm = _LlmStub()
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+    response = await handler.execute_command("history", "webclear")
+
+    assert "history webclear" in response.lower()
+    assert "removed 3 web metadata block(s)" in response.lower()
+    assert stub_agent.message_history[0].channels is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_webclear_hidden_when_disabled() -> None:
+    """webclear should not be available when web tools are disabled."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+    response = await handler.execute_command("history", "webclear")
+
+    assert "unknown /history action: webclear" in response.lower()
+    assert "usage: /history [show|save|load]" in response.lower()
 
 
 @pytest.mark.integration

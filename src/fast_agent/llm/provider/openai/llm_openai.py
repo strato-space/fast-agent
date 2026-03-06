@@ -41,6 +41,10 @@ from fast_agent.llm.provider.openai._stream_capture import (
     stream_capture_filename as _stream_capture_filename,
 )
 from fast_agent.llm.provider.openai.multipart_converter_openai import OpenAIConverter
+from fast_agent.llm.provider.openai.schema_sanitizer import (
+    sanitize_tool_input_schema,
+    should_strip_tool_schema_defaults,
+)
 from fast_agent.llm.provider.openai.tool_notifications import OpenAIToolNotificationMixin
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import format_reasoning_setting, parse_reasoning_setting
@@ -96,7 +100,7 @@ class OpenAILLM(
                         raw_setting is not None
                         and "reasoning_effort" in config.model_fields_set
                         and config.reasoning_effort
-                        != config.model_fields["reasoning_effort"].default
+                        != type(config).model_fields["reasoning_effort"].default
                     ):
                         self.logger.warning(
                             "OpenAI config 'reasoning_effort' is deprecated; use 'reasoning'."
@@ -134,14 +138,7 @@ class OpenAILLM(
 
     def _initialize_default_params(self, kwargs: dict) -> RequestParams:
         """Initialize OpenAI-specific default parameters"""
-        # Get base defaults from parent (includes ModelDatabase lookup)
-        base_params = super()._initialize_default_params(kwargs)
-
-        # Override with OpenAI-specific settings
-        chosen_model = kwargs.get("model", DEFAULT_OPENAI_MODEL)
-        base_params.model = chosen_model
-
-        return base_params
+        return self._initialize_default_params_with_model_fallback(kwargs, DEFAULT_OPENAI_MODEL)
 
     def _base_url(self) -> str | None:
         if self.context.config and self.context.config.openai:
@@ -155,16 +152,6 @@ class OpenAILLM(
         """
         provider_config = self._get_provider_config()
         return getattr(provider_config, "default_headers", None) if provider_config else None
-
-    def _get_provider_config(self):
-        """Return the config section for this provider, if available."""
-        context_config = getattr(self.context, "config", None)
-        if not context_config:
-            return None
-        section_name = self.config_section or getattr(self.provider, "value", None)
-        if not section_name:
-            return None
-        return getattr(context_config, section_name, None)
 
     def _openai_client(self) -> AsyncOpenAI:
         """
@@ -242,6 +229,9 @@ class OpenAILLM(
         reasoning_segments: list[str],
     ) -> bool:
         """Stream reasoning text and track whether a thinking block is open."""
+        if not self._should_emit_reasoning_stream(reasoning_mode):
+            return reasoning_active
+
         if not reasoning_text:
             return reasoning_active
 
@@ -259,6 +249,10 @@ class OpenAILLM(
             return reasoning_active
 
         return reasoning_active
+
+    def _should_emit_reasoning_stream(self, reasoning_mode: str | None) -> bool:  # noqa: ARG002
+        """Allow subclasses to suppress streamed reasoning display."""
+        return True
 
     def _handle_tool_delta(
         self,
@@ -869,7 +863,7 @@ class OpenAILLM(
                     "function": {
                         "name": tool.name,
                         "description": tool.description if tool.description else "",
-                        "parameters": self.adjust_schema(tool.inputSchema),
+                        "parameters": self.adjust_schema(tool.inputSchema, model_name=model_name),
                     },
                 }
                 for tool in tools or []
@@ -1237,14 +1231,20 @@ class OpenAILLM(
 
         return converted
 
-    def adjust_schema(self, inputSchema: dict) -> dict:
-        # return inputSchema
+    def adjust_schema(self, inputSchema: dict, model_name: str | None = None) -> dict:
+        effective_model = model_name or self.default_request_params.model
+        result = (
+            sanitize_tool_input_schema(inputSchema)
+            if should_strip_tool_schema_defaults(effective_model)
+            else inputSchema
+        )
+
         if self.provider not in [Provider.OPENAI, Provider.AZURE]:
-            return inputSchema
+            return result
 
-        if "properties" in inputSchema:
-            return inputSchema
+        if "properties" in result:
+            return result
 
-        result = inputSchema.copy()
+        result = result.copy()
         result["properties"] = {}
         return result

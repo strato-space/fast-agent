@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import typer
+from mcp.types import TextContent
 
+from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.cli.runtime.agent_setup import (
+    _apply_shell_cwd_policy_preflight,
     _build_fan_out_result_paths,
     _build_result_file_with_suffix,
     _export_result_histories,
+    _find_last_assistant_text,
+    _resume_session_if_requested,
     _run_single_agent_cli_flow,
     _sanitize_result_suffix,
 )
 from fast_agent.cli.runtime.run_request import AgentRunRequest
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.session import ResumeSessionAgentsResult
 
 
 class _DummyAgent:
@@ -66,6 +76,7 @@ def _make_request(
         skills_directory=None,
         environment_dir=None,
         noenv=False,
+        force_smart=False,
         shell_runtime=False,
         mode="interactive",
         transport="http",
@@ -99,6 +110,29 @@ def test_build_fan_out_result_paths_disambiguates_collisions() -> None:
         "foo-alpha_beta-2.json",
         "foo-alpha_beta-3.json",
     ]
+
+
+def test_find_last_assistant_text_prefers_latest_assistant_message() -> None:
+    history = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hello")]),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="first")],
+        ),
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="again")]),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="second")],
+        ),
+    ]
+
+    assert _find_last_assistant_text(history) == "second"
+
+
+def test_find_last_assistant_text_returns_none_without_assistant_messages() -> None:
+    history = [PromptMessageExtended(role="user", content=[TextContent(type="text", text="hello")])]
+
+    assert _find_last_assistant_text(history) is None
 
 
 @pytest.mark.asyncio
@@ -163,6 +197,106 @@ async def test_export_result_histories_exits_nonzero_on_write_error(
 
 
 @pytest.mark.asyncio
+async def test_resume_session_interactive_queues_markdown_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_request(result_file=None, message=None, prompt_file=None)
+    request.resume = "latest"
+
+    assistant_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="## Welcome back\n\n- item")],
+    )
+
+    alpha = _DummyAgent("alpha")
+    alpha.message_history = [assistant_message]
+    beta = _DummyAgent("beta")
+
+    app = _DummyAgentApp(["alpha", "beta"], default_agent="beta")
+    app._agents["alpha"] = alpha
+    app._agents["beta"] = beta
+
+    session = SimpleNamespace(
+        info=SimpleNamespace(
+            name="session-1",
+            last_activity=datetime(2026, 2, 26, 12, 0, 0),
+        )
+    )
+    manager = SimpleNamespace(
+        resume_session_agents=lambda *args, **kwargs: ResumeSessionAgentsResult(
+            session=cast("Any", session),
+            loaded={"alpha": Path("history_alpha.json")},
+            missing_agents=[],
+        )
+    )
+
+    markdown_notices: list[tuple[str, dict[str, str | None]]] = []
+    plain_notices: list[str] = []
+
+    def _capture_markdown_notice(text: str, **kwargs: str | None) -> None:
+        markdown_notices.append((text, kwargs))
+
+    monkeypatch.setattr("fast_agent.session.get_session_manager", lambda: manager)
+    monkeypatch.setattr("fast_agent.ui.enhanced_prompt.queue_startup_notice", plain_notices.append)
+    monkeypatch.setattr(
+        "fast_agent.ui.enhanced_prompt.queue_startup_markdown_notice",
+        _capture_markdown_notice,
+    )
+
+    await _resume_session_if_requested(app, request)
+
+    assert any("Resumed session" in notice for notice in plain_notices)
+    assert any("Last assistant message" in notice for notice in plain_notices)
+    assert markdown_notices
+    assert markdown_notices[0][0] == "## Welcome back\n\n- item"
+
+
+@pytest.mark.asyncio
+async def test_resume_session_interactive_handles_usage_notices_from_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_request(result_file=None, message=None, prompt_file=None)
+    request.resume = "latest"
+
+    assistant_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="done")],
+    )
+    agent = _DummyAgent("agent")
+    agent.message_history = [assistant_message]
+    app = _DummyAgentApp(["agent"], default_agent="agent")
+    app._agents["agent"] = agent
+
+    session = SimpleNamespace(
+        info=SimpleNamespace(
+            name="session-2",
+            last_activity=datetime(2026, 2, 26, 12, 0, 0),
+        )
+    )
+    manager = SimpleNamespace(
+        resume_session_agents=lambda *args, **kwargs: ResumeSessionAgentsResult(
+            session=cast("Any", session),
+            loaded={"agent": Path("history_agent.json")},
+            missing_agents=[],
+            usage_notices=["[dim]Usage restored[/dim]"],
+        )
+    )
+
+    plain_notices: list[str] = []
+
+    monkeypatch.setattr("fast_agent.session.get_session_manager", lambda: manager)
+    monkeypatch.setattr("fast_agent.ui.enhanced_prompt.queue_startup_notice", plain_notices.append)
+    monkeypatch.setattr(
+        "fast_agent.ui.enhanced_prompt.queue_startup_markdown_notice",
+        lambda *args, **kwargs: None,
+    )
+
+    await _resume_session_if_requested(app, request)
+
+    assert any("Usage restored" in notice for notice in plain_notices)
+
+
+@pytest.mark.asyncio
 async def test_run_single_agent_cli_flow_retries_interactive_after_keyboard_interrupt(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -188,6 +322,31 @@ async def test_run_single_agent_cli_flow_retries_interactive_after_keyboard_inte
 
 
 @pytest.mark.asyncio
+async def test_run_single_agent_cli_flow_exits_after_double_keyboard_interrupt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _InterruptingAgentApp(_DummyAgentApp):
+        def __init__(self) -> None:
+            super().__init__(["agent"])
+            self.interactive_calls = 0
+
+        async def interactive(self, agent_name: str | None = None) -> None:
+            del agent_name
+            self.interactive_calls += 1
+            raise KeyboardInterrupt()
+
+    app = _InterruptingAgentApp()
+    request = _make_request(result_file=None, message=None)
+
+    with pytest.raises(KeyboardInterrupt):
+        await _run_single_agent_cli_flow(app, request)
+
+    captured = capsys.readouterr()
+    assert app.interactive_calls == 2
+    assert "Second Ctrl+C received; exiting fast-agent." in captured.err
+
+
+@pytest.mark.asyncio
 async def test_run_single_agent_cli_flow_retries_interactive_after_cancelled_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -210,3 +369,145 @@ async def test_run_single_agent_cli_flow_retries_interactive_after_cancelled_err
     captured = capsys.readouterr()
     assert app.interactive_calls == 2
     assert "Interrupted operation; returning to fast-agent prompt." not in captured.err
+
+
+def test_apply_shell_cwd_policy_preflight_interactive_honors_error_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fast = SimpleNamespace(
+        agents={
+            "agent": {
+                "config": AgentConfig(
+                    name="agent",
+                    instruction="x",
+                    servers=[],
+                    shell=True,
+                    cwd=Path("missing-shell-cwd"),
+                )
+            }
+        },
+        app=SimpleNamespace(
+            context=SimpleNamespace(
+                config=SimpleNamespace(
+                    shell_execution=SimpleNamespace(missing_cwd_policy="error")
+                )
+            )
+        ),
+    )
+    request = _make_request(result_file=None, message=None)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        _apply_shell_cwd_policy_preflight(fast, request)
+
+    assert exc_info.value.exit_code == 1
+    assert "Shell cwd policy (error):" in capsys.readouterr().err
+
+
+def test_apply_shell_cwd_policy_preflight_interactive_honors_warn_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[str] = []
+    monkeypatch.setattr(
+        "fast_agent.ui.enhanced_prompt.queue_startup_notice",
+        notices.append,
+    )
+    fast = SimpleNamespace(
+        agents={
+            "agent": {
+                "config": AgentConfig(
+                    name="agent",
+                    instruction="x",
+                    servers=[],
+                    shell=True,
+                    cwd=Path("missing-shell-cwd"),
+                )
+            }
+        },
+        app=SimpleNamespace(
+            context=SimpleNamespace(
+                config=SimpleNamespace(
+                    shell_execution=SimpleNamespace(missing_cwd_policy="warn")
+                )
+            )
+        ),
+    )
+    request = _make_request(result_file=None, message=None)
+    monkeypatch.chdir(tmp_path)
+
+    _apply_shell_cwd_policy_preflight(fast, request)
+
+    assert notices
+    assert "Shell cwd policy (warn):" in notices[0]
+
+
+def test_apply_shell_cwd_policy_preflight_interactive_honors_create_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast = SimpleNamespace(
+        agents={
+            "agent": {
+                "config": AgentConfig(
+                    name="agent",
+                    instruction="x",
+                    servers=[],
+                    shell=True,
+                    cwd=Path("missing-shell-cwd"),
+                )
+            }
+        },
+        app=SimpleNamespace(
+            context=SimpleNamespace(
+                config=SimpleNamespace(
+                    shell_execution=SimpleNamespace(missing_cwd_policy="create")
+                )
+            )
+        ),
+    )
+    request = _make_request(result_file=None, message=None)
+    monkeypatch.chdir(tmp_path)
+
+    _apply_shell_cwd_policy_preflight(fast, request)
+
+    assert (tmp_path / "missing-shell-cwd").is_dir()
+
+
+def test_apply_shell_cwd_policy_preflight_interactive_create_errors_on_remaining_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    not_a_dir = tmp_path / "not-a-dir"
+    not_a_dir.write_text("content", encoding="utf-8")
+    fast = SimpleNamespace(
+        agents={
+            "agent": {
+                "config": AgentConfig(
+                    name="agent",
+                    instruction="x",
+                    servers=[],
+                    shell=True,
+                    cwd=Path("not-a-dir"),
+                )
+            }
+        },
+        app=SimpleNamespace(
+            context=SimpleNamespace(
+                config=SimpleNamespace(
+                    shell_execution=SimpleNamespace(missing_cwd_policy="create")
+                )
+            )
+        ),
+    )
+    request = _make_request(result_file=None, message=None)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        _apply_shell_cwd_policy_preflight(fast, request)
+
+    assert exc_info.value.exit_code == 1
+    assert "Shell cwd policy (error):" in capsys.readouterr().err

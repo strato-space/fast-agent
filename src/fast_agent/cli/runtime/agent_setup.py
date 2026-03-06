@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Mapping, cast
 
 import typer
 
@@ -13,10 +15,191 @@ from fast_agent.cli.commands.server_helpers import add_servers_to_config
 from fast_agent.cli.constants import RESUME_LATEST_SENTINEL
 from fast_agent.core.exceptions import AgentConfigError
 
-from .request_builders import resolve_default_instruction, use_smart_agent
+from .request_builders import resolve_default_instruction, resolve_smart_agent_enabled
+from .shell_cwd_policy import (
+    can_prompt_for_missing_cwd,
+    collect_shell_cwd_issues,
+    create_missing_shell_cwd_directories,
+    effective_missing_shell_cwd_policy,
+    format_shell_cwd_issues,
+    resolve_missing_shell_cwd_policy,
+)
 
 if TYPE_CHECKING:
     from .run_request import AgentRunRequest
+
+
+def _find_last_assistant_text(history: list[Any]) -> str | None:
+    for message in reversed(history):
+        if getattr(message, "role", None) != "assistant":
+            continue
+        text = getattr(message, "last_text", None)
+        if callable(text):
+            value = text()
+            if value:
+                return str(value)
+    return None
+
+
+def _is_interactive_startup_notice_context(request: AgentRunRequest) -> bool:
+    return request.mode == "interactive" and request.message is None and request.prompt_file is None
+
+
+def _should_prompt_for_model_picker(
+    request: AgentRunRequest,
+    *,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> bool:
+    """Return True when interactive startup can safely prompt for model selection."""
+    if not _is_interactive_startup_notice_context(request):
+        return False
+    if request.agent_cards or request.card_tools:
+        # Phase 1: only use picker for plain CLI bootstrap (no AgentCards).
+        return False
+    return stdin_is_tty and stdout_is_tty
+
+
+def _resolve_model_without_hardcoded_default(
+    *,
+    model: str | None,
+    config_default_model: str | None,
+    model_aliases: Mapping[str, Mapping[str, str]] | None,
+) -> tuple[str | None, str | None]:
+    """Resolve model precedence without falling back to the hardcoded system default."""
+    from fast_agent.core.model_resolution import resolve_model_spec
+
+    return resolve_model_spec(
+        context=None,
+        model=model,
+        default_model=config_default_model,
+        cli_model=model,
+        fallback_to_hardcoded=False,
+        model_aliases=model_aliases,
+    )
+
+
+async def _select_model_from_picker(request: AgentRunRequest) -> str:
+    """Prompt user for model selection and return a resolved model string."""
+    from fast_agent.ui.model_picker import run_model_picker_async
+
+    config_path = Path(request.config_path) if request.config_path else None
+
+    while True:
+        picker_result = await run_model_picker_async(config_path=config_path)
+        if picker_result is None:
+            typer.echo("Model selection cancelled.", err=True)
+            raise typer.Exit(1)
+
+        if picker_result.refer_to_docs or not picker_result.resolved_model:
+            typer.echo(
+                "Selected provider requires manual model IDs/options. "
+                "Please choose a concrete model (or press q to cancel).",
+                err=True,
+            )
+            continue
+
+        return picker_result.resolved_model
+
+
+def _emit_startup_notice(request: AgentRunRequest, message: str) -> None:
+    if _is_interactive_startup_notice_context(request):
+        from fast_agent.ui.enhanced_prompt import queue_startup_notice
+
+        queue_startup_notice(message)
+        return
+
+    typer.echo(message, err=True)
+
+
+def _format_shell_cwd_policy_message(
+    *,
+    policy: str,
+    lines: list[str],
+) -> str:
+    title = f"Shell cwd policy ({policy}):"
+    return "\n".join([title, *lines])
+
+
+def _apply_shell_cwd_policy_preflight(fast: Any, request: AgentRunRequest) -> None:
+    issues = collect_shell_cwd_issues(
+        fast.agents,
+        shell_runtime_requested=request.shell_runtime,
+        cwd=Path.cwd(),
+    )
+    if not issues:
+        return
+
+    settings = getattr(fast.app.context, "config", None)
+    shell_settings = getattr(settings, "shell_execution", None)
+    configured_policy = getattr(shell_settings, "missing_cwd_policy", None)
+    resolved_policy = resolve_missing_shell_cwd_policy(
+        cli_override=request.missing_shell_cwd_policy,
+        configured_policy=configured_policy,
+    )
+    interactive_startup_context = _is_interactive_startup_notice_context(request)
+    can_prompt = can_prompt_for_missing_cwd(
+        mode=request.mode,
+        message=request.message,
+        prompt_file=request.prompt_file,
+        stdin_is_tty=sys.stdin.isatty(),
+        tty_device_available=False,
+    )
+    policy = effective_missing_shell_cwd_policy(resolved_policy, can_prompt=can_prompt)
+    issue_lines = format_shell_cwd_issues(issues)
+
+    if policy == "warn":
+        _emit_startup_notice(
+            request,
+            _format_shell_cwd_policy_message(policy=policy, lines=issue_lines),
+        )
+        return
+
+    if policy == "error":
+        typer.echo(_format_shell_cwd_policy_message(policy=policy, lines=issue_lines), err=True)
+        raise typer.Exit(1)
+
+    if policy == "ask":
+        if interactive_startup_context:
+            # Keep interactive confirmation inside the prompt lifecycle for ask mode.
+            return
+        policy = "warn"
+
+    if policy == "warn":
+        _emit_startup_notice(
+            request,
+            _format_shell_cwd_policy_message(policy=policy, lines=issue_lines),
+        )
+        return
+
+    created_paths, creation_errors = create_missing_shell_cwd_directories(issues)
+    if created_paths:
+        created_lines = [
+            "Created missing shell cwd directories:",
+            *[f" - {path}" for path in created_paths],
+        ]
+        _emit_startup_notice(request, "\n".join(created_lines))
+
+    if creation_errors:
+        error_lines = ["Failed to create one or more shell cwd directories:"]
+        error_lines.extend(f" - {item.path}: {item.message}" for item in creation_errors)
+        typer.echo("\n".join(error_lines), err=True)
+        raise typer.Exit(1)
+
+    remaining_issues = collect_shell_cwd_issues(
+        fast.agents,
+        shell_runtime_requested=request.shell_runtime,
+        cwd=Path.cwd(),
+    )
+    if remaining_issues:
+        typer.echo(
+            _format_shell_cwd_policy_message(
+                policy="error",
+                lines=format_shell_cwd_issues(remaining_issues),
+            ),
+            err=True,
+        )
+        raise typer.Exit(1)
 
 
 async def _resume_session_if_requested(agent_app, request: AgentRunRequest) -> None:
@@ -30,7 +213,7 @@ async def _resume_session_if_requested(agent_app, request: AgentRunRequest) -> N
         return
 
     from fast_agent.session import get_session_manager
-    from fast_agent.ui.enhanced_prompt import queue_startup_notice
+    from fast_agent.ui.enhanced_prompt import queue_startup_markdown_notice, queue_startup_notice
 
     manager = get_session_manager()
     session_id = None if request.resume in ("", RESUME_LATEST_SENTINEL) else request.resume
@@ -55,7 +238,10 @@ async def _resume_session_if_requested(agent_app, request: AgentRunRequest) -> N
             )
         return
 
-    session, loaded, missing_agents = result
+    session = result.session
+    loaded = result.loaded
+    missing_agents = result.missing_agents
+    usage_notices = result.usage_notices
     session_time = session.info.last_activity.strftime("%y-%m-%d %H:%M")
     resume_notice = (
         f"[dim]Resumed session[/dim] [cyan]{session.info.name}[/cyan] [dim]({session_time})[/dim]"
@@ -74,6 +260,22 @@ async def _resume_session_if_requested(agent_app, request: AgentRunRequest) -> N
             queue_startup_notice(missing_notice)
         else:
             typer.echo(f"Missing agents from session: {missing_list}", err=True)
+
+    for usage_notice in usage_notices:
+        if not usage_notice:
+            continue
+        if interactive_notice:
+            queue_startup_notice(usage_notice)
+        else:
+            typer.echo(
+                usage_notice
+                .replace("[yellow]", "")
+                .replace("[/yellow]", "")
+                .replace("[dim]", "")
+                .replace("[/dim]", ""),
+                err=True,
+            )
+
     if missing_agents or not loaded:
         from fast_agent.session import format_history_summary, summarize_session_histories
 
@@ -85,6 +287,27 @@ async def _resume_session_if_requested(agent_app, request: AgentRunRequest) -> N
                 queue_startup_notice(summary_notice)
             else:
                 typer.echo(f"Available histories: {summary_text}", err=True)
+
+    preview_agent = default_agent
+    default_name = getattr(default_agent, "name", None)
+    if loaded and default_name not in loaded:
+        first_loaded_name = sorted(loaded.keys())[0]
+        preview_agent = agent_app._agents.get(first_loaded_name, default_agent)
+
+    preview_history = getattr(preview_agent, "message_history", [])
+    assistant_text = _find_last_assistant_text(list(preview_history))
+    if assistant_text:
+        if interactive_notice:
+            queue_startup_notice("[dim]Last assistant message:[/dim]")
+            queue_startup_markdown_notice(
+                assistant_text,
+                title="Last assistant message",
+                right_info="session",
+                agent_name=getattr(preview_agent, "name", None),
+            )
+        else:
+            typer.echo("Last assistant message:", err=True)
+            typer.echo(assistant_text, err=True)
 
 
 def _validate_target_agent_name(fast, request: AgentRunRequest) -> None:
@@ -206,7 +429,13 @@ async def _export_result_histories(
 async def _run_single_agent_cli_flow(agent_app: Any, request: AgentRunRequest) -> None:
     from fast_agent.mcp.prompts.prompt_load import load_prompt
 
+    # Allow interactive prompt startup checks to honor per-run CLI override policy.
+    setattr(agent_app, "_missing_shell_cwd_policy_override", request.missing_shell_cwd_policy)
+
     async def _run_interactive_with_interrupt_recovery() -> None:
+        ctrl_c_exit_window_seconds = 2.0
+        ctrl_c_deadline: float | None = None
+
         while True:
             try:
                 await agent_app.interactive(agent_name=request.target_agent_name)
@@ -219,7 +448,17 @@ async def _run_single_agent_cli_flow(agent_app: Any, request: AgentRunRequest) -
                 await asyncio.sleep(0)
                 continue
             except KeyboardInterrupt:
-                typer.echo("Interrupted operation; returning to fast-agent prompt.", err=True)
+                now = time.monotonic()
+                if ctrl_c_deadline is not None and now <= ctrl_c_deadline:
+                    typer.echo("Second Ctrl+C received; exiting fast-agent.", err=True)
+                    raise
+
+                ctrl_c_deadline = now + ctrl_c_exit_window_seconds
+                typer.echo(
+                    "Interrupted operation; returning to fast-agent prompt. "
+                    "Press Ctrl+C again within 2 seconds to exit.",
+                    err=True,
+                )
                 continue
 
     await _resume_session_if_requested(agent_app, request)
@@ -246,15 +485,47 @@ async def _run_single_agent_cli_flow(agent_app: Any, request: AgentRunRequest) -
 
 async def run_agent_request(request: AgentRunRequest) -> None:
     """Run the normalized CLI request."""
+    picker_model_source_override: str | None = None
+
+    if request.model is None:
+        from fast_agent.config import get_settings
+
+        settings = get_settings(request.config_path)
+        _, explicit_source = _resolve_model_without_hardcoded_default(
+            model=request.model,
+            config_default_model=getattr(settings, "default_model", None),
+            model_aliases=getattr(settings, "model_aliases", None),
+        )
+
+        if explicit_source is None and _should_prompt_for_model_picker(
+            request,
+            stdin_is_tty=sys.stdin.isatty(),
+            stdout_is_tty=sys.stdout.isatty(),
+        ):
+            request.model = await _select_model_from_picker(request)
+            picker_model_source_override = "model picker"
+
     serve_permissions_enabled = request.permissions_enabled and not (
         request.noenv and request.mode == "serve"
     )
 
     instruction = request.instruction
     if instruction is None:
-        instruction = resolve_default_instruction(request.model, request.mode)
+        instruction = resolve_default_instruction(
+            request.model,
+            request.mode,
+            force_smart=request.force_smart,
+        )
 
-    smart_agent_enabled = use_smart_agent(request.model, request.mode)
+    smart_agent_enabled = resolve_smart_agent_enabled(
+        request.model,
+        request.mode,
+        force_smart=request.force_smart,
+    )
+    smart_unavailable_warning = (
+        "Warning: --smart requested, but smart defaults are unavailable when using "
+        "multiple models. Continuing with non-smart defaults."
+    )
     if request.mode == "serve" and request.transport in ["stdio", "acp"]:
         from fast_agent.ui.console import configure_console_stream
 
@@ -269,13 +540,15 @@ async def run_agent_request(request: AgentRunRequest) -> None:
         config_path=request.config_path,
         ignore_unknown_args=True,
         parse_cli_args=False,
-        quiet=request.mode == "serve",
+        quiet=request.mode == "serve" or request.quiet,
         skills_directory=request.skills_directory,
         environment_dir=request.environment_dir,
     )
 
     if request.model:
         fast.args.model = request.model
+    if picker_model_source_override:
+        fast.args.model_source_override = picker_model_source_override
     fast.args.noenv = request.noenv
     fast.args.reload = request.reload
     fast.args.watch = request.watch
@@ -311,11 +584,27 @@ async def run_agent_request(request: AgentRunRequest) -> None:
                         fast.load_agents(card_source)
 
             has_explicit_default = False
+            explicit_default_type: str | None = None
             for agent_data in fast.agents.values():
                 config = agent_data.get("config")
                 if config and getattr(config, "default", False):
                     has_explicit_default = True
+                    explicit_default_type = (
+                        str(agent_data.get("type")) if agent_data.get("type") is not None else None
+                    )
                     break
+
+            if has_explicit_default and request.force_smart:
+                from fast_agent.agents.agent_types import AgentType
+
+                if explicit_default_type != AgentType.SMART.value:
+                    typer.echo(
+                        "Warning: --smart requested, but loaded AgentCards already define a "
+                        "non-smart default agent. Keeping the card-defined default.",
+                        err=True,
+                    )
+            elif request.force_smart and not smart_agent_enabled:
+                typer.echo(smart_unavailable_warning, err=True)
 
             if not has_explicit_default:
                 agent_decorator = fast.smart if smart_agent_enabled else fast.agent
@@ -356,6 +645,7 @@ async def run_agent_request(request: AgentRunRequest) -> None:
                     fast.attach_agent_tools(target_name, tool_loaded_names)
 
             _validate_target_agent_name(fast, request)
+            _apply_shell_cwd_policy_preflight(fast, request)
         except AgentConfigError as exc:
             fast._handle_error(exc)
             raise typer.Exit(1) from exc
@@ -367,6 +657,9 @@ async def run_agent_request(request: AgentRunRequest) -> None:
                 await _run_single_agent_cli_flow(agent, request)
 
     elif request.model and "," in request.model:
+        if request.force_smart and not smart_agent_enabled:
+            typer.echo(smart_unavailable_warning, err=True)
+
         models = [m.strip() for m in request.model.split(",") if m.strip()]
 
         fan_out_agents: list[str] = []

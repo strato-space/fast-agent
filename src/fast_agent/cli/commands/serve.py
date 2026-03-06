@@ -30,6 +30,13 @@ class InstanceScope(str, Enum):
     REQUEST = "request"
 
 
+class MissingShellCwdPolicy(str, Enum):
+    ASK = "ask"
+    CREATE = "create"
+    WARN = "warn"
+    ERROR = "error"
+
+
 def _build_run_request(
     *,
     ctx: typer.Context,
@@ -41,10 +48,12 @@ def _build_run_request(
     card_tools: list[str] | None,
     urls: str | None,
     auth: str | None,
+    client_metadata_url: str | None,
     model: str | None,
     skills_dir: Path | None,
     env_dir: Path | None,
     noenv: bool,
+    force_smart: bool,
     npx: str | None,
     uvx: str | None,
     stdio: str | None,
@@ -58,6 +67,7 @@ def _build_run_request(
     no_permissions: bool,
     reload: bool,
     watch: bool,
+    missing_shell_cwd: MissingShellCwdPolicy | None = None,
 ) -> AgentRunRequest:
     resolved_env_dir = resolve_environment_dir_option(ctx, env_dir, set_env_var=not noenv)
     return build_command_run_request(
@@ -67,6 +77,7 @@ def _build_run_request(
         servers=servers,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         agent_cards=agent_cards,
         card_tools=card_tools,
         model=model,
@@ -81,6 +92,7 @@ def _build_run_request(
         skills_directory=skills_dir,
         environment_dir=resolved_env_dir,
         noenv=noenv,
+        force_smart=force_smart,
         shell_enabled=shell,
         mode="serve",
         transport=transport.value,
@@ -92,6 +104,7 @@ def _build_run_request(
         permissions_enabled=not no_permissions,
         reload=reload,
         watch=watch,
+        missing_shell_cwd_policy=missing_shell_cwd.value if missing_shell_cwd else None,
     )
 
 
@@ -105,21 +118,18 @@ app = typer.Typer(
 def serve(
     ctx: typer.Context,
     name: str = typer.Option("fast-agent", "--name", help="Name for the MCP server"),
-    instruction: str | None = typer.Option(
-        None,
-        "--instruction",
-        "-i",
-        help="Path to file or URL containing instruction for the agent",
-    ),
+    instruction: str | None = CommonAgentOptions.instruction(),
     config_path: str | None = CommonAgentOptions.config_path(),
+    model: str | None = CommonAgentOptions.model(),
     servers: str | None = CommonAgentOptions.servers(),
     agent_cards: list[str] | None = CommonAgentOptions.agent_cards(),
     card_tools: list[str] | None = CommonAgentOptions.card_tools(),
     urls: str | None = CommonAgentOptions.urls(),
     auth: str | None = CommonAgentOptions.auth(),
-    model: str | None = CommonAgentOptions.model(),
+    client_metadata_url: str | None = CommonAgentOptions.client_metadata_url(),
     env_dir: Path | None = CommonAgentOptions.env_dir(),
     noenv: bool = CommonAgentOptions.noenv(),
+    smart: bool = CommonAgentOptions.smart(),
     skills_dir: Path | None = CommonAgentOptions.skills_dir(),
     npx: str | None = CommonAgentOptions.npx(),
     uvx: str | None = CommonAgentOptions.uvx(),
@@ -161,6 +171,11 @@ def serve(
         "--no-permissions",
         help="Disable tool permission requests (allow all tool executions without asking) - ACP only",
     ),
+    missing_shell_cwd: MissingShellCwdPolicy | None = typer.Option(
+        None,
+        "--missing-shell-cwd",
+        help="Override shell_execution.missing_cwd_policy (ask, create, warn, error)",
+    ),
     reload: bool = CommonAgentOptions.reload(),
     watch: bool = CommonAgentOptions.watch(),
 ) -> None:
@@ -175,10 +190,12 @@ def serve(
         card_tools=card_tools,
         urls=urls,
         auth=auth,
+        client_metadata_url=client_metadata_url,
         model=model,
         skills_dir=skills_dir,
         env_dir=env_dir,
         noenv=noenv,
+        force_smart=smart,
         npx=npx,
         uvx=uvx,
         stdio=stdio,
@@ -192,5 +209,6 @@ def serve(
         no_permissions=no_permissions,
         reload=reload,
         watch=watch,
+        missing_shell_cwd=missing_shell_cwd,
     )
     run_request(request)

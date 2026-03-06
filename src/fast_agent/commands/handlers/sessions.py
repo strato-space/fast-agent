@@ -17,6 +17,7 @@ from fast_agent.ui.shell_notice import format_shell_notice
 if TYPE_CHECKING:
     from fast_agent.commands.context import CommandContext
     from fast_agent.session import SessionEntrySummary
+    from fast_agent.types import PromptMessageExtended
 
 
 NOENV_SESSION_MESSAGE = "Session commands are disabled in --noenv mode."
@@ -65,6 +66,16 @@ def _resolve_pin_state(value: str | None, *, current: bool) -> tuple[bool | None
     if normalized in {"off", "false", "no", "disable", "disabled"}:
         return False, None
     return None, "Usage: /session pin [on|off|id|number]"
+
+
+def _find_last_assistant_text(history: list[PromptMessageExtended]) -> str | None:
+    for message in reversed(history):
+        if message.role != "assistant":
+            continue
+        text = message.last_text()
+        if text:
+            return text
+    return None
 
 
 def _build_session_entries(entries: list[SessionEntrySummary], *, usage: str) -> Text:
@@ -311,7 +322,10 @@ async def handle_resume_session(
             outcome.add_message("No sessions found.", channel="warning")
         return outcome
 
-    session, loaded, missing_agents = result
+    session = result.session
+    loaded = result.loaded
+    missing_agents = result.missing_agents
+    usage_notices = result.usage_notices
     if loaded:
         loaded_list = ", ".join(sorted(loaded.keys()))
         outcome.add_message(
@@ -334,6 +348,13 @@ async def handle_resume_session(
         missing_list = ", ".join(sorted(missing_agents))
         outcome.add_message(
             f"Missing agents from session: {missing_list}",
+            channel="warning",
+            right_info="session",
+        )
+
+    for usage_notice in usage_notices:
+        outcome.add_message(
+            usage_notice,
             channel="warning",
             right_info="session",
         )
@@ -369,6 +390,16 @@ async def handle_resume_session(
 
     history = getattr(agent_obj, "message_history", [])
     await ctx.io.display_history_overview(agent_obj.name, list(history), usage)
+
+    assistant_text = _find_last_assistant_text(list(history))
+    if assistant_text:
+        outcome.add_message(
+            Text(assistant_text),
+            title="Last assistant message",
+            right_info="session",
+            agent_name=agent_obj.name,
+            render_markdown=True,
+        )
     return outcome
 
 

@@ -32,7 +32,8 @@ mcp_timeline:
 #  timeout_seconds: 20
 # warning interval if no output seen
 #  warning_seconds: 5
-# max number of output lines to display for shell tool results (0 = exit code only)
+# max number of output lines to display for shell tool results
+# (shows head + ... + tail when truncated; 0 = exit code only)
 #  output_display_lines: 5  # default
 # show shell command output in console (false to suppress bash output)
 #  show_bash: true
@@ -55,22 +56,21 @@ logger:
   # Streaming renderer for assistant responses: "markdown", "plain", or "none"
   streaming: markdown
 
-# MCP Servers
+# MCP Servers (target shorthand)
 mcp:
-  servers:
-    fetch:
-      command: "uvx"
-      args: ["mcp-server-fetch"]
-    filesystem:
-      command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    huggingface:
-      url: "https://huggingface.co/mcp?login"
+  targets:
+    - name: fetch
+      target: "uvx mcp-server-fetch"
+    - name: filesystem
+      target: "npx -y @modelcontextprotocol/server-filesystem ."
+    - name: huggingface
+      target: "https://huggingface.co/mcp?login"
       # headers:
       # "Authorization": "Bearer ${ENV_VAR}"
 
 # Skills configuration
 skills:
   marketplace_urls:
+    - "https://github.com/fast-agent-ai/skills"
     - "https://github.com/huggingface/skills"
     - "https://github.com/anthropics/skills"

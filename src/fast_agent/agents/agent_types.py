@@ -57,6 +57,16 @@ ToolHooksConfig: TypeAlias = dict[str, str] | None
 LifecycleHooksConfig: TypeAlias = dict[str, str] | None
 
 
+@dataclass(frozen=True, slots=True)
+class MCPConnectTarget:
+    """Runtime MCP connect target declared on an AgentCard."""
+
+    target: str
+    name: str | None = None
+    headers: dict[str, str] | None = None
+    auth: dict[str, Any] | None = None
+
+
 @dataclass
 class AgentConfig:
     """Configuration for an Agent instance"""
@@ -64,6 +74,7 @@ class AgentConfig:
     name: str
     instruction: str = DEFAULT_AGENT_INSTRUCTION
     description: str | None = None
+    tool_input_schema: dict[str, Any] | None = None
     servers: list[str] = field(default_factory=list)
     tools: dict[str, list[str]] = field(default_factory=dict)  # filters for tools
     resources: dict[str, list[str]] = field(default_factory=dict)  # filters for resources
@@ -85,6 +96,7 @@ class AgentConfig:
     tool_hooks: ToolHooksConfig = None
     lifecycle_hooks: LifecycleHooksConfig = None
     trim_tool_history: bool = False
+    mcp_connect: list[MCPConnectTarget] = field(default_factory=list)
     source_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self):

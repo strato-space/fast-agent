@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,9 +23,15 @@ from fast_agent.constants import (
     MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
     TERMINAL_BYTES_PER_TOKEN,
 )
+from fast_agent.core.logging.progress_payloads import build_progress_payload
+from fast_agent.event_progress import ProgressAction
 from fast_agent.ui import console
 from fast_agent.ui.console_display import ConsoleDisplay
 from fast_agent.ui.progress_display import progress_display
+from fast_agent.ui.shell_output_truncation import (
+    SHELL_OUTPUT_TRUNCATION_MARKER,
+    split_shell_output_line_limit,
+)
 from fast_agent.utils.async_utils import gather_with_cancel
 
 
@@ -41,6 +48,7 @@ class ShellRuntime:
         working_directory: Path | None = None,
         output_byte_limit: int | None = None,
         config: Settings | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self._activation_reason = activation_reason
         self._logger = logger
@@ -53,6 +61,7 @@ class ShellRuntime:
         self.enabled: bool = activation_reason is not None
         self._tool: Tool | None = None
         self._display = ConsoleDisplay(config=config)
+        self._agent_name = agent_name
         self._output_display_lines: int | None = None
         self._show_bash_output = True
         if config is not None:
@@ -120,6 +129,37 @@ class ShellRuntime:
         # Skills now show their location relative to cwd in the system prompt
         return Path.cwd()
 
+    @staticmethod
+    def _resolve_working_directory(path: Path) -> Path:
+        """Resolve working directory to an absolute path for subprocess execution."""
+        if path.is_absolute():
+            return path.resolve()
+        return (Path.cwd() / path).resolve()
+
+    def _validate_working_directory(self, configured_path: Path) -> str | None:
+        """Return an actionable validation error when cwd is missing/invalid."""
+        resolved_path = self._resolve_working_directory(configured_path)
+
+        if not resolved_path.exists():
+            return " ".join(
+                [
+                    f"Shell working directory does not exist: {resolved_path}.",
+                    f"Configured cwd: {configured_path}.",
+                    "Check the agent card 'cwd' setting or create the directory.",
+                ]
+            )
+
+        if not resolved_path.is_dir():
+            return " ".join(
+                [
+                    f"Shell working directory is not a directory: {resolved_path}.",
+                    f"Configured cwd: {configured_path}.",
+                    "Check the agent card 'cwd' setting.",
+                ]
+            )
+
+        return None
+
     def runtime_info(self) -> dict[str, str | None]:
         """Best-effort detection of the shell runtime used for local execution.
 
@@ -176,7 +216,14 @@ class ShellRuntime:
             "returns_exit_code": True,
         }
 
-    async def execute(self, arguments: dict[str, Any] | None = None) -> CallToolResult:
+    async def execute(
+        self,
+        arguments: dict[str, Any] | None = None,
+        tool_use_id: str | None = None,
+        *,
+        show_tool_call_id: bool = False,
+        defer_display_to_tool_result: bool = False,
+    ) -> CallToolResult:
         """Execute a shell command and stream output to the console with timeout detection."""
         command_value = (arguments or {}).get("command") if arguments else None
         if not isinstance(command_value, str) or not command_value.strip():
@@ -195,10 +242,24 @@ class ShellRuntime:
             f"Executing command with timeout={self._timeout_seconds}s, warning_interval={self._warning_interval_seconds}s"
         )
 
+        configured_working_dir = self.working_directory()
+        working_dir_error = self._validate_working_directory(configured_working_dir)
+        if working_dir_error:
+            return CallToolResult(
+                isError=True,
+                content=[TextContent(type="text", text=working_dir_error)],
+            )
+
         # Pause progress display during shell execution to avoid overlaying output
         with progress_display.paused():
             try:
-                working_dir = self.working_directory()
+                self._emit_progress_event(
+                    action=ProgressAction.CALLING_TOOL,
+                    tool_use_id=tool_use_id,
+                    tool_event="start",
+                )
+
+                working_dir = self._resolve_working_directory(configured_working_dir)
                 runtime_details = self.runtime_info()
                 shell_name = (runtime_details.get("name") or "").lower()
                 shell_path = runtime_details.get("path")
@@ -242,29 +303,53 @@ class ShellRuntime:
 
                 output_segments: list[str] = []
                 output_bytes = 0
+                total_output_bytes = 0
                 output_truncated = False
                 truncation_notice_printed = False
+                had_stream_output = False
+                use_live_shell_display = (
+                    self._show_bash_output and not defer_display_to_tool_result
+                )
                 display_line_limit = self._output_display_lines
-                displayed_line_count = 0
+                displayed_head_count = 0
+                display_total_line_count = 0
+                output_line_count = 0
+                display_overflowed = False
                 display_ellipsis_printed = False
+                display_head_limit, display_tail_limit = (0, 0)
+                display_tail_buffer: deque[tuple[int, str, str | None]] = deque(maxlen=1)
+                if display_line_limit is not None and display_line_limit > 0:
+                    display_head_limit, display_tail_limit = split_shell_output_line_limit(
+                        display_line_limit
+                    )
+                    display_tail_buffer = deque(
+                        maxlen=max(display_tail_limit, 1),
+                    )
                 # Track last output time in a mutable container for sharing across coroutines
                 last_output_time = [time.time()]
                 timeout_occurred = [False]
                 watchdog_task = None
 
                 async def stream_output(stream, style: str | None, is_stderr: bool = False) -> None:
-                    nonlocal output_bytes, output_truncated, truncation_notice_printed
-                    nonlocal displayed_line_count, display_ellipsis_printed
+                    nonlocal output_bytes, total_output_bytes, output_truncated
+                    nonlocal truncation_notice_printed
+                    nonlocal displayed_head_count, display_total_line_count, display_overflowed
+                    nonlocal display_ellipsis_printed
+                    nonlocal had_stream_output
+                    nonlocal output_line_count
                     if not stream:
                         return
                     while True:
                         line = await stream.readline()
                         if not line:
                             break
+                        had_stream_output = True
+                        output_line_count += 1
                         text = line.decode(errors="replace")
                         output_text = text if not is_stderr else f"[stderr] {text}"
+                        output_blob = output_text.encode("utf-8", errors="replace")
+                        total_output_bytes += len(output_blob)
                         if not output_truncated:
-                            output_blob = output_text.encode("utf-8", errors="replace")
                             remaining = self._output_byte_limit - output_bytes
                             if remaining > 0:
                                 if len(output_blob) <= remaining:
@@ -282,21 +367,26 @@ class ShellRuntime:
                                 output_truncated = True
 
                         if output_truncated and not truncation_notice_printed:
-                            if self._show_bash_output and (
+                            if use_live_shell_display and (
                                 display_line_limit is None or display_line_limit > 0
                             ):
                                 estimated_tokens = int(
                                     self._output_byte_limit / TERMINAL_BYTES_PER_TOKEN
                                 )
-                                message = Text(
-                                    "▶ Shell to agent output truncated (> ~", style="black on red"
+                                console.console.print(
+                                    " ".join(
+                                        [
+                                            "▶ Shell to agent output reached",
+                                            f"{self._output_byte_limit} bytes",
+                                            f"(~{estimated_tokens} tokens);",
+                                            "additional output omitted from tool result.",
+                                        ]
+                                    ),
+                                    style="black on red",
                                 )
-                                message.append(str(estimated_tokens))
-                                message.append(" tokens)", style="black on red")
-                                console.console.print(message)
                             truncation_notice_printed = True
 
-                        if self._show_bash_output:
+                        if use_live_shell_display:
                             if display_line_limit is None:
                                 console.console.print(
                                     self._render_display_line(text, style),
@@ -304,15 +394,27 @@ class ShellRuntime:
                                 )
                             elif display_line_limit <= 0:
                                 pass
-                            elif displayed_line_count < display_line_limit:
-                                console.console.print(
-                                    self._render_display_line(text, style),
-                                    markup=False,
-                                )
-                                displayed_line_count += 1
-                            elif not display_ellipsis_printed:
-                                console.console.print("...", style="dim", markup=False)
-                                display_ellipsis_printed = True
+                            else:
+                                display_total_line_count += 1
+                                current_line_index = display_total_line_count
+                                if displayed_head_count < display_head_limit:
+                                    console.console.print(
+                                        self._render_display_line(text, style),
+                                        markup=False,
+                                    )
+                                    displayed_head_count += 1
+                                else:
+                                    if display_tail_limit > 0:
+                                        display_tail_buffer.append((current_line_index, text, style))
+                                    if current_line_index > display_line_limit:
+                                        display_overflowed = True
+                                        if not display_ellipsis_printed:
+                                            console.console.print(
+                                                SHELL_OUTPUT_TRUNCATION_MARKER,
+                                                style="dim",
+                                                markup=False,
+                                            )
+                                            display_ellipsis_printed = True
 
                         # Update last output time whenever we receive a line
                         last_output_time[0] = time.time()
@@ -339,7 +441,7 @@ class ShellRuntime:
                         time_since_warning = elapsed - last_warning_time
                         if time_since_warning >= self._warning_interval_seconds and remaining > 0:
                             self._logger.debug(f"Watchdog: warning at {int(remaining)}s remaining")
-                            if self._show_bash_output:
+                            if use_live_shell_display:
                                 console.console.print(
                                     f"▶ No output detected - terminating in {int(remaining)}s",
                                     style="black on red",
@@ -365,7 +467,7 @@ class ShellRuntime:
                             self._logger.debug(
                                 "Watchdog: timeout exceeded, terminating process group"
                             )
-                            if self._show_bash_output:
+                            if use_live_shell_display:
                                 console.console.print(
                                     "▶ Timeout exceeded - terminating process", style="black on red"
                                 )
@@ -444,14 +546,25 @@ class ShellRuntime:
                         return_code = -1
 
                 # Build result based on timeout or normal completion
+                truncation_summary: str | None = None
+                if output_truncated:
+                    retained_tokens = max(int(output_bytes / TERMINAL_BYTES_PER_TOKEN), 1)
+                    total_tokens = max(int(total_output_bytes / TERMINAL_BYTES_PER_TOKEN), 1)
+                    omitted_bytes = max(total_output_bytes - output_bytes, 0)
+                    truncation_summary = (
+                        "[Output truncated: retained "
+                        f"{output_bytes} of {total_output_bytes} bytes "
+                        f"(~{retained_tokens} of ~{total_tokens} tokens); "
+                        f"omitted {omitted_bytes} bytes. "
+                        "Increase shell_execution.output_byte_limit to retain more.]"
+                    )
+
                 if timeout_occurred[0]:
                     combined_output = "".join(output_segments)
                     if combined_output and not combined_output.endswith("\n"):
                         combined_output += "\n"
-                    if output_truncated:
-                        combined_output += (
-                            f"[Output truncated after {self._output_byte_limit} bytes]\n"
-                        )
+                    if truncation_summary:
+                        combined_output += f"{truncation_summary}\n"
                     combined_output += (
                         f"(timeout after {self._timeout_seconds}s - process terminated)"
                     )
@@ -465,15 +578,14 @@ class ShellRuntime:
                             )
                         ],
                     )
+                    completion_details = f"failed (timeout after {self._timeout_seconds}s)"
                 else:
                     combined_output = "".join(output_segments)
                     # Add explicit exit code message for the LLM
                     if combined_output and not combined_output.endswith("\n"):
                         combined_output += "\n"
-                    if output_truncated:
-                        combined_output += (
-                            f"[Output truncated after {self._output_byte_limit} bytes]\n"
-                        )
+                    if truncation_summary:
+                        combined_output += f"{truncation_summary}\n"
                     combined_output += f"process exit code was {return_code}"
 
                     result = CallToolResult(
@@ -485,18 +597,96 @@ class ShellRuntime:
                             )
                         ],
                     )
+                    completion_state = "completed" if return_code == 0 else "failed"
+                    completion_details = f"{completion_state} (exit {return_code})"
+
+                if use_live_shell_display and display_line_limit is not None and display_line_limit > 0:
+                    if display_overflowed:
+                        if not display_ellipsis_printed:
+                            console.console.print(
+                                SHELL_OUTPUT_TRUNCATION_MARKER,
+                                style="dim",
+                                markup=False,
+                            )
+                        for buffered_index, buffered_text, buffered_style in display_tail_buffer:
+                            if buffered_index <= display_line_limit:
+                                continue
+                            console.console.print(
+                                self._render_display_line(buffered_text, buffered_style),
+                                markup=False,
+                            )
 
                 # Display bottom separator with exit code
-                if self._show_bash_output:
-                    self._display.show_shell_exit_code(return_code)
+                if use_live_shell_display:
+                    self._display.show_shell_exit_code(
+                        return_code,
+                        no_output=not had_stream_output,
+                        output_line_count=output_line_count if had_stream_output else None,
+                        tool_call_id=tool_use_id if show_tool_call_id else None,
+                    )
 
-                setattr(result, "_suppress_display", True)
+                suppress_display = True
+                if defer_display_to_tool_result and self._show_bash_output:
+                    suppress_display = False
+                setattr(result, "_suppress_display", suppress_display)
                 setattr(result, "exit_code", return_code)
+                setattr(result, "output_line_count", output_line_count)
+
+                self._emit_progress_event(
+                    action=ProgressAction.TOOL_PROGRESS,
+                    tool_use_id=tool_use_id,
+                    progress=1.0,
+                    total=1.0,
+                    details=completion_details,
+                )
                 return result
 
             except Exception as exc:
                 self._logger.error(f"Execute tool failed: {exc}")
+                self._emit_progress_event(
+                    action=ProgressAction.TOOL_PROGRESS,
+                    tool_use_id=tool_use_id,
+                    progress=1.0,
+                    total=1.0,
+                    details=f"failed: {exc}",
+                )
                 return CallToolResult(
                     isError=True,
                     content=[TextContent(type="text", text=f"Command failed to start: {exc}")],
                 )
+
+    def _emit_progress_event(
+        self,
+        *,
+        action: ProgressAction,
+        tool_use_id: str | None,
+        tool_event: str | None = None,
+        progress: float | None = None,
+        total: float | None = None,
+        details: str | None = None,
+    ) -> None:
+        """Emit shell tool lifecycle events for progress display when supported."""
+        info = getattr(self._logger, "info", None)
+        if not callable(info):
+            return
+
+        payload: dict[str, Any] = build_progress_payload(
+            action=action,
+            tool_name="execute",
+            server_name="local",
+            agent_name=self._agent_name,
+            tool_use_id=tool_use_id,
+            tool_call_id=tool_use_id,
+            tool_event=tool_event,
+            progress=progress,
+            total=total,
+            details=details,
+        )
+
+        try:
+            info("Local shell tool lifecycle", data=payload)
+        except TypeError:
+            # Standard library loggers reject custom keyword arguments.
+            return
+        except Exception:
+            return

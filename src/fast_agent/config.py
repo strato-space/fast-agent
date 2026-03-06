@@ -19,6 +19,7 @@ else:  # pragma: no cover - used only to satisfy type checkers
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from fast_agent.constants import DEFAULT_ENVIRONMENT_DIR
 from fast_agent.llm.reasoning_effort import ReasoningEffortSetting
 from fast_agent.llm.structured_output_mode import StructuredOutputMode
 from fast_agent.llm.text_verbosity import TextVerbosityLevel
@@ -144,6 +145,15 @@ class SkillsSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class CardsSettings(BaseModel):
+    """Configuration for card pack registry selection."""
+
+    marketplace_url: str | None = None
+    marketplace_urls: list[str] | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class ShellSettings(BaseModel):
     """Configuration for shell execution behavior."""
 
@@ -161,7 +171,10 @@ class ShellSettings(BaseModel):
     )
     output_display_lines: int | None = Field(
         default=5,
-        description="Maximum output lines to display (None = no limit)",
+        description=(
+            "Maximum shell output lines to display "
+            "(head/tail with an ellipsis when truncated; None = no limit)"
+        ),
     )
     show_bash: bool = Field(
         default=True,
@@ -170,6 +183,10 @@ class ShellSettings(BaseModel):
     output_byte_limit: int | None = Field(
         default=None,
         description="Override model-based output byte limit (None = auto)",
+    )
+    missing_cwd_policy: Literal["ask", "create", "warn", "error"] = Field(
+        default="warn",
+        description="Policy when an agent shell cwd is missing or invalid",
     )
 
     model_config = ConfigDict(extra="ignore")
@@ -310,6 +327,19 @@ class MCPServerSettings(BaseModel):
 
     implementation: Implementation | None = None
 
+    experimental_session_advertise: bool = False
+    """Advertise MCP session test capability in client initialize payload."""
+
+    experimental_session_advertise_version: int = 2
+    """Reserved compatibility knob for session test capability advertisement."""
+
+    @field_validator("experimental_session_advertise_version", mode="after")
+    @classmethod
+    def _validate_experimental_session_advertise_version(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("experimental_session_advertise_version must be greater than zero.")
+        return value
+
     @field_validator("max_missed_pings", mode="before")
     @classmethod
     def _coerce_max_missed_pings(cls, value: Any) -> int:
@@ -363,12 +393,235 @@ class MCPSettings(BaseModel):
     servers: dict[str, MCPServerSettings] = {}
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
+    @classmethod
+    def _normalize_target_list_entries(
+        cls,
+        raw_targets: Any,
+    ) -> dict[str, dict[str, Any]]:
+        if raw_targets is None:
+            return {}
+
+        if not isinstance(raw_targets, list):
+            raise ValueError("`mcp.targets` must be a list")
+
+        from fast_agent.mcp.connect_targets import resolve_target_entry
+
+        normalized_targets: dict[str, dict[str, Any]] = {}
+        for index, raw_entry in enumerate(raw_targets):
+            entry: dict[str, Any]
+            if isinstance(raw_entry, str):
+                entry = {"target": raw_entry}
+            elif isinstance(raw_entry, dict):
+                entry = raw_entry
+            else:
+                raise ValueError(f"`mcp.targets[{index}]` must be a string or mapping")
+
+            target_value = entry.get("target")
+            source_path = f"mcp.targets[{index}].target"
+            if not isinstance(target_value, str) or not target_value.strip():
+                raise ValueError(f"`{source_path}` must be a non-empty string")
+
+            name_value = entry.get("name")
+            if name_value is not None and (not isinstance(name_value, str) or not name_value.strip()):
+                raise ValueError(f"`mcp.targets[{index}].name` must be a non-empty string")
+
+            overrides = {key: value for key, value in entry.items() if key != "target"}
+            resolved_name, resolved_settings = resolve_target_entry(
+                target=target_value,
+                default_name=name_value if isinstance(name_value, str) else None,
+                overrides=overrides,
+                source_path=source_path,
+            )
+
+            resolved_payload = resolved_settings.model_dump(mode="python")
+            existing_payload = normalized_targets.get(resolved_name)
+            if existing_payload is not None and existing_payload != resolved_payload:
+                raise ValueError(
+                    " ".join(
+                        [
+                            f"`mcp.targets[{index}]` resolves to duplicate server name '{resolved_name}'",
+                            "with different settings.",
+                            "Set an explicit unique `name`.",
+                        ]
+                    )
+                )
+
+            normalized_targets[resolved_name] = resolved_payload
+
+        return normalized_targets
+
+    @classmethod
+    def _normalize_server_map_entries(
+        cls,
+        raw_servers: Any,
+    ) -> dict[Any, Any] | None:
+        if raw_servers is None:
+            return {}
+        if not isinstance(raw_servers, dict):
+            return None
+
+        from fast_agent.mcp.connect_targets import resolve_target_entry
+
+        normalized_servers: dict[Any, Any] = {}
+        for server_key, raw_entry in raw_servers.items():
+            if not isinstance(raw_entry, dict) or "target" not in raw_entry:
+                normalized_servers[server_key] = raw_entry
+                continue
+
+            source_name = str(server_key)
+            source_path = f"mcp.servers.{source_name}.target"
+            target_value = raw_entry.get("target")
+            if not isinstance(target_value, str) or not target_value.strip():
+                raise ValueError(f"`{source_path}` must be a non-empty string")
+
+            overrides = {key: value for key, value in raw_entry.items() if key != "target"}
+            _resolved_name, resolved_settings = resolve_target_entry(
+                target=target_value,
+                default_name=source_name,
+                overrides=overrides,
+                source_path=source_path,
+            )
+            normalized_servers[server_key] = resolved_settings.model_dump(mode="python")
+
+        return normalized_servers
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_server_targets(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+
+        raw_servers = values.get("servers")
+        raw_targets = values.get("targets")
+
+        normalized_targets = cls._normalize_target_list_entries(raw_targets)
+        normalized_servers = cls._normalize_server_map_entries(raw_servers)
+
+        if normalized_servers is None:
+            return values
+
+        merged_servers: dict[Any, Any] = dict(normalized_targets)
+        merged_servers.update(normalized_servers)
+
+        normalized_values = dict(values)
+        normalized_values["servers"] = merged_servers
+        normalized_values.pop("targets", None)
+        return normalized_values
+
+
+_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _validate_domain_list(domains: list[str] | None) -> list[str] | None:
+    if domains is None:
+        return None
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_domain in domains:
+        domain = (raw_domain or "").strip().lower()
+        if not domain:
+            raise ValueError("Domain entries must be non-empty strings.")
+        if "://" in domain:
+            raise ValueError("Domain entries must not include URL schemes.")
+        if any(char in domain for char in ("/", "?", "#", "@", " ")):
+            raise ValueError("Domain entries must be hostnames without paths or credentials.")
+
+        wildcard = False
+        if domain.startswith("*."):
+            wildcard = True
+            domain = domain[2:]
+
+        labels = [label for label in domain.split(".") if label]
+        if len(labels) < 2:
+            raise ValueError("Domain entries must include a TLD (e.g., example.com).")
+        if not all(_DOMAIN_LABEL_RE.match(label) for label in labels):
+            raise ValueError(f"Invalid domain entry: '{raw_domain}'.")
+
+        normalized_domain = f"*.{domain}" if wildcard else domain
+        if normalized_domain not in seen:
+            seen.add(normalized_domain)
+            normalized.append(normalized_domain)
+
+    return normalized
+
+
+class AnthropicUserLocationSettings(BaseModel):
+    """Approximate user location for Anthropic web search tool requests."""
+
+    type: Literal["approximate"] = "approximate"
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class AnthropicWebSearchSettings(BaseModel):
+    """Anthropic built-in web_search server tool settings."""
+
+    enabled: bool = False
+    max_uses: int | None = None
+    allowed_domains: list[str] | None = None
+    blocked_domains: list[str] | None = None
+    user_location: AnthropicUserLocationSettings | None = None
+
+    @field_validator("max_uses")
+    @classmethod
+    def _validate_max_uses(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("max_uses must be greater than zero when provided.")
+        return value
+
+    @field_validator("allowed_domains", "blocked_domains")
+    @classmethod
+    def _validate_domains(cls, value: list[str] | None) -> list[str] | None:
+        return _validate_domain_list(value)
+
+    @model_validator(mode="after")
+    def _validate_domain_xor(self) -> "AnthropicWebSearchSettings":
+        if self.allowed_domains and self.blocked_domains:
+            raise ValueError("allowed_domains and blocked_domains are mutually exclusive.")
+        return self
+
+
+class AnthropicWebFetchSettings(BaseModel):
+    """Anthropic built-in web_fetch server tool settings."""
+
+    enabled: bool = False
+    max_uses: int | None = None
+    allowed_domains: list[str] | None = None
+    blocked_domains: list[str] | None = None
+    citations_enabled: bool = False
+    max_content_tokens: int | None = None
+
+    @field_validator("max_uses", "max_content_tokens")
+    @classmethod
+    def _validate_positive_limits(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("Tool limits must be greater than zero when provided.")
+        return value
+
+    @field_validator("allowed_domains", "blocked_domains")
+    @classmethod
+    def _validate_domains(cls, value: list[str] | None) -> list[str] | None:
+        return _validate_domain_list(value)
+
+    @model_validator(mode="after")
+    def _validate_domain_xor(self) -> "AnthropicWebFetchSettings":
+        if self.allowed_domains and self.blocked_domains:
+            raise ValueError("allowed_domains and blocked_domains are mutually exclusive.")
+        return self
+
 
 class AnthropicSettings(BaseModel):
     """Settings for using Anthropic models in the fast-agent application."""
 
     api_key: str | None = Field(default=None, description="Anthropic API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Anthropic provider is selected without an explicit model",
+    )
     default_headers: dict[str, str] | None = Field(
         default=None, description="Custom headers to pass with every request"
     )
@@ -391,8 +644,39 @@ class AnthropicSettings(BaseModel):
         default="auto",
         description="Structured output mode: auto, json, or tool_use",
     )
+    web_search: AnthropicWebSearchSettings = Field(default_factory=AnthropicWebSearchSettings)
+    web_fetch: AnthropicWebFetchSettings = Field(default_factory=AnthropicWebFetchSettings)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class OpenAIUserLocationSettings(BaseModel):
+    """Approximate user location for OpenAI web search tool requests."""
+
+    type: Literal["approximate"] = "approximate"
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class OpenAIWebSearchSettings(BaseModel):
+    """OpenAI Responses web_search tool settings."""
+
+    enabled: bool = False
+    tool_type: Literal["web_search", "web_search_preview"] = "web_search"
+    search_context_size: Literal["low", "medium", "high"] | None = None
+    allowed_domains: list[str] | None = None
+    user_location: OpenAIUserLocationSettings | None = None
+    external_web_access: bool | None = None
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def _validate_allowed_domains(cls, value: list[str] | None) -> list[str] | None:
+        normalized = _validate_domain_list(value)
+        if normalized is not None and len(normalized) > 100:
+            raise ValueError("allowed_domains supports at most 100 domains.")
+        return normalized
 
 
 class OpenAISettings(BaseModel):
@@ -400,6 +684,10 @@ class OpenAISettings(BaseModel):
 
     api_key: str | None = Field(default=None, description="OpenAI API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when OpenAI provider is selected without an explicit model",
+    )
     reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
         default=None,
         description="Unified reasoning setting (effort level or budget)",
@@ -416,6 +704,11 @@ class OpenAISettings(BaseModel):
         default=None,
         description="Custom headers for all API requests",
     )
+    transport: Literal["sse", "websocket", "auto"] = Field(
+        default="sse",
+        description="Responses transport mode: sse (default), websocket, or auto fallback.",
+    )
+    web_search: OpenAIWebSearchSettings = Field(default_factory=OpenAIWebSearchSettings)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -425,6 +718,12 @@ class OpenResponsesSettings(BaseModel):
 
     api_key: str | None = Field(default=None, description="Open Responses API key")
     base_url: str | None = Field(default=None, description="Open Responses endpoint URL")
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default model when Open Responses provider is selected without an explicit model"
+        ),
+    )
     reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
         default=None,
         description="Unified reasoning setting (effort level or budget)",
@@ -437,6 +736,11 @@ class OpenResponsesSettings(BaseModel):
         default=None,
         description="Custom headers for all API requests",
     )
+    transport: Literal["sse", "websocket", "auto"] = Field(
+        default="sse",
+        description="Responses transport mode: sse (default), websocket, or auto fallback.",
+    )
+    web_search: OpenAIWebSearchSettings = Field(default_factory=OpenAIWebSearchSettings)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -446,6 +750,12 @@ class CodexResponsesSettings(BaseModel):
 
     api_key: str | None = Field(default=None, description="Codex Responses API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default model when Codex Responses provider is selected without an explicit model"
+        ),
+    )
     text_verbosity: Literal["low", "medium", "high"] = Field(
         default="medium",
         description="Text verbosity level: low, medium, high",
@@ -454,6 +764,11 @@ class CodexResponsesSettings(BaseModel):
         default=None,
         description="Custom headers for all API requests",
     )
+    transport: Literal["sse", "websocket", "auto"] = Field(
+        default="sse",
+        description="Responses transport mode: sse (default), websocket, or auto fallback.",
+    )
+    web_search: OpenAIWebSearchSettings = Field(default_factory=OpenAIWebSearchSettings)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -463,6 +778,10 @@ class DeepSeekSettings(BaseModel):
 
     api_key: str | None = Field(default=None, description="DeepSeek API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when DeepSeek provider is selected without an explicit model",
+    )
     default_headers: dict[str, str] | None = Field(
         default=None,
         description="Custom headers for all API requests",
@@ -476,6 +795,10 @@ class GoogleSettings(BaseModel):
 
     api_key: str | None = Field(default=None, description="Google API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Google provider is selected without an explicit model",
+    )
     default_headers: dict[str, str] | None = Field(
         default=None,
         description="Custom headers for all API requests",
@@ -491,6 +814,10 @@ class XAISettings(BaseModel):
     base_url: str | None = Field(
         default="https://api.x.ai/v1",
         description="xAI API endpoint (default: https://api.x.ai/v1)",
+    )
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when xAI provider is selected without an explicit model",
     )
     default_headers: dict[str, str] | None = Field(
         default=None,
@@ -508,6 +835,10 @@ class GenericSettings(BaseModel):
         default=None,
         description="API endpoint (default: http://localhost:11434/v1 for Ollama)",
     )
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when generic provider is selected without an explicit model",
+    )
     default_headers: dict[str, str] | None = Field(
         default=None,
         description="Custom headers for all API requests",
@@ -523,6 +854,12 @@ class OpenRouterSettings(BaseModel):
     base_url: str | None = Field(
         default=None,
         description="Override API endpoint (default: https://openrouter.ai/api/v1)",
+    )
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default model when OpenRouter provider is selected without an explicit model"
+        ),
     )
     default_headers: dict[str, str] | None = Field(
         default=None,
@@ -549,6 +886,12 @@ class AzureSettings(BaseModel):
         default=None,
         description="Full endpoint URL (do not use with resource_name)",
     )
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default deployment/model when Azure provider is selected without an explicit model"
+        ),
+    )
     default_headers: dict[str, str] | None = Field(
         default=None,
         description="Custom headers for all API requests",
@@ -564,6 +907,10 @@ class GroqSettings(BaseModel):
     base_url: str | None = Field(
         default="https://api.groq.com/openai/v1",
         description="Groq API endpoint",
+    )
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Groq provider is selected without an explicit model",
     )
     default_headers: dict[str, str] | None = Field(
         default=None,
@@ -596,6 +943,12 @@ class TensorZeroSettings(BaseModel):
         default=None,
         description="TensorZero endpoint (default: http://localhost:3000)",
     )
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default function name when TensorZero provider is selected without an explicit model"
+        ),
+    )
     api_key: str | None = Field(default=None, description="TensorZero API key (if required)")
     default_headers: dict[str, str] | None = Field(
         default=None,
@@ -612,6 +965,10 @@ class BedrockSettings(BaseModel):
     profile: str | None = Field(
         default=None,
         description="AWS profile for authentication (default: 'default')",
+    )
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Bedrock provider is selected without an explicit model",
     )
     reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
         default=None,
@@ -632,6 +989,12 @@ class HuggingFaceSettings(BaseModel):
     base_url: str | None = Field(
         default=None,
         description="Override router endpoint (default: https://router.huggingface.co/v1)",
+    )
+    default_model: str | None = Field(
+        default=None,
+        description=(
+            "Default model when HuggingFace provider is selected without an explicit model"
+        ),
     )
     default_provider: str | None = Field(
         default=None,
@@ -770,6 +1133,163 @@ def resolve_config_search_root(
     return root
 
 
+def resolve_env_vars(config_item: Any) -> Any:
+    """Recursively resolve environment variables in config data."""
+    if isinstance(config_item, dict):
+        return {k: resolve_env_vars(v) for k, v in config_item.items()}
+    if isinstance(config_item, list):
+        return [resolve_env_vars(i) for i in config_item]
+    if isinstance(config_item, str):
+        pattern = re.compile(r"\$\{([^}]+)\}")
+
+        def replace_match(match: re.Match[str]) -> str:
+            var_name_with_default = match.group(1)
+            if ":" in var_name_with_default:
+                var_name, default_value = var_name_with_default.split(":", 1)
+                return os.getenv(var_name, default_value)
+
+            var_name = var_name_with_default
+            env_value = os.getenv(var_name)
+            if env_value is None:
+                return match.group(0)
+            return env_value
+
+        return pattern.sub(replace_match, config_item)
+
+    return config_item
+
+
+def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge two dictionaries, preserving nested structures."""
+    merged = base.copy()
+    for key, value in update.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            existing = merged[key]
+            if isinstance(existing, dict):
+                merged[key] = deep_merge(existing, value)
+            else:
+                merged[key] = value
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_yaml_mapping(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+
+    import yaml  # pylint: disable=C0415
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+    if not isinstance(payload, dict):
+        return {}
+    return resolve_env_vars(payload)
+
+
+def find_project_config_file(start_path: Path) -> Path | None:
+    """Find project-level ``fastagent.config.yaml`` from ``start_path`` upward."""
+    current = start_path.resolve()
+    while current != current.parent:
+        candidate = current / "fastagent.config.yaml"
+        if candidate.exists():
+            return candidate
+        current = current.parent
+    return None
+
+
+def resolve_environment_config_file(
+    start_path: Path,
+    *,
+    env_dir: str | Path | None = None,
+) -> Path:
+    """Return the env overlay config path: ``<env>/fastagent.config.yaml``."""
+    base = start_path.resolve()
+    override = env_dir if env_dir is not None else os.getenv("ENVIRONMENT_DIR")
+
+    if override:
+        env_root = Path(override).expanduser()
+        if not env_root.is_absolute():
+            env_root = (base / env_root).resolve()
+    else:
+        env_root = (base / DEFAULT_ENVIRONMENT_DIR).resolve()
+
+    return env_root / "fastagent.config.yaml"
+
+
+def resolve_layered_config_file(
+    start_path: Path,
+    *,
+    env_dir: str | Path | None = None,
+) -> Path | None:
+    """Return the effective config path using project + env precedence.
+
+    Precedence is project config first, then environment config overlay when
+    the env config file exists.
+    """
+
+    project_config = find_project_config_file(start_path)
+    env_config = resolve_environment_config_file(start_path, env_dir=env_dir)
+
+    if env_config.exists():
+        return env_config
+    return project_config
+
+
+def load_layered_settings(
+    *,
+    start_path: Path,
+    env_dir: str | Path | None = None,
+) -> tuple[dict[str, Any], Path | None]:
+    """Load merged settings from project config with env overlay.
+
+    Precedence: project config < environment config.
+
+    Returns:
+        A tuple of ``(merged_settings, effective_config_path)`` where
+        ``effective_config_path`` is the last-applied config path (env when
+        present, else project), or ``None`` when neither exists.
+    """
+
+    merged: dict[str, Any] = {}
+    effective_config: Path | None = None
+
+    project_config = find_project_config_file(start_path)
+    if project_config and project_config.exists():
+        merged = deep_merge(merged, load_yaml_mapping(project_config))
+        effective_config = project_config
+
+    env_config = resolve_environment_config_file(start_path, env_dir=env_dir)
+    if env_config.exists():
+        merged = deep_merge(merged, load_yaml_mapping(env_config))
+        effective_config = env_config
+
+    return merged, effective_config
+
+
+def load_layered_model_settings(
+    *,
+    start_path: Path,
+    env_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Load layered model settings from project + env config.
+
+    Precedence: project config < env config.
+    ``model_aliases`` uses deep-merge semantics, while ``default_model`` uses
+    scalar replacement semantics.
+    """
+    layered_settings, _ = load_layered_settings(start_path=start_path, env_dir=env_dir)
+    layered: dict[str, Any] = {}
+
+    if "default_model" in layered_settings:
+        layered["default_model"] = layered_settings["default_model"]
+
+    if "model_aliases" in layered_settings:
+        layered["model_aliases"] = layered_settings["model_aliases"]
+
+    return layered
+
+
 class Settings(BaseSettings):
     """
     Settings class for the fast-agent application.
@@ -799,6 +1319,9 @@ class Settings(BaseSettings):
     Aliases are provided for common models e.g. sonnet, haiku, gpt-4.1, o3-mini etc.
     If not set, falls back to FAST_AGENT_MODEL env var, then to "gpt-5-mini.low".
     """
+
+    model_aliases: dict[str, dict[str, str]] = Field(default_factory=dict)
+    """Model aliases grouped by namespace (e.g. $system.default)."""
 
     auto_sampling: bool = True
     """Enable automatic sampling model selection if not explicitly configured"""
@@ -881,6 +1404,9 @@ class Settings(BaseSettings):
     skills: SkillsSettings = SkillsSettings()
     """Local skills discovery and selection settings."""
 
+    cards: CardsSettings = CardsSettings()
+    """Card pack registry selection settings."""
+
     shell_execution: ShellSettings = ShellSettings()
     """Shell execution timeout and warning settings."""
 
@@ -892,6 +1418,40 @@ class Settings(BaseSettings):
 
     _config_file: str | None = PrivateAttr(default=None)
     _secrets_file: str | None = PrivateAttr(default=None)
+
+    @field_validator("model_aliases")
+    @classmethod
+    def _validate_model_aliases(
+        cls,
+        value: dict[str, dict[str, str]],
+    ) -> dict[str, dict[str, str]]:
+        """Validate model alias namespace/key names and normalize values."""
+        valid_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+        normalized: dict[str, dict[str, str]] = {}
+
+        for namespace, entries in value.items():
+            if not valid_name.fullmatch(namespace):
+                raise ValueError(
+                    "model_aliases namespace names must match [A-Za-z_][A-Za-z0-9_-]*"
+                )
+
+            normalized_entries: dict[str, str] = {}
+            for key, model in entries.items():
+                if not valid_name.fullmatch(key):
+                    raise ValueError(
+                        "model_aliases keys must match [A-Za-z_][A-Za-z0-9_-]*"
+                    )
+
+                model_value = model.strip()
+                if not model_value:
+                    raise ValueError(
+                        f"model_aliases.{namespace}.{key} must be a non-empty model string"
+                    )
+                normalized_entries[key] = model_value
+
+            normalized[namespace] = normalized_entries
+
+        return normalized
 
     @classmethod
     def find_config(cls) -> Path | None:
@@ -918,46 +1478,6 @@ _settings: Settings | None = None
 def get_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
     """Get settings instance, automatically loading from config file if available."""
 
-    def resolve_env_vars(config_item: Any) -> Any:
-        """Recursively resolve environment variables in config data."""
-        if isinstance(config_item, dict):
-            return {k: resolve_env_vars(v) for k, v in config_item.items()}
-        elif isinstance(config_item, list):
-            return [resolve_env_vars(i) for i in config_item]
-        elif isinstance(config_item, str):
-            # Regex to find ${ENV_VAR} or ${ENV_VAR:default_value}
-            pattern = re.compile(r"\$\{([^}]+)\}")
-
-            def replace_match(match: re.Match) -> str:
-                var_name_with_default = match.group(1)
-                if ":" in var_name_with_default:
-                    var_name, default_value = var_name_with_default.split(":", 1)
-                    return os.getenv(var_name, default_value)
-                else:
-                    var_name = var_name_with_default
-                    env_value = os.getenv(var_name)
-                    if env_value is None:
-                        # Optionally, raise an error or return the placeholder if the env var is not set
-                        # For now, returning the placeholder to avoid breaking if not set and no default
-                        # print(f"Warning: Environment variable {var_name} not set and no default provided.")
-                        return match.group(0)
-                    return env_value
-
-            # Replace all occurrences
-            resolved_value = pattern.sub(replace_match, config_item)
-            return resolved_value
-        return config_item
-
-    def deep_merge(base: dict, update: dict) -> dict:
-        """Recursively merge two dictionaries, preserving nested structures."""
-        merged = base.copy()
-        for key, value in update.items():
-            if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-                merged[key] = deep_merge(merged[key], value)
-            else:
-                merged[key] = value
-        return merged
-
     global _settings
 
     # If we have a specific config path, always reload settings
@@ -972,6 +1492,7 @@ def get_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
     # Handle config path - convert string to Path if needed
     config_file: Path | None
     secrets_file: Path | None
+    merged_settings: dict[str, Any]
     if config_path:
         config_file = Path(config_path)
         # If it's a relative path and doesn't exist, try finding it
@@ -985,32 +1506,25 @@ def get_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
         secrets_file = None
         if config_file.exists():
             _, secrets_file = find_fastagent_config_files(config_file.parent)
+
+        merged_settings = {}
+        # Load main config if it exists
+        if config_file and config_file.exists():
+            merged_settings = load_yaml_mapping(config_file)
+        elif config_file and not config_file.exists():
+            print(f"Warning: Specified config file does not exist: {config_file}")
     else:
-        # Use standardized discovery for both config and secrets
+        # Use standardized discovery for secrets and layered loading for config.
         search_root = resolve_config_search_root(Path.cwd())
-        config_file, secrets_file = find_fastagent_config_files(search_root)
-
-    merged_settings = {}
-
-    import yaml  # pylint: disable=C0415
-
-    # Load main config if it exists
-    if config_file and config_file.exists():
-        with open(config_file, "r", encoding="utf-8") as f:
-            yaml_settings = yaml.safe_load(f) or {}
-            # Resolve environment variables in the loaded YAML settings
-            resolved_yaml_settings = resolve_env_vars(yaml_settings)
-            merged_settings = resolved_yaml_settings
-    elif config_file and not config_file.exists():
-        print(f"Warning: Specified config file does not exist: {config_file}")
+        _, secrets_file = find_fastagent_config_files(search_root)
+        merged_settings, config_file = load_layered_settings(
+            start_path=Path.cwd(),
+            env_dir=os.getenv("ENVIRONMENT_DIR"),
+        )
 
     # Load secrets file if found (regardless of whether config file exists)
     if secrets_file and secrets_file.exists():
-        with open(secrets_file, "r", encoding="utf-8") as f:
-            yaml_secrets = yaml.safe_load(f) or {}
-            # Resolve environment variables in the loaded secrets YAML
-            resolved_secrets_yaml = resolve_env_vars(yaml_secrets)
-            merged_settings = deep_merge(merged_settings, resolved_secrets_yaml)
+        merged_settings = deep_merge(merged_settings, load_yaml_mapping(secrets_file))
 
     legacy_keys: list[str] = []
     anthropic_settings = merged_settings.get("anthropic")

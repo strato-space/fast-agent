@@ -22,7 +22,10 @@ import httpx
 from pydantic import BaseModel
 
 from fast_agent.core.exceptions import ProviderKeyError
-from fast_agent.core.keyring_utils import get_keyring_status
+from fast_agent.core.keyring_utils import (
+    get_keyring_status,
+    maybe_print_keyring_access_notice,
+)
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.mcp.oauth_client import add_identity_to_index, remove_identity_from_index
 from fast_agent.ui import console
@@ -283,6 +286,7 @@ def _delete_chunked_payload(keyring_module: _KeyringProtocol) -> None:
 
 def _keyring_payload_present() -> bool:
     try:
+        maybe_print_keyring_access_notice(purpose="checking Codex OAuth tokens")
         import keyring
 
         keyring_module = cast("_KeyringProtocol", keyring)
@@ -297,6 +301,7 @@ def _keyring_payload_present() -> bool:
 
 def _get_keyring_password() -> str | None:
     try:
+        maybe_print_keyring_access_notice(purpose="loading Codex OAuth tokens")
         import keyring
 
         keyring_module = cast("_KeyringProtocol", keyring)
@@ -309,6 +314,7 @@ def _get_keyring_password() -> str | None:
 
 
 def _set_keyring_password(payload: str) -> None:
+    maybe_print_keyring_access_notice(purpose="saving Codex OAuth tokens")
     import keyring
 
     keyring_module = cast("_KeyringProtocol", keyring)
@@ -341,6 +347,7 @@ def _set_keyring_password(payload: str) -> None:
 
 
 def _delete_keyring_password() -> None:
+    maybe_print_keyring_access_notice(purpose="clearing Codex OAuth tokens")
     import keyring
 
     keyring_module = cast("_KeyringProtocol", keyring)
@@ -404,15 +411,23 @@ def _load_codex_cli_tokens() -> CodexOAuthTokens | None:
     return None
 
 
-def load_codex_tokens() -> CodexOAuthTokens | None:
+def _load_codex_tokens_with_source() -> tuple[CodexOAuthTokens | None, str | None]:
     payload = _get_keyring_password()
     if payload:
         try:
-            return CodexOAuthTokens.model_validate_json(payload)
+            return CodexOAuthTokens.model_validate_json(payload), "keyring"
         except Exception:
-            return None
+            return None, None
+
     tokens = _load_codex_cli_tokens()
     if tokens:
+        return tokens, "auth.json"
+    return None, None
+
+
+def load_codex_tokens() -> CodexOAuthTokens | None:
+    tokens, source = _load_codex_tokens_with_source()
+    if tokens and source == "auth.json":
         logger.info(
             "codex_cli_tokens",
             "Loaded Codex OAuth tokens from auth.json",
@@ -491,11 +506,16 @@ def get_codex_access_token() -> str | None:
 
 
 def get_codex_token_status() -> dict[str, Any]:
-    tokens = load_codex_tokens()
+    tokens, source = _load_codex_tokens_with_source()
     if not tokens:
-        return {"present": False, "expires_at": None, "expired": False}
+        return {"present": False, "expires_at": None, "expired": False, "source": None}
     expired = tokens.is_expired(margin_seconds=0)
-    return {"present": True, "expires_at": tokens.expires_at, "expired": expired}
+    return {
+        "present": True,
+        "expires_at": tokens.expires_at,
+        "expired": expired,
+        "source": source,
+    }
 
 
 def parse_chatgpt_account_id(access_token: str) -> str | None:

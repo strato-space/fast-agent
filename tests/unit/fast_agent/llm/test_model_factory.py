@@ -3,11 +3,14 @@ import pytest
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.core.exceptions import ModelConfigError
+from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.model_factory import ModelFactory, Provider
+from fast_agent.llm.model_selection import ModelSelectionCatalog
 from fast_agent.llm.provider.anthropic.llm_anthropic import AnthropicLLM
 from fast_agent.llm.provider.openai.llm_generic import GenericLLM
 from fast_agent.llm.provider.openai.llm_huggingface import HuggingFaceLLM
 from fast_agent.llm.provider.openai.llm_openai import OpenAILLM
+from fast_agent.llm.provider.openai.responses import ResponsesLLM
 from fast_agent.llm.reasoning_effort import ReasoningEffortSetting
 
 # Test aliases - decoupled from production MODEL_ALIASES
@@ -119,6 +122,212 @@ def test_model_query_text_verbosity():
     assert config.text_verbosity == "medium"
 
 
+def test_model_query_temperature():
+    config = ModelFactory.parse_model_string("gpt-5?temperature=0.35")
+    assert config.provider == Provider.RESPONSES
+    assert config.model_name == "gpt-5"
+    assert config.temperature == 0.35
+
+
+def test_model_query_temp_alias():
+    config = ModelFactory.parse_model_string("gpt-5?temp=0.2")
+    assert config.temperature == 0.2
+
+
+def test_model_query_sampling_parameters():
+    config = ModelFactory.parse_model_string(
+        "hf.Qwen/Qwen3.5-397B-A17B:novita"
+        "?temperature=0.6&top_p=0.95&top_k=20&min_p=0.0"
+        "&presence_penalty=0.0&repetition_penalty=1.0"
+    )
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "Qwen/Qwen3.5-397B-A17B:novita"
+    assert config.temperature == 0.6
+    assert config.top_p == 0.95
+    assert config.top_k == 20
+    assert config.min_p == 0.0
+    assert config.presence_penalty == 0.0
+    assert config.repetition_penalty == 1.0
+
+
+def test_alias_sampling_defaults_allow_user_query_overrides() -> None:
+    config = ModelFactory.parse_model_string("qwen35?temperature=0.9&top_p=0.7")
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "Qwen/Qwen3.5-397B-A17B:novita"
+    assert config.temperature == 0.9
+    assert config.top_p == 0.7
+    assert config.top_k == 20
+    assert config.reasoning_effort == ReasoningEffortSetting(kind="toggle", value=True)
+
+
+def test_alias_sampling_defaults_preserve_user_provider_suffix_override() -> None:
+    config = ModelFactory.parse_model_string("qwen35:nebius")
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "Qwen/Qwen3.5-397B-A17B:nebius"
+    assert config.temperature == 0.6
+    assert config.top_p == 0.95
+    assert config.reasoning_effort == ReasoningEffortSetting(kind="toggle", value=True)
+
+
+def test_kimi25_alias_sets_thinking_sampling_defaults() -> None:
+    config = ModelFactory.parse_model_string("kimi25")
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "moonshotai/Kimi-K2.5:fireworks-ai"
+    assert config.temperature == 1.0
+    assert config.top_p == 0.95
+    assert config.reasoning_effort == ReasoningEffortSetting(kind="toggle", value=True)
+
+
+def test_minimax25_alias_sets_sampling_defaults() -> None:
+    config = ModelFactory.parse_model_string("minimax25")
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "MiniMaxAI/MiniMax-M2.5:novita"
+    assert config.temperature == 1.0
+    assert config.top_p == 0.95
+    assert config.top_k == 40
+
+
+def test_model_query_transport_websocket_alias():
+    config = ModelFactory.parse_model_string("codexplan?transport=ws")
+    assert config.provider == Provider.CODEX_RESPONSES
+    assert config.model_name == "gpt-5.3-codex"
+    assert config.transport == "websocket"
+
+
+def test_model_query_transport_auto():
+    config = ModelFactory.parse_model_string("codexplan52?transport=auto")
+    assert config.transport == "auto"
+
+
+def test_model_query_transport_sse():
+    config = ModelFactory.parse_model_string("codexplan?transport=sse")
+    assert config.transport == "sse"
+
+
+def test_model_query_web_tool_flags():
+    config = ModelFactory.parse_model_string("claude-sonnet-4-6?web_search=on&web_fetch=off")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-sonnet-4-6"
+    assert config.web_search is True
+    assert config.web_fetch is False
+
+
+def test_model_query_web_tool_flags_boolean_aliases():
+    config = ModelFactory.parse_model_string("sonnet?web_search=true&web_fetch=0")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-sonnet-4-6"
+    assert config.web_search is True
+    assert config.web_fetch is False
+
+
+def test_model_query_web_search_flag_for_responses_provider():
+    config = ModelFactory.parse_model_string("responses.gpt-5-mini?web_search=on")
+    assert config.provider == Provider.RESPONSES
+    assert config.model_name == "gpt-5-mini"
+    assert config.web_search is True
+
+
+def test_invalid_web_tool_query_values():
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("claude-sonnet-4-6?web_search=maybe")
+
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("claude-sonnet-4-6?web_fetch=maybe")
+
+
+def test_invalid_transport_query():
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("codexplan?transport=websock")
+
+
+def test_transport_query_allows_responses_default_model():
+    config = ModelFactory.parse_model_string("gpt-5?transport=ws")
+    assert config.provider == Provider.RESPONSES
+    assert config.model_name == "gpt-5"
+    assert config.transport == "websocket"
+
+
+def test_transport_query_allows_responses_gpt_5_2() -> None:
+    config = ModelFactory.parse_model_string("responses.gpt-5.2?transport=ws")
+    assert config.provider == Provider.RESPONSES
+    assert config.model_name == "gpt-5.2"
+    assert config.transport == "websocket"
+
+
+def test_transport_query_allows_responses_codex_model():
+    config = ModelFactory.parse_model_string("responses.gpt-5.3-codex?transport=ws")
+    assert config.provider == Provider.RESPONSES
+    assert config.model_name == "gpt-5.3-codex"
+    assert config.transport == "websocket"
+
+
+def test_transport_query_rejects_responses_provider_for_codex_spark():
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("responses.gpt-5.3-codex-spark?transport=ws")
+
+
+def test_transport_query_allows_codexresponses_provider_for_codex_spark():
+    config = ModelFactory.parse_model_string("codexresponses.gpt-5.3-codex-spark?transport=ws")
+    assert config.provider == Provider.CODEX_RESPONSES
+    assert config.model_name == "gpt-5.3-codex-spark"
+    assert config.transport == "websocket"
+
+
+def test_transport_query_rejects_openai_provider_even_with_responses_model():
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("openai.gpt-5?transport=ws")
+
+
+def test_transport_query_composes_with_reasoning_and_verbosity():
+    config = ModelFactory.parse_model_string("codexplan?transport=ws&reasoning=high&verbosity=low")
+    assert config.transport == "websocket"
+    assert config.reasoning_effort == ReasoningEffortSetting(kind="effort", value="high")
+    assert config.text_verbosity == "low"
+
+
+def test_factory_passes_transport_to_responses_llm():
+    factory = ModelFactory.create_factory("codexplan?transport=ws")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+    assert isinstance(llm, ResponsesLLM)
+    assert llm._transport == "websocket"
+
+
+def test_factory_passes_transport_to_responses_llm_for_openai_responses_model() -> None:
+    factory = ModelFactory.create_factory("responses.gpt-5?transport=ws")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+    assert isinstance(llm, ResponsesLLM)
+    assert llm.provider == Provider.RESPONSES
+    assert llm._transport == "websocket"
+
+
+def test_factory_passes_web_tool_overrides_to_anthropic_llm():
+    factory = ModelFactory.create_factory("claude-sonnet-4-6?web_search=on&web_fetch=off")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+    assert isinstance(llm, AnthropicLLM)
+    assert llm._web_search_override is True
+    assert llm._web_fetch_override is False
+
+
+def test_factory_passes_web_search_override_to_responses_llm():
+    factory = ModelFactory.create_factory("responses.gpt-5-mini?web_search=on")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+    assert isinstance(llm, ResponsesLLM)
+    assert llm._web_search_override is True
+
+
+def test_factory_passes_web_search_override_to_codex_responses_llm():
+    factory = ModelFactory.create_factory("codexplan?web_search=on")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+    assert isinstance(llm, ResponsesLLM)
+    assert llm.provider == Provider.CODEX_RESPONSES
+    assert llm._web_search_override is True
+
+
 def test_invalid_inputs():
     """Test handling of invalid inputs"""
     invalid_cases = [
@@ -144,6 +353,11 @@ def test_invalid_instant_query():
 def test_invalid_verbosity_query():
     with pytest.raises(ModelConfigError):
         ModelFactory.parse_model_string("gpt-5?verbosity=verbose")
+
+
+def test_invalid_temperature_query():
+    with pytest.raises(ModelConfigError):
+        ModelFactory.parse_model_string("gpt-5?temperature=hot")
 
 
 def test_llm_class_creation():
@@ -186,9 +400,35 @@ def test_opus_aliases_resolve_to_opus_46():
     assert config.provider == Provider.ANTHROPIC
     assert config.model_name == "claude-opus-4-6"
 
+
+def test_claude_alias_resolves_to_sonnet_46():
+    config = ModelFactory.parse_model_string("claude")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-sonnet-4-6"
+
     config = ModelFactory.parse_model_string("opus46")
     assert config.provider == Provider.ANTHROPIC
     assert config.model_name == "claude-opus-4-6"
+
+
+def test_gemini31_alias_resolves_to_google_31_preview():
+    config = ModelFactory.parse_model_string("gemini3.1")
+    assert config.provider == Provider.GOOGLE
+    assert config.model_name == "gemini-3.1-pro-preview"
+
+
+def test_curated_catalog_aliases_are_parseable():
+    for entry in ModelSelectionCatalog.list_current_entries():
+        if "?" in entry.model:
+            continue
+
+        alias_config = ModelFactory.parse_model_string(entry.alias)
+        model_config = ModelFactory.parse_model_string(entry.model)
+
+        assert alias_config.provider == model_config.provider
+        assert ModelDatabase.normalize_model_name(alias_config.model_name) == ModelDatabase.normalize_model_name(
+            model_config.model_name
+        )
 
 
 def test_codexplan_aliases_use_codex_oauth_provider():
@@ -199,6 +439,10 @@ def test_codexplan_aliases_use_codex_oauth_provider():
     config = ModelFactory.parse_model_string("codexplan52")
     assert config.provider == Provider.CODEX_RESPONSES
     assert config.model_name == "gpt-5.2-codex"
+
+    config = ModelFactory.parse_model_string("codexspark")
+    assert config.provider == Provider.CODEX_RESPONSES
+    assert config.model_name == "gpt-5.3-codex-spark"
 
 
 def test_huggingface_alias_with_default_provider():
@@ -358,3 +602,105 @@ def test_anthropic_long_context_default_is_200k():
     info = llm.model_info
     assert info is not None
     assert info.context_window == 200_000
+
+
+def test_factory_passes_temperature_query_to_request_params():
+    factory = ModelFactory.create_factory("gpt-5?temperature=0.42")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+    assert llm.default_request_params.temperature == 0.42
+
+
+def test_factory_passes_sampling_query_to_request_params() -> None:
+    factory = ModelFactory.create_factory("qwen35")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+
+    assert llm.default_request_params.model == "Qwen/Qwen3.5-397B-A17B"
+    assert llm.default_request_params.temperature == 0.6
+    assert llm.default_request_params.top_p == 0.95
+    assert llm.default_request_params.top_k == 20
+    assert llm.default_request_params.min_p == 0.0
+    assert llm.default_request_params.presence_penalty == 0.0
+    assert llm.default_request_params.repetition_penalty == 1.0
+    assert llm.reasoning_effort == ReasoningEffortSetting(kind="toggle", value=True)
+
+
+def test_hf_sampling_overrides_route_non_openai_fields_to_extra_body() -> None:
+    factory = ModelFactory.create_factory("qwen35")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+
+    args = llm._prepare_api_request(
+        [{"role": "user", "content": "hi"}],
+        None,
+        llm.default_request_params,
+    )
+
+    assert args["temperature"] == 0.6
+    assert args["top_p"] == 0.95
+    assert args["presence_penalty"] == 0.0
+    assert "top_k" not in args
+    assert "min_p" not in args
+    assert "repetition_penalty" not in args
+
+    extra_body = args.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["top_k"] == 20
+    assert extra_body["min_p"] == 0.0
+    assert extra_body["repetition_penalty"] == 1.0
+    assert extra_body["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_hf_qwen35_instruct_alias_disables_thinking_via_chat_template_kwargs() -> None:
+    factory = ModelFactory.create_factory("qwen35instruct")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+
+    args = llm._prepare_api_request(
+        [{"role": "user", "content": "hi"}],
+        None,
+        llm.default_request_params,
+    )
+
+    extra_body = args.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_hf_kimi25_alias_does_not_emit_chat_template_kwargs_for_thinking_mode() -> None:
+    factory = ModelFactory.create_factory("kimi25")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+
+    args = llm._prepare_api_request(
+        [{"role": "user", "content": "hi"}],
+        None,
+        llm.default_request_params,
+    )
+
+    assert args["temperature"] == 1.0
+    assert args["top_p"] == 0.95
+
+    extra_body = args.get("extra_body")
+    if isinstance(extra_body, dict):
+        assert "chat_template_kwargs" not in extra_body
+    else:
+        assert extra_body is None
+
+
+def test_runtime_model_provider_registration():
+    model_name = "runtime-fast-model"
+    ModelFactory.register_runtime_model_provider(model_name, Provider.FAST_AGENT)
+    try:
+        config = ModelFactory.parse_model_string(model_name)
+        assert config.provider == Provider.FAST_AGENT
+        assert config.model_name == model_name
+    finally:
+        ModelFactory.unregister_runtime_model_provider(model_name)

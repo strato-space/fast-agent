@@ -13,7 +13,9 @@ from frontmatter import loads as load_frontmatter
 
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.core.exceptions import AgentConfigError, format_fast_agent_error
+from fast_agent.core.tool_input_schema import validate_tool_input_schema
 from fast_agent.core.validation import find_dependency_cycle
+from fast_agent.mcp.connect_targets import resolve_target_entry
 
 CARD_EXTENSIONS = {".md", ".markdown", ".yaml", ".yml"}
 
@@ -180,8 +182,11 @@ def _scan_agent_card_files(
                 errors.append(f"Missing required field '{field}'")
 
         servers = _ensure_str_list(raw.get("servers"), "servers", errors)
+        _validate_mcp_connect_entries(raw.get("mcp_connect"), errors)
         function_tools = _ensure_str_list(raw.get("function_tools"), "function_tools", errors)
         messages = _ensure_str_list(raw.get("messages"), "messages", errors)
+        _validate_tool_input_schema(raw.get("tool_input_schema"), errors)
+        shell_cwd = _resolve_shell_cwd(raw.get("cwd"), errors)
         dependencies = _card_dependencies(type_key, raw, errors)
 
         instruction_texts: list[str] = []
@@ -234,6 +239,9 @@ def _scan_agent_card_files(
 
         if messages:
             _validate_message_files(messages, card_path.parent, errors)
+
+        if shell_cwd is not None:
+            _validate_shell_cwd(shell_cwd, errors)
 
         entries[-1] = AgentCardScanResult(
             name=name,
@@ -469,6 +477,110 @@ def _ensure_str(value: Any, field: str, errors: list[str]) -> str | None:
         errors.append(f"'{field}' must be a non-empty string")
         return None
     return value.strip()
+
+
+def _resolve_shell_cwd(value: Any, errors: list[str]) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        errors.append("'cwd' must be a string")
+        return None
+
+    cwd_value = value.strip()
+    if not cwd_value:
+        errors.append("'cwd' must be a non-empty string")
+        return None
+
+    configured = Path(cwd_value).expanduser()
+    if configured.is_absolute():
+        return configured.resolve()
+    return (Path.cwd() / configured).resolve()
+
+
+def _validate_tool_input_schema(value: Any, errors: list[str]) -> None:
+    validation = validate_tool_input_schema(value)
+    for error in validation.errors:
+        errors.append(f"'tool_input_schema' {error}")
+
+
+def _validate_shell_cwd(cwd: Path, errors: list[str]) -> None:
+    if not cwd.exists():
+        errors.append(f"Shell cwd does not exist ({cwd})")
+        return
+    if not cwd.is_dir():
+        errors.append(f"Shell cwd is not a directory ({cwd})")
+
+
+def _validate_mcp_connect_entries(value: Any, errors: list[str]) -> None:
+    if value is None:
+        return
+
+    if not isinstance(value, list):
+        errors.append("'mcp_connect' must be a list")
+        return
+
+    for idx, raw_entry in enumerate(value):
+        if not isinstance(raw_entry, dict):
+            errors.append(f"'mcp_connect[{idx}]' must be a mapping")
+            continue
+
+        unknown_keys = set(raw_entry.keys()) - {"target", "name", "headers", "auth"}
+        if unknown_keys:
+            unknown_text = ", ".join(sorted(str(key) for key in unknown_keys))
+            errors.append(f"'mcp_connect[{idx}]' has unsupported keys: {unknown_text}")
+
+        target_value = raw_entry.get("target")
+        if not isinstance(target_value, str) or not target_value.strip():
+            errors.append(f"'mcp_connect[{idx}].target' must be a non-empty string")
+            continue
+
+        name_value = raw_entry.get("name")
+        if name_value is not None and (not isinstance(name_value, str) or not name_value.strip()):
+            errors.append(f"'mcp_connect[{idx}].name' must be a non-empty string")
+            continue
+
+        headers_value = raw_entry.get("headers")
+        resolved_headers: dict[str, str] | None = None
+        if headers_value is not None:
+            if not isinstance(headers_value, dict):
+                errors.append(f"'mcp_connect[{idx}].headers' must be a mapping")
+                continue
+            resolved_headers = {}
+            for key, header_value in headers_value.items():
+                if not isinstance(key, str) or not key.strip():
+                    errors.append(f"'mcp_connect[{idx}].headers' keys must be non-empty strings")
+                    resolved_headers = None
+                    break
+                if not isinstance(header_value, str):
+                    errors.append(f"'mcp_connect[{idx}].headers' values must be strings")
+                    resolved_headers = None
+                    break
+                resolved_headers[key] = header_value
+            if headers_value and resolved_headers is None:
+                continue
+
+        auth_value = raw_entry.get("auth")
+        resolved_auth: dict[str, Any] | None = None
+        if auth_value is not None:
+            if not isinstance(auth_value, dict):
+                errors.append(f"'mcp_connect[{idx}].auth' must be a mapping")
+                continue
+            resolved_auth = dict(auth_value)
+
+        try:
+            overrides: dict[str, Any] = {}
+            if resolved_headers is not None:
+                overrides["headers"] = resolved_headers
+            if resolved_auth is not None:
+                overrides["auth"] = resolved_auth
+            resolve_target_entry(
+                target=target_value.strip(),
+                default_name=name_value.strip() if isinstance(name_value, str) else None,
+                overrides=overrides,
+                source_path=f"mcp_connect[{idx}].target",
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced as card scan issue
+            errors.append(f"Invalid mcp_connect target at index {idx}: {exc}")
 
 
 def _resolve_message_path(message_path_str: str, base_path: Path) -> Path:

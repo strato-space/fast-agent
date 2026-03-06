@@ -21,7 +21,13 @@ def test_model_database_normalizes_provider_prefix_slash() -> None:
 
 def test_model_database_normalizes_aliases() -> None:
     assert ModelDatabase.get_max_output_tokens("sonnet") == ModelDatabase.get_max_output_tokens(
-        "claude-sonnet-4-5"
+        "claude-sonnet-4-6"
+    )
+    assert ModelDatabase.get_max_output_tokens("claude") == ModelDatabase.get_max_output_tokens(
+        "claude-sonnet-4-6"
+    )
+    assert ModelDatabase.get_max_output_tokens("codexspark") == ModelDatabase.get_max_output_tokens(
+        "gpt-5.3-codex-spark"
     )
 
 
@@ -35,4 +41,10 @@ def test_model_database_preserves_known_slash_keys() -> None:
     # Some model ids are canonical slash paths (e.g. HF model repos).
     assert ModelDatabase.get_max_output_tokens("openai/gpt-oss-20b") == ModelDatabase.get_max_output_tokens(
         "hf.openai/gpt-oss-20b"
+    )
+
+
+def test_model_database_normalizes_temperature_query() -> None:
+    assert ModelDatabase.get_max_output_tokens("gpt-5?temperature=0.2") == ModelDatabase.get_max_output_tokens(
+        "gpt-5"
     )

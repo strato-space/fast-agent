@@ -4,11 +4,12 @@ from fast_agent.config import HuggingFaceSettings, Settings
 from fast_agent.constants import DEFAULT_MAX_ITERATIONS
 from fast_agent.context import Context
 from fast_agent.llm.fastagent_llm import FastAgentLLM
-from fast_agent.llm.model_database import ModelDatabase
+from fast_agent.llm.model_database import ModelDatabase, ModelParameters
 from fast_agent.llm.model_factory import ModelFactory
 from fast_agent.llm.provider.openai.llm_huggingface import HuggingFaceLLM
 from fast_agent.llm.provider.openai.llm_openai import OpenAILLM
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
+from fast_agent.llm.provider_types import Provider
 
 
 def test_model_database_context_windows():
@@ -17,6 +18,7 @@ def test_model_database_context_windows():
     assert ModelDatabase.get_context_window("claude-sonnet-4-0") == 200000
     assert ModelDatabase.get_context_window("gpt-4o") == 128000
     assert ModelDatabase.get_context_window("gemini-2.0-flash") == 1048576
+    assert ModelDatabase.get_context_window("Qwen/Qwen3.5-397B-A17B") == 262144
 
     # Test unknown model
     assert ModelDatabase.get_context_window("unknown-model") is None
@@ -41,16 +43,80 @@ def test_model_database_long_context_model_listing():
     assert "claude-haiku-4-5" not in models
 
 
+def test_model_database_fast_model_flags():
+    assert ModelDatabase.is_fast_model("gpt-4.1-mini")
+    assert ModelDatabase.is_fast_model("openai.gpt-4.1-mini")
+    assert not ModelDatabase.is_fast_model("gpt-5")
+
+
+def test_model_database_fast_model_listing():
+    fast_models = ModelDatabase.list_fast_models()
+    assert "gpt-4.1-mini" in fast_models
+    assert "gpt-5-mini" in fast_models
+    assert "gpt-5" not in fast_models
+
+
+def test_model_database_default_provider_lookup():
+    assert ModelDatabase.get_default_provider("gpt-4.1") == Provider.OPENAI
+    assert ModelDatabase.get_default_provider("claude-sonnet-4-6") == Provider.ANTHROPIC
+    assert ModelDatabase.get_default_provider("openai.gpt-4.1") == Provider.OPENAI
+    assert ModelDatabase.get_default_provider("gpt-5?reasoning=low") == Provider.RESPONSES
+    assert ModelDatabase.get_default_provider("Qwen/Qwen3.5-397B-A17B") == Provider.HUGGINGFACE
+    assert ModelDatabase.get_default_provider("unknown-model") is None
+
+
+def test_model_database_anthropic_web_tool_versions_for_46_models():
+    assert ModelDatabase.get_anthropic_web_search_version("claude-opus-4-6") == "web_search_20260209"
+    assert ModelDatabase.get_anthropic_web_fetch_version("claude-opus-4-6") == "web_fetch_20260209"
+    assert ModelDatabase.get_anthropic_required_betas("claude-opus-4-6") == (
+        "code-execution-web-tools-2026-02-09",
+    )
+
+    assert (
+        ModelDatabase.get_anthropic_web_search_version("claude-sonnet-4-6")
+        == "web_search_20260209"
+    )
+    assert (
+        ModelDatabase.get_anthropic_web_fetch_version("claude-sonnet-4-6")
+        == "web_fetch_20260209"
+    )
+
+
+def test_model_database_anthropic_web_tool_versions_for_non_46_models():
+    assert (
+        ModelDatabase.get_anthropic_web_search_version("claude-sonnet-4-5")
+        == "web_search_20250305"
+    )
+    assert (
+        ModelDatabase.get_anthropic_web_fetch_version("claude-sonnet-4-5")
+        == "web_fetch_20250910"
+    )
+    assert ModelDatabase.get_anthropic_required_betas("claude-sonnet-4-5") is None
+
+
+def test_model_database_anthropic_web_tool_versions_unknown_model():
+    assert ModelDatabase.get_anthropic_web_search_version("unknown-model") is None
+    assert ModelDatabase.get_anthropic_web_fetch_version("unknown-model") is None
+    assert ModelDatabase.get_anthropic_required_betas("unknown-model") is None
+
+
 def test_model_database_max_tokens():
     """Test that ModelDatabase returns expected max tokens"""
     # Test known models with different max_output_tokens (no cap)
     assert ModelDatabase.get_default_max_tokens("claude-sonnet-4-0") == 64000  # ANTHROPIC_SONNET
     assert ModelDatabase.get_default_max_tokens("gpt-4o") == 16384  # OPENAI_STANDARD
     assert ModelDatabase.get_default_max_tokens("o1") == 100000  # High max_output_tokens
+    assert ModelDatabase.get_default_max_tokens("Qwen/Qwen3.5-397B-A17B:novita") == 65536
 
     # Test fallbacks
     assert ModelDatabase.get_default_max_tokens("unknown-model") == 2048
     assert ModelDatabase.get_default_max_tokens("") == 2048
+
+
+def test_model_database_default_temperature():
+    assert ModelDatabase.get_default_temperature("passthrough") == 0.0
+    assert ModelDatabase.get_default_temperature("unknown-model") is None
+    assert ModelDatabase.get_default_temperature(None) is None
 
 
 def test_model_database_tokenizes():
@@ -64,6 +130,10 @@ def test_model_database_tokenizes():
 
     # Test unknown model
     assert ModelDatabase.get_tokenizes("unknown-model") is None
+
+    qwen_tokenizes = ModelDatabase.get_tokenizes("Qwen/Qwen3.5-397B-A17B")
+    assert qwen_tokenizes is not None
+    assert "image/jpeg" in qwen_tokenizes
 
 
 def test_model_database_supports_mime_basic():
@@ -131,6 +201,7 @@ def test_llm_uses_model_database_for_max_tokens():
     assert isinstance(llm3, FastAgentLLM)
     expected_max_tokens = ModelDatabase.get_default_max_tokens("passthrough")
     assert llm3.default_request_params.maxTokens == expected_max_tokens
+    assert llm3.default_request_params.temperature is None
 
 
 def test_llm_usage_tracking_uses_model_database():
@@ -181,14 +252,47 @@ def test_model_database_stream_modes():
     assert ModelDatabase.get_stream_mode("unknown-model") == "openai"
 
 
+def test_model_database_response_transports():
+    """Codex models should expose websocket transport metadata."""
+    assert ModelDatabase.get_response_transports("gpt-5.3-codex") == ("sse", "websocket")
+    assert ModelDatabase.get_response_transports("gpt-5.3-codex-spark") == ("sse", "websocket")
+    assert ModelDatabase.get_response_transports("gpt-4o") is None
+    assert ModelDatabase.supports_response_transport("gpt-5.3-codex", "websocket") is True
+    assert ModelDatabase.supports_response_transport("gpt-4o", "websocket") is None
+
+
+def test_model_database_response_websocket_provider_support() -> None:
+    assert (
+        ModelDatabase.supports_response_websocket_provider(
+            "gpt-5.3-codex-spark", Provider.CODEX_RESPONSES
+        )
+        is True
+    )
+    assert (
+        ModelDatabase.supports_response_websocket_provider(
+            "gpt-5.3-codex-spark", Provider.RESPONSES
+        )
+        is False
+    )
+    assert ModelDatabase.supports_response_websocket_provider("gpt-4o", Provider.RESPONSES) is None
+
+
 def test_model_database_reasoning_modes():
     """Ensure reasoning types are tracked per model."""
     assert ModelDatabase.get_reasoning("o1") == "openai"
     assert ModelDatabase.get_reasoning("o3-mini") == "openai"
     assert ModelDatabase.get_reasoning("gpt-5") == "openai"
+    assert ModelDatabase.get_reasoning("gpt-5.3-codex-spark") is None
     assert ModelDatabase.get_reasoning("claude-opus-4-6") == "anthropic_thinking"
     assert ModelDatabase.get_reasoning("zai-org/glm-4.6") == "reasoning_content"
+    assert ModelDatabase.get_reasoning("Qwen/Qwen3.5-397B-A17B") == "reasoning_content"
     assert ModelDatabase.get_reasoning("gpt-4o") is None
+
+
+def test_model_database_codex_spark_is_text_only() -> None:
+    assert ModelDatabase.supports_mime("gpt-5.3-codex-spark", "text/plain")
+    assert not ModelDatabase.supports_mime("gpt-5.3-codex-spark", "application/pdf")
+    assert not ModelDatabase.supports_mime("gpt-5.3-codex-spark", "image/png")
 
 
 def test_model_database_opus_46_reasoning_spec():
@@ -305,7 +409,7 @@ def test_huggingface_kimi25_disable_reasoning_toggle():
     args = _hf_request_args(llm)
     extra_body = args.get("extra_body")
     assert isinstance(extra_body, dict)
-    assert extra_body["thinking"] == {"type": "disabled"}
+    assert extra_body["chat_template_kwargs"] == {"thinking": False}
 
 
 def test_huggingface_kimi25_default_reasoning_toggle_enabled():
@@ -313,5 +417,88 @@ def test_huggingface_kimi25_default_reasoning_toggle_enabled():
 
     args = _hf_request_args(llm)
     extra_body = args.get("extra_body")
+    if isinstance(extra_body, dict):
+        assert "chat_template_kwargs" not in extra_body
+    else:
+        assert extra_body is None
+
+
+def test_huggingface_qwen35_reasoning_toggle_uses_chat_template_kwargs_disabled():
+    llm = _make_hf_llm_with_reasoning("Qwen/Qwen3.5-397B-A17B", reasoning=False)
+
+    args = _hf_request_args(llm)
+    extra_body = args.get("extra_body")
     assert isinstance(extra_body, dict)
-    assert extra_body["thinking"] == {"type": "enabled"}
+    assert extra_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_huggingface_qwen35_reasoning_toggle_uses_chat_template_kwargs_enabled():
+    llm = _make_hf_llm_with_reasoning("Qwen/Qwen3.5-397B-A17B", reasoning=True)
+
+    args = _hf_request_args(llm)
+    extra_body = args.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_huggingface_qwen35_default_reasoning_emits_chat_template_kwargs_enabled():
+    llm = _make_hf_llm("Qwen/Qwen3.5-397B-A17B")
+
+    args = _hf_request_args(llm)
+    extra_body = args.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_huggingface_qwen35_reasoning_stream_hidden_when_disabled():
+    llm = _make_hf_llm_with_reasoning("Qwen/Qwen3.5-397B-A17B", reasoning=False)
+
+    segments: list[str] = []
+    active = llm._handle_reasoning_delta(
+        reasoning_mode="reasoning_content",
+        reasoning_text="hidden reasoning",
+        reasoning_active=False,
+        reasoning_segments=segments,
+    )
+
+    assert active is False
+    assert segments == []
+
+
+def test_huggingface_qwen35_reasoning_stream_visible_when_enabled():
+    llm = _make_hf_llm_with_reasoning("Qwen/Qwen3.5-397B-A17B", reasoning=True)
+
+    segments: list[str] = []
+    active = llm._handle_reasoning_delta(
+        reasoning_mode="reasoning_content",
+        reasoning_text="visible reasoning",
+        reasoning_active=False,
+        reasoning_segments=segments,
+    )
+
+    assert active is False
+    assert segments == ["visible reasoning"]
+
+
+def test_model_database_runtime_model_params_registration():
+    model_name = "vendor/runtime-model"
+    ModelDatabase.unregister_runtime_model_params(model_name)
+
+    params = ModelParameters(
+        context_window=12345,
+        max_output_tokens=678,
+        tokenizes=["text/plain"],
+        default_provider=Provider.OPENROUTER,
+    )
+
+    ModelDatabase.register_runtime_model_params(model_name, params)
+
+    retrieved = ModelDatabase.get_model_params(model_name)
+    assert retrieved is not None
+    assert retrieved.context_window == 12345
+    assert retrieved.max_output_tokens == 678
+    assert ModelDatabase.get_default_provider(model_name) == Provider.OPENROUTER
+    assert model_name in ModelDatabase.list_runtime_models(Provider.OPENROUTER)
+
+    ModelDatabase.unregister_runtime_model_params(model_name)
+    assert ModelDatabase.get_model_params(model_name) is None

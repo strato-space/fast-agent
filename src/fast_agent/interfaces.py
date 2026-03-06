@@ -153,6 +153,22 @@ class FastAgentLLMProtocol(Protocol):
     @property
     def text_verbosity_spec(self) -> TextVerbositySpec | None: ...
 
+    def set_web_search_enabled(self, value: bool | None) -> None: ...
+
+    @property
+    def web_search_supported(self) -> bool: ...
+
+    @property
+    def web_search_enabled(self) -> bool: ...
+
+    def set_web_fetch_enabled(self, value: bool | None) -> None: ...
+
+    @property
+    def web_fetch_supported(self) -> bool: ...
+
+    @property
+    def web_fetch_enabled(self) -> bool: ...
+
 
 @runtime_checkable
 class LlmAgentProtocol(Protocol):
@@ -288,6 +304,8 @@ class AgentProtocol(LlmAgentProtocol, Protocol):
         model: str | None = None,
         additional_message: Text | None = None,
         render_markdown: bool | None = None,
+        show_hook_indicator: bool | None = None,
+        render_message: bool = True,
     ) -> None: ...
 
     async def attach_llm(

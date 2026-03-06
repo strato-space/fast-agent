@@ -2,6 +2,7 @@
 Decorator for LlmAgent, normalizes PromptMessageExtended, allows easy extension of Agents
 """
 
+import inspect
 import json
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -48,12 +49,14 @@ from pydantic import BaseModel
 from fast_agent.agents.agent_types import AgentConfig, AgentType
 from fast_agent.constants import (
     CONTROL_MESSAGE_SAVE_HISTORY,
+    FAST_AGENT_ALERT_CHANNEL,
     FAST_AGENT_ERROR_CHANNEL,
     FAST_AGENT_REMOVED_METADATA_CHANNEL,
 )
 from fast_agent.context import Context
 from fast_agent.core.exceptions import AgentConfigError
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.core.model_resolution import get_context_model_aliases, resolve_model_alias
 from fast_agent.hooks.hook_messages import show_hook_failure
 from fast_agent.interfaces import (
     AgentProtocol,
@@ -230,7 +233,30 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
     async def _finalize_shutdown(self, *, run_hook: bool = True) -> None:
         if run_hook:
             await self._run_lifecycle_hook("on_shutdown")
+        await self._close_llm_resources()
         self.initialized = False
+
+    async def _close_llm_resources(self) -> None:
+        """Close optional LLM-owned resources (for example persistent transports)."""
+
+        llm = self._llm
+        if llm is None:
+            return
+
+        close_method = getattr(llm, "close", None)
+        if not callable(close_method):
+            return
+
+        try:
+            close_result = close_method()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception as exc:
+            logger.debug(
+                "Failed to close LLM resources during agent shutdown",
+                name=self._name,
+                error=str(exc),
+            )
 
     def _load_lifecycle_hooks(self) -> "AgentLifecycleHooks":
         if self._lifecycle_hooks is not None:
@@ -311,7 +337,8 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
 
         from fast_agent.llm.model_factory import ModelFactory
 
-        model_config = ModelFactory.parse_model_string(model)
+        model_with_aliases = resolve_model_alias(model, get_context_model_aliases(self._context))
+        model_config = ModelFactory.parse_model_string(model_with_aliases)
         resolved_model = model_config.model_name
         if self._default_request_params:
             self._default_request_params.model = resolved_model
@@ -327,7 +354,7 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
             request_params = deepcopy(request_params)
             request_params.model = resolved_model
 
-        llm_factory = ModelFactory.create_factory(model)
+        llm_factory = ModelFactory.create_factory(model_with_aliases)
 
         await self.attach_llm(
             llm_factory,
@@ -812,10 +839,15 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
 
         summary = self._build_removed_summary(removed_blocks)
         if summary:
-            # Attach metadata to the last user message for downstream UI usage
+            # Attach compact persisted alert flags and detailed metadata for UI usage.
             for msg in reversed(sanitized_messages):
                 if msg.role == "user":
                     channels = dict(msg.channels or {})
+
+                    alert_entries = list(channels.get(FAST_AGENT_ALERT_CHANNEL, []))
+                    alert_entries.extend(self._build_alert_entries(summary))
+                    channels[FAST_AGENT_ALERT_CHANNEL] = alert_entries
+
                     meta_entries = list(channels.get(FAST_AGENT_REMOVED_METADATA_CHANNEL, []))
                     meta_entries.extend(self._build_metadata_entries(removed_blocks))
                     channels[FAST_AGENT_REMOVED_METADATA_CHANNEL] = meta_entries
@@ -1006,6 +1038,16 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
             )
             entries.append(metadata_text)
         return entries
+
+    def _build_alert_entries(self, summary: RemovedContentSummary) -> list[ContentBlock]:
+        """Create compact persisted alert entries for toolbar classification."""
+        payload = {
+            "type": "unsupported_content_removed",
+            "flags": sorted(summary.alert_flags),
+            "categories": sorted(summary.counts),
+            "handled": True,
+        }
+        return [text_content(json.dumps(payload))]
 
     def _build_removed_summary(self, removed: list[_RemovedBlock]) -> RemovedContentSummary | None:
         if not removed:
@@ -1298,5 +1340,7 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
         model: str | None = None,
         additional_message: Union["Text", None] = None,
         render_markdown: bool | None = None,
+        show_hook_indicator: bool | None = None,
+        render_message: bool = True,
     ) -> None:
         pass

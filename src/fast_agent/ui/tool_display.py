@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Mapping
+import re
+from typing import TYPE_CHECKING, Any, Mapping, cast
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -9,6 +10,10 @@ from rich.text import Text
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.ui import console
 from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
+from fast_agent.ui.shell_output_truncation import (
+    format_shell_output_line_count,
+    truncate_shell_output_lines,
+)
 
 if TYPE_CHECKING:
     from mcp.types import CallToolResult
@@ -116,6 +121,107 @@ class ToolDisplay:
             return lines[:index], candidate
         return lines, None
 
+    @staticmethod
+    def _parse_exit_code_value(exit_line: str | None) -> int | None:
+        if not exit_line:
+            return None
+
+        bracket_match = re.search(r"\[Exit code:\s*(-?\d+)", exit_line)
+        if bracket_match:
+            return int(bracket_match.group(1))
+
+        process_match = re.search(r"process exit code was\s+(-?\d+)", exit_line)
+        if process_match:
+            return int(process_match.group(1))
+
+        return None
+
+    def _shell_exit_detail(
+        self,
+        *,
+        no_output: bool,
+        tool_call_id: str | None,
+        output_line_count: int | None,
+    ) -> str | None:
+        detail_parts: list[str] = []
+        if output_line_count is not None and output_line_count > 0:
+            detail_parts.append(format_shell_output_line_count(output_line_count))
+        if no_output:
+            detail_parts.append("(no output)")
+
+        formatted_id = self._format_tool_call_id(tool_call_id)
+        if formatted_id:
+            detail_parts.append(f"id: {formatted_id}")
+
+        if not detail_parts:
+            return None
+        return f" {' '.join(detail_parts)}"
+
+    @staticmethod
+    def _shell_output_line_count_from_content(content) -> int | None:
+        from fast_agent.mcp.helpers.content_helpers import get_text, is_text_content
+
+        if not content or len(content) != 1 or not is_text_content(content[0]):
+            return None
+
+        text = get_text(content[0]) or ""
+        lines = cast("list[str]", text.splitlines())
+        lines_without_exit, _ = ToolDisplay._extract_exit_code_line(lines)
+        return len(lines_without_exit)
+
+    def _build_shell_exit_additional_message(
+        self,
+        *,
+        content,
+        source_content,
+        tool_name: str | None,
+        tool_call_id: str | None,
+        output_line_count: int | None = None,
+    ):
+        from mcp.types import TextContent
+
+        from fast_agent.mcp.helpers.content_helpers import get_text, is_text_content
+
+        if not tool_name:
+            return content, None
+        normalized_tool_name = self._normalize_tool_name(tool_name)
+        if normalized_tool_name not in {"execute", "bash", "shell"}:
+            return content, None
+
+        if not content or len(content) != 1 or not is_text_content(content[0]):
+            return content, None
+
+        text = get_text(content[0]) or ""
+        lines = cast("list[str]", text.splitlines())
+        lines_without_exit, exit_line = self._extract_exit_code_line(lines)
+        exit_code = self._parse_exit_code_value(exit_line)
+        if exit_code is None:
+            return content, None
+
+        line_count = output_line_count
+        if line_count is None:
+            line_count = self._shell_output_line_count_from_content(source_content)
+        if line_count is None:
+            line_count = len(lines_without_exit)
+
+        no_output = not any(line.strip() for line in lines_without_exit)
+        detail = self._shell_exit_detail(
+            no_output=no_output,
+            tool_call_id=tool_call_id,
+            output_line_count=line_count,
+        )
+        additional_message = self._display.style.shell_exit_line(
+            exit_code,
+            console.console.size.width,
+            detail,
+        )
+
+        if not lines_without_exit:
+            return "", additional_message
+
+        rendered_text = "\n".join(lines_without_exit)
+        return [TextContent(type="text", text=rendered_text)], additional_message
+
     def _limit_shell_output_text(self, text: str, line_limit: int) -> str:
         if line_limit < 0:
             return text
@@ -130,9 +236,7 @@ class ToolDisplay:
         if line_limit >= len(lines_without_exit):
             return text
 
-        output_lines = lines_without_exit[:line_limit]
-        if len(lines_without_exit) > line_limit:
-            output_lines.append("...")
+        output_lines, _ = truncate_shell_output_lines(lines_without_exit, line_limit)
         if exit_line:
             output_lines.append(exit_line)
         return "\n".join(output_lines)
@@ -177,6 +281,7 @@ class ToolDisplay:
             content = result.content
             structured_content = getattr(result, "structuredContent", None)
             has_structured = structured_content is not None
+            source_content = content
             display_content = content
             if truncate_content:
                 show_bash_output = self._shell_show_bash(tool_name)
@@ -196,7 +301,9 @@ class ToolDisplay:
                     if tool_cfg.tool_name == tool_name and tool_cfg.is_valid:
                         is_skybridge_tool = True
                         skybridge_resource_uri = (
-                            str(tool_cfg.resource_uri) if tool_cfg.resource_uri is not None else None
+                            str(tool_cfg.resource_uri)
+                            if tool_cfg.resource_uri is not None
+                            else None
                         )
                         break
 
@@ -253,6 +360,16 @@ class ToolDisplay:
             right_info = self._build_tool_right_info(
                 f"{type_label} - {status}",
                 tool_call_id,
+            )
+
+            display_content, shell_exit_additional_message = (
+                self._build_shell_exit_additional_message(
+                    content=display_content,
+                    source_content=source_content,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    output_line_count=getattr(result, "output_line_count", None),
+                )
             )
 
             if has_structured:
@@ -322,6 +439,7 @@ class ToolDisplay:
                     bottom_metadata=bottom_metadata,
                     is_error=result.isError,
                     truncate_content=truncate_content,
+                    additional_message=shell_exit_additional_message,
                     show_hook_indicator=show_hook_indicator,
                 )
         except Exception:

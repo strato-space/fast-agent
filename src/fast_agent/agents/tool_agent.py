@@ -1,6 +1,7 @@
 import asyncio
 import time
 from contextvars import ContextVar
+from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Sequence
 
 from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
@@ -363,20 +364,26 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                     and last_msg.stop_reason == LlmStopReason.TOOL_USE
                 ):
                     tool_call_ids = list(last_msg.tool_calls.keys())
-                    logger.error(
-                        "History ends with unanswered tool call - session may have been "
-                        "interrupted mid-turn. Cannot proceed with LLM call.",
+                    removed = self.pop_last_message()
+                    logger.warning(
+                        "History ended with unanswered tool call; auto-healed by "
+                        "dropping trailing pending tool request.",
                         data={
                             "tool_calls": tool_call_ids,
                             "history_length": len(history),
+                            "auto_healed": removed is not None,
                         },
                     )
-                    raise ValueError(
-                        "Invalid conversation history: assistant message has pending tool "
-                        f"calls {tool_call_ids} but no user message with tool results follows. "
-                        "The session may have been interrupted. Please clear the history or "
-                        "remove the incomplete tool call before continuing."
-                    )
+                    if removed is None:
+                        logger.error(
+                            "Unable to auto-heal dangling tool call history because no "
+                            "message was removed."
+                        )
+                        raise ValueError(
+                            "Invalid conversation history: assistant message has pending "
+                            f"tool calls {tool_call_ids} but no user message with tool "
+                            "results follows. The session may have been interrupted."
+                        )
 
         if tools is None:
             tools = (await self.list_tools()).tools
@@ -690,7 +697,11 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
 
         from mcp.types import TextContent
 
-        from fast_agent.constants import FAST_AGENT_TOOL_TIMING
+        from fast_agent.constants import (
+            FAST_AGENT_TOOL_TIMING,
+            FAST_AGENT_URL_ELICITATION_CHANNEL,
+        )
+        from fast_agent.mcp.url_elicitation_required import URLElicitationRequiredDisplayPayload
 
         channels = None
         content = []
@@ -706,6 +717,19 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 channels = {}
             channels[FAST_AGENT_TOOL_TIMING] = [
                 TextContent(type="text", text=json.dumps(tool_timings))
+            ]
+
+        deferred_url_elicitations: list[dict[str, object]] = []
+        for result in tool_results.values():
+            payload = getattr(result, "_fast_agent_url_elicitation_required", None)
+            if isinstance(payload, URLElicitationRequiredDisplayPayload):
+                deferred_url_elicitations.append(asdict(payload))
+
+        if deferred_url_elicitations:
+            if channels is None:
+                channels = {}
+            channels[FAST_AGENT_URL_ELICITATION_CHANNEL] = [
+                TextContent(type="text", text=json.dumps(deferred_url_elicitations))
             ]
 
         return PromptMessageExtended(

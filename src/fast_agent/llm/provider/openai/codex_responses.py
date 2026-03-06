@@ -9,6 +9,10 @@ from fast_agent.core.exceptions import ProviderKeyError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.llm.provider.openai.codex_oauth import parse_chatgpt_account_id
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
+from fast_agent.llm.provider.openai.responses_websocket import (
+    ResponsesWsRequestPlanner,
+    StatefulContinuationResponsesWsPlanner,
+)
 from fast_agent.llm.provider_types import Provider
 
 if TYPE_CHECKING:
@@ -80,6 +84,32 @@ class CodexResponsesLLM(ResponsesLLM):
                 "The configured Codex OAuth token was rejected. "
                 "Run `fast-agent auth codex-login` to reauthenticate.",
             ) from e
+
+    def _supports_websocket_transport(self) -> bool:
+        return True
+
+    def _new_ws_request_planner(self) -> ResponsesWsRequestPlanner:
+        """Use response-id continuation on websocket turns."""
+        return StatefulContinuationResponsesWsPlanner()
+
+    def _build_websocket_headers(self) -> dict[str, str]:
+        token = self._api_key()
+        account_id = parse_chatgpt_account_id(token)
+        if not account_id:
+            raise ProviderKeyError(
+                "Codex OAuth token invalid",
+                "The Codex access token did not contain a chatgpt_account_id. "
+                "Run `fast-agent auth codex-login` to refresh your token.",
+            )
+        default_headers = dict(self._default_headers() or {})
+        default_headers["chatgpt-account-id"] = account_id
+        default_headers.setdefault("originator", "fast-agent")
+        try:
+            app_version = version("fast-agent-mcp")
+        except Exception:
+            app_version = "unknown"
+        default_headers.setdefault("User-Agent", f"fast-agent/{app_version}")
+        return default_headers | super()._build_websocket_headers()
 
     def _build_response_args(
         self,

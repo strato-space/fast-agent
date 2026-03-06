@@ -30,8 +30,8 @@ CURATED_MODELS: list[CuratedModel] = [
     ),
     CuratedModel(
         id="glm",
-        display_name="ZAI GLM 4.7",
-        description="ZAI GLM-4.7: Superior Agentic, Reasoning and Coding Capabilities",
+        display_name="ZAI GLM 5",
+        description="ZAI GLM-5: Superior Agentic, Reasoning and Coding Capabilities",
     ),
     CuratedModel(
         id="minimax",
@@ -55,8 +55,23 @@ CURATED_MODELS: list[CuratedModel] = [
     ),
     CuratedModel(
         id="kimi25",
-        display_name="Kimi K2.5",
-        description="Kimi 2.5 seamlessly integrates vision and language understanding with advanced agentic capabilities, instant and thinking modes, as well as conversational and agentic paradigms.",
+        display_name="Kimi K2.5 (Thinking)",
+        description="Kimi 2.5 thinking profile with curated defaults (temp=1.0, top_p=0.95).",
+    ),
+    # CuratedModel(
+    #     id="kimi25instant",
+    #     display_name="Kimi K2.5 Instant",
+    #     description="Kimi 2.5 instant profile with thinking disabled (temp=0.6, top_p=0.95).",
+    # ),
+    CuratedModel(
+        id="qwen35",
+        display_name="Qwen 3.5 (Thinking)",
+        description="Qwen3.5-397B-A17B tuned for thinking mode defaults (temp=0.6, top_p=0.95, top_k=20).",
+    ),
+    CuratedModel(
+        id="qwen35instruct",
+        display_name="Qwen 3.5 Instruct",
+        description="Qwen3.5-397B-A17B tuned for instruct mode defaults (temp=0.7, top_p=0.8, top_k=20).",
     ),
 ]
 
@@ -135,6 +150,8 @@ def format_model_list_help() -> str:
             "**Examples:**",
             "- `/set-model kimi` - Use the Kimi K2 model",
             "- `/set-model glm` - Use GLM 4.6",
+            # "- `/set-model kimi25instant` - Use Kimi 2.5 instant profile",
+            "- `/set-model qwen35instruct` - Use Qwen 3.5 with instruct sampling profile",
             "- `/set-model moonshotai/Kimi-K2-Thinking` - Set model (autoroute) and show providers",
             "",
             "## Model String Format",

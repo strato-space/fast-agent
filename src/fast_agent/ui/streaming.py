@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Protocol
@@ -17,7 +19,7 @@ from fast_agent.ui.markdown_helpers import prepare_markdown_content
 from fast_agent.ui.markdown_truncator import MarkdownTruncator
 from fast_agent.ui.plain_text_truncator import PlainTextTruncator
 from fast_agent.ui.stream_segments import StreamSegmentAssembler
-from fast_agent.ui.stream_viewport import StreamViewport, estimate_plain_text_height
+from fast_agent.ui.stream_viewport import StreamViewport
 
 if TYPE_CHECKING:
     from rich.console import RenderableType
@@ -28,14 +30,30 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-MARKDOWN_STREAM_TARGET_RATIO = 0.9
+MARKDOWN_STREAM_TARGET_RATIO = 0.93
 MARKDOWN_STREAM_REFRESH_PER_SECOND = 4
-MARKDOWN_STREAM_HEIGHT_FUDGE = 2
-PLAIN_STREAM_TARGET_RATIO = 0.92
+MARKDOWN_STREAM_HEIGHT_FUDGE = 3
+PLAIN_STREAM_TARGET_RATIO = 0.95
 PLAIN_STREAM_REFRESH_PER_SECOND = 20
-PLAIN_STREAM_HEIGHT_FUDGE = 2
+PLAIN_STREAM_HEIGHT_FUDGE = 3
 STREAM_BATCH_PERIOD = 1 / 100
 STREAM_BATCH_MAX_DURATION = 1 / 60
+STREAM_CURSOR_BLOCK = "●"
+
+
+def _resolve_progress_resume_debounce_seconds() -> float:
+    """Return debounce duration for progress resume after streaming closes."""
+    raw_value = os.getenv("FAST_AGENT_PROGRESS_RESUME_DEBOUNCE_SECONDS", "0.12").strip()
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return 0.12
+    return max(0.0, parsed)
+
+
+STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS = _resolve_progress_resume_debounce_seconds()
+
+_FENCE_OPEN_LINE_RE = re.compile(r"^\s{0,3}(?P<delim>`{3,}|~{3,})(?P<info>.*)$")
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,15 @@ class NullStreamingHandle:
         return
 
     def handle_tool_event(self, _event_type: str, info: dict[str, Any] | None = None) -> None:
+        return
+
+    def has_scrolled(self) -> bool:
+        return False
+
+    def preserve_final_frame(self) -> bool:
+        return False
+
+    async def wait_for_drain(self) -> None:
         return
 
 
@@ -111,15 +138,13 @@ class StreamingMessageHandle:
         self._viewport = StreamViewport(
             markdown_truncator=self._markdown_truncator,
             plain_truncator=self._plain_truncator,
+            code_theme=self._display.code_style,
         )
         self._stream_target_ratio = (
             PLAIN_STREAM_TARGET_RATIO if use_plain_text else MARKDOWN_STREAM_TARGET_RATIO
         )
         self._height_fudge = (
             PLAIN_STREAM_HEIGHT_FUDGE if use_plain_text else MARKDOWN_STREAM_HEIGHT_FUDGE
-        )
-        initial_renderable = (
-            Text("", style=self._plain_text_style or "") if self._use_plain_text else Markdown("")
         )
         refresh_rate = (
             PLAIN_STREAM_REFRESH_PER_SECOND
@@ -135,6 +160,8 @@ class StreamingMessageHandle:
         self._scrolling_started = False
         self._scroll_start_time: float | None = None
         self._display_truncated = False
+        self._header_cache: dict[tuple[int, bool], Text] = {}
+        self._next_render_deadline: float | None = None
         try:
             self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
@@ -144,16 +171,19 @@ class StreamingMessageHandle:
         self._stop_sentinel: object = object()
         self._worker_task: asyncio.Task[None] | None = None
         self._live: Live | None = Live(
-            initial_renderable,
+            None,
             console=console.console,
             vertical_overflow="ellipsis",
             refresh_per_second=refresh_rate,
+            auto_refresh=False,
             transient=True,
         )
         self._live_started = False
         self._active = True
         self._finalized = False
+        self._show_stream_cursor = True
         self._max_render_height = 0
+        self._preserve_final_frame = False
 
         if self._async_mode and self._loop and self._queue is not None:
             self._worker_task = self._loop.create_task(self._render_worker())
@@ -193,7 +223,7 @@ class StreamingMessageHandle:
                 "newest_enqueued_at": now,
                 "batch_chars": len(chunk),
             }
-            self._render_current_buffer()
+            self._render_sync_if_due()
 
     def update_chunk(self, chunk: StreamChunk) -> None:
         """Structured streaming update with an explicit reasoning flag."""
@@ -213,15 +243,24 @@ class StreamingMessageHandle:
                 "newest_enqueued_at": now,
                 "batch_chars": len(chunk.text),
             }
-            self._render_current_buffer()
+            self._render_sync_if_due()
 
     def _build_header(self) -> Text:
+        width = console.console.size.width
+        cache_key = (width, self._display_truncated)
+        cached = self._header_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         right_content = self._header_right.strip()
         if self._display_truncated:
-            indicator = "[black on blue]display truncated[/black on blue]"
+            indicator = "[black on blue]scrolling[/black on blue]"
             right_content = f"{right_content} {indicator}" if right_content else indicator
 
         combined = self._display._format_header_line(self._header_left, right_content)
+        self._header_cache[cache_key] = combined
+        if len(self._header_cache) > 8:
+            self._header_cache.clear()
         return combined
 
     def _pause_progress_display(self) -> None:
@@ -235,6 +274,11 @@ class StreamingMessageHandle:
     def _resume_progress_display(self) -> None:
         if self._progress_display and self._progress_paused:
             try:
+                self._progress_display.resume(
+                    debounce_seconds=STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS
+                )
+            except TypeError:
+                # Backward compatibility for non-standard displays in tests/experiments.
                 self._progress_display.resume()
             except Exception:
                 pass
@@ -252,20 +296,63 @@ class StreamingMessageHandle:
             self._live_started = True
 
     def _close_incomplete_code_blocks(self, text: str) -> str:
-        import re
+        if "```" not in text and "~~~" not in text:
+            return text
+        in_fence = False
+        fence_char = "`"
+        fence_len = 3
 
-        opening_fences = len(re.findall(r"^```", text, re.MULTILINE))
-        closing_fences = len(re.findall(r"^```\s*$", text, re.MULTILINE))
+        for line in text.splitlines():
+            stripped = line.lstrip(" ")
+            if len(line) - len(stripped) > 3:
+                continue
 
-        if opening_fences > closing_fences:
-            if not re.search(r"```\s*$", text):
-                return text + "\n```\n"
+            if not in_fence:
+                opening = _FENCE_OPEN_LINE_RE.match(line)
+                if not opening:
+                    continue
 
-        return text
+                delimiter = opening.group("delim")
+                info = opening.group("info")
+                # Backtick fences cannot include backticks in the info string.
+                if delimiter[0] == "`" and "`" in info:
+                    continue
+
+                in_fence = True
+                fence_char = delimiter[0]
+                fence_len = len(delimiter)
+                continue
+
+            if not stripped or stripped[0] != fence_char:
+                continue
+
+            index = 0
+            while index < len(stripped) and stripped[index] == fence_char:
+                index += 1
+
+            if index >= fence_len and stripped[index:].strip() == "":
+                in_fence = False
+
+        if not in_fence:
+            return text
+
+        closing_fence = fence_char * fence_len
+        if text.endswith("\n"):
+            return f"{text}{closing_fence}\n"
+        return f"{text}\n{closing_fence}\n"
 
     def finalize(self, _message: "PromptMessageExtended | str") -> None:
         if not self._active or self._finalized:
             return
+
+        # Remove the transient cursor in the final frame before closing Live rendering.
+        self._show_stream_cursor = False
+
+        if self._preserve_final_frame:
+            # Avoid carrying the anti-flicker height padding into the persisted
+            # final frame, otherwise short responses keep visible blank lines.
+            self._max_render_height = 0
+            self._height_fudge = 0
 
         # Flush any buffered reasoning content before closing the live view
         if self._segment_assembler.flush():
@@ -309,6 +396,92 @@ class StreamingMessageHandle:
                 self._worker_task = None
         self._shutdown_live_resources()
         self._max_render_height = 0
+        self._next_render_deadline = None
+
+    async def _wait_for_render_slot(self) -> bool:
+        """Sleep until the next render deadline to keep frame cadence steady."""
+        interval = self._min_render_interval
+        if not interval:
+            return True
+
+        if not self._render_throttle_active:
+            # Keep markdown updates immediate while content still fits the viewport.
+            self._next_render_deadline = None
+            return True
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now
+            return True
+
+        delay = deadline - now
+        if delay <= 0:
+            return True
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return False
+        return True
+
+    def _advance_render_deadline(self) -> None:
+        """Advance render deadline without drifting under variable render cost."""
+        interval = self._min_render_interval
+        if not interval:
+            return
+
+        if not self._render_throttle_active:
+            self._next_render_deadline = None
+            return
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now + interval
+            return
+
+        next_deadline = deadline + interval
+        if next_deadline <= now:
+            skipped_slots = int((now - deadline) // interval) + 1
+            next_deadline = deadline + (skipped_slots * interval)
+        self._next_render_deadline = next_deadline
+
+    def _sync_render_due(self) -> bool:
+        """Return True when sync mode is allowed to render the next frame."""
+        interval = self._min_render_interval
+        if not interval:
+            return True
+
+        if not self._render_throttle_active:
+            self._next_render_deadline = None
+            return True
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now
+            return True
+        return now >= deadline
+
+    @property
+    def _render_throttle_active(self) -> bool:
+        """Whether frame pacing should currently throttle renders.
+
+        Markdown renders are unthrottled until truncation begins (first scroll),
+        then we switch to the configured cadence. Plain-text mode keeps its
+        existing fixed cadence.
+        """
+        if self._use_plain_text:
+            return True
+        return self._scrolling_started
+
+    def _render_sync_if_due(self) -> None:
+        """Render in sync mode while respecting frame-rate limits."""
+        if not self._sync_render_due():
+            return
+        self._render_current_buffer()
+        self._advance_render_deadline()
 
     def _enqueue_chunk(self, chunk: object) -> None:
         if not self._queue or not self._loop:
@@ -319,8 +492,10 @@ class StreamingMessageHandle:
         except RuntimeError:
             current_loop = None
 
-        queued = chunk if isinstance(chunk, _QueuedItem) else _QueuedItem(
-            payload=chunk, enqueued_at=time.perf_counter()
+        queued = (
+            chunk
+            if isinstance(chunk, _QueuedItem)
+            else _QueuedItem(payload=chunk, enqueued_at=time.perf_counter())
         )
         if current_loop is self._loop:
             try:
@@ -349,6 +524,43 @@ class StreamingMessageHandle:
     def _handle_chunk(self, chunk: str) -> bool:
         return self._segment_assembler.handle_text(chunk)
 
+    def _cursor_suffix(self, *, segment_index: int, total_segments: int) -> str:
+        if not self._show_stream_cursor:
+            return ""
+        if total_segments <= 0:
+            return ""
+        if segment_index != total_segments - 1:
+            return ""
+        return STREAM_CURSOR_BLOCK
+
+    def has_scrolled(self) -> bool:
+        """Return whether viewport truncation/scrolling has started."""
+        return self._scrolling_started
+
+    def preserve_final_frame(self) -> bool:
+        """Request that closing leaves the final streamed frame visible.
+
+        Returns True when the request can be honored for this stream.
+        """
+        if not self._live:
+            return False
+        if (
+            not self._live_started
+            and not self._segment_assembler.segments
+            and not self._segment_assembler.has_pending_content()
+        ):
+            return False
+        self._preserve_final_frame = True
+        return True
+
+    async def wait_for_drain(self) -> None:
+        """Wait until all queued stream updates have been rendered."""
+        if not self._async_mode or self._queue is None:
+            return
+        if self._worker_task is None or self._worker_task.done():
+            return
+        await self._queue.join()
+
     def _render_current_buffer(self) -> None:
         if not self._active:
             return
@@ -364,7 +576,7 @@ class StreamingMessageHandle:
 
         header = self._build_header()
         max_allowed_height = max(1, console.console.size.height - 2)
-        window_segments = self._viewport.slice_segments(
+        window_segments, window_heights = self._viewport.slice_segments_with_heights(
             segments,
             terminal_height=max_allowed_height,
             console=console.console,
@@ -373,7 +585,7 @@ class StreamingMessageHandle:
         if not window_segments:
             return
         is_truncated = len(window_segments) < len(segments) or (
-            window_segments and segments and window_segments[0] is not segments[0]
+            bool(window_segments) and bool(segments) and window_segments[0] is not segments[0]
         )
         self._display_truncated = is_truncated
         if is_truncated and not self._scrolling_started:
@@ -382,22 +594,24 @@ class StreamingMessageHandle:
         self._segment_assembler.compact(window_segments)
 
         renderables: list[RenderableType] = []
-        content_height = 0
+        content_height = sum(window_heights)
         width = console.console.size.width
         render_start = time.perf_counter()
 
-        for segment in window_segments:
+        total_segments = len(window_segments)
+        for segment_index, segment in enumerate(window_segments):
+            cursor_suffix = self._cursor_suffix(
+                segment_index=segment_index,
+                total_segments=total_segments,
+            )
             if segment.kind == "markdown":
                 prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
                 prepared_for_display = self._close_incomplete_code_blocks(prepared)
+                if cursor_suffix:
+                    prepared_for_display += cursor_suffix
                 if prepared_for_display:
                     renderables.append(
                         Markdown(prepared_for_display, code_theme=self._display.code_style)
-                    )
-                    content_height += self._markdown_truncator.measure_rendered_height(
-                        prepared_for_display,
-                        console.console,
-                        self._display.code_style,
                     )
                 else:
                     renderables.append(Text(""))
@@ -405,20 +619,16 @@ class StreamingMessageHandle:
                 if self._render_reasoning_markdown:
                     prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
                     prepared_for_display = self._close_incomplete_code_blocks(prepared)
+                    if cursor_suffix:
+                        prepared_for_display += cursor_suffix
                     markdown = Markdown(
                         prepared_for_display,
                         code_theme=self._display.code_style,
                         style="dim italic",
                     )
                     renderables.append(markdown)
-                    content_height += self._markdown_truncator.measure_rendered_height(
-                        prepared_for_display,
-                        console.console,
-                        self._display.code_style,
-                    )
                 else:
-                    renderables.append(Text(segment.text, style="dim italic"))
-                    content_height += estimate_plain_text_height(segment.text, width)
+                    renderables.append(Text(f"{segment.text}{cursor_suffix}", style="dim italic"))
             else:
                 if segment.kind == "tool":
                     header_text = (
@@ -438,11 +648,11 @@ class StreamingMessageHandle:
                         if args_text:
                             tool_text.append("\n")
                             tool_text.append(args_text)
+                    if cursor_suffix:
+                        tool_text.append(cursor_suffix, style="dim")
                     renderables.append(tool_text)
-                    content_height += estimate_plain_text_height(tool_text.plain, width)
                 else:
-                    renderables.append(Text(segment.text))
-                    content_height += estimate_plain_text_height(segment.text, width)
+                    renderables.append(Text(f"{segment.text}{cursor_suffix}"))
 
         self._max_render_height = min(self._max_render_height, max_allowed_height)
         budget_height = min(content_height + self._height_fudge, max_allowed_height)
@@ -470,7 +680,7 @@ class StreamingMessageHandle:
             (now - self._last_render_time) * 1000 if self._last_render_time else None
         )
         try:
-            self._live.update(combined)
+            self._live.update(combined, refresh=True)
             self._last_render_time = time.monotonic()
         except Exception as exc:
             logger.warning(
@@ -537,6 +747,7 @@ class StreamingMessageHandle:
                     break
 
                 if item is self._stop_sentinel:
+                    self._queue.task_done()
                     break
 
                 stop_requested = False
@@ -551,13 +762,12 @@ class StreamingMessageHandle:
                             break
                         try:
                             timeout = min(self._batch_period, self._batch_max_duration - elapsed)
-                            next_item = await asyncio.wait_for(
-                                self._queue.get(), timeout=timeout
-                            )
+                            next_item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
                         except asyncio.TimeoutError:
                             break
                     if next_item is self._stop_sentinel:
                         stop_requested = True
+                        chunks.append(next_item)
                         break
                     chunks.append(next_item)
 
@@ -565,6 +775,8 @@ class StreamingMessageHandle:
                 queued_items: list[_QueuedItem] = []
                 batch_chars = 0
                 for chunk in chunks:
+                    if chunk is self._stop_sentinel:
+                        continue
                     payload = chunk
                     if isinstance(chunk, _QueuedItem):
                         queued_items.append(chunk)
@@ -585,6 +797,10 @@ class StreamingMessageHandle:
                         )
 
                 if should_render:
+                    if not await self._wait_for_render_slot():
+                        for _ in chunks:
+                            self._queue.task_done()
+                        break
                     oldest_enqueued_at = None
                     newest_enqueued_at = None
                     if queued_items:
@@ -599,11 +815,10 @@ class StreamingMessageHandle:
                         "batch_chars": batch_chars,
                     }
                     self._render_current_buffer()
-                    if self._min_render_interval:
-                        try:
-                            await asyncio.sleep(self._min_render_interval)
-                        except asyncio.CancelledError:
-                            break
+                    self._advance_render_deadline()
+
+                for _ in chunks:
+                    self._queue.task_done()
 
                 if stop_requested:
                     break
@@ -614,12 +829,18 @@ class StreamingMessageHandle:
 
     def _shutdown_live_resources(self) -> None:
         if self._live and self._live_started:
+            if self._preserve_final_frame:
+                try:
+                    self._live.transient = False
+                except Exception:
+                    pass
             try:
                 self._live.__exit__(None, None, None)
             except Exception:
                 pass
             self._live = None
             self._live_started = False
+        self._preserve_final_frame = False
 
         self._resume_progress_display()
         self._active = False
@@ -643,7 +864,7 @@ class StreamingMessageHandle:
                     "newest_enqueued_at": now,
                     "batch_chars": 0,
                 }
-                self._render_current_buffer()
+                self._render_sync_if_due()
         except Exception as exc:
             logger.warning(
                 "Error handling tool event",
@@ -677,3 +898,9 @@ class StreamingHandle(Protocol):
     def close(self) -> None: ...
 
     def handle_tool_event(self, event_type: str, info: dict[str, Any] | None = None) -> None: ...
+
+    def has_scrolled(self) -> bool: ...
+
+    def preserve_final_frame(self) -> bool: ...
+
+    async def wait_for_drain(self) -> None: ...

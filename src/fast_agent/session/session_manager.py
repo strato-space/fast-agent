@@ -213,6 +213,16 @@ class SessionInfo:
         }
 
 
+@dataclass(frozen=True)
+class ResumeSessionAgentsResult:
+    """Structured result for SessionManager.resume_session_agents."""
+
+    session: Session
+    loaded: dict[str, pathlib.Path]
+    missing_agents: list[str]
+    usage_notices: list[str] = field(default_factory=list)
+
+
 class Session:
     """Represents a single conversation session."""
 
@@ -685,7 +695,7 @@ class SessionManager:
 
     def resume_session(
         self, agent: AgentProtocol, name: str | None = None
-    ) -> tuple[Session, pathlib.Path | None] | None:
+    ) -> tuple[Session, pathlib.Path | None, list[str]] | None:
         """Resume a session and load its latest history into the agent."""
         session_name = self._resolve_session_name(name)
         session = self.load_latest_session() if session_name is None else self.load_session(session_name)
@@ -693,19 +703,22 @@ class SessionManager:
             return None
 
         history_path = session.latest_history_path(getattr(agent, "name", None))
+        notices: list[str] = []
         if history_path and history_path.exists():
             from fast_agent.mcp.prompts.prompt_load import load_history_into_agent
 
-            load_history_into_agent(agent, history_path)
+            notice = load_history_into_agent(agent, history_path)
+            if notice:
+                notices.append(notice)
 
-        return session, history_path
+        return session, history_path, notices
 
     def resume_session_agents(
         self,
         agents: Mapping[str, AgentProtocol],
         name: str | None = None,
         default_agent_name: str | None = None,
-    ) -> tuple[Session, dict[str, pathlib.Path], list[str]] | None:
+    ) -> ResumeSessionAgentsResult | None:
         """Resume a session and load histories for all known agents."""
         session_name = self._resolve_session_name(name)
         session = self.load_latest_session() if session_name is None else self.load_session(session_name)
@@ -715,6 +728,7 @@ class SessionManager:
         history_map = session.info.metadata.get("last_history_by_agent")
         loaded: dict[str, pathlib.Path] = {}
         missing_agents: list[str] = []
+        notices: list[str] = []
 
         if isinstance(history_map, dict) and history_map:
             for agent_name, filename in history_map.items():
@@ -727,8 +741,21 @@ class SessionManager:
                 if history_path.exists():
                     from fast_agent.mcp.prompts.prompt_load import load_history_into_agent
 
-                    load_history_into_agent(agents[agent_name], history_path)
-                    loaded[agent_name] = history_path
+                    try:
+                        notice = load_history_into_agent(agents[agent_name], history_path)
+                        if notice:
+                            notices.append(notice)
+                        loaded[agent_name] = history_path
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to load session history file",
+                            data={
+                                "session": session.info.name,
+                                "agent": agent_name,
+                                "file": str(history_path),
+                                "error": str(exc),
+                            },
+                        )
                 else:
                     logger.warning(
                         "Session history file missing",
@@ -745,8 +772,21 @@ class SessionManager:
                 if history_path and history_path.exists():
                     from fast_agent.mcp.prompts.prompt_load import load_history_into_agent
 
-                    load_history_into_agent(fallback_agent, history_path)
-                    loaded[fallback_agent.name] = history_path
+                    try:
+                        notice = load_history_into_agent(fallback_agent, history_path)
+                        if notice:
+                            notices.append(notice)
+                        loaded[fallback_agent.name] = history_path
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to load fallback session history file",
+                            data={
+                                "session": session.info.name,
+                                "agent": fallback_agent.name,
+                                "file": str(history_path),
+                                "error": str(exc),
+                            },
+                        )
 
         if missing_agents:
             logger.warning(
@@ -754,7 +794,12 @@ class SessionManager:
                 data={"session": session.info.name, "agents": missing_agents},
             )
 
-        return session, loaded, missing_agents
+        return ResumeSessionAgentsResult(
+            session=session,
+            loaded=loaded,
+            missing_agents=missing_agents,
+            usage_notices=notices,
+        )
 
     def fork_current_session(self, title: str | None = None) -> Session | None:
         """Fork the current or latest session into a new session."""

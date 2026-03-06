@@ -33,6 +33,7 @@ GO_SPECIFIC_OPTIONS = {
     "--results",
     "--servers",
     "--auth",
+    "--client-metadata-url",
     "--name",
     "--config-path",
     "-c",
@@ -48,6 +49,7 @@ GO_SPECIFIC_OPTIONS = {
     "--watch",
     "--reload",
     "--resume",
+    "--smart",
 }
 
 # Known subcommands that should not trigger auto-routing
@@ -55,7 +57,7 @@ KNOWN_SUBCOMMANDS = {
     "go",
     "serve",
     "acp",
-    "setup",
+    "scaffold",
     "check",
     "auth",
     "bootstrap",

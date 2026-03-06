@@ -8,6 +8,8 @@ This class extends LlmDecorator with LLM-specific interaction behaviors includin
 - Chat display integration
 """
 
+import json
+import os
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from a2a.types import AgentCapabilities
@@ -16,12 +18,22 @@ from rich.text import Text
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_decorator import LlmDecorator, ModelT
-from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
+from fast_agent.constants import (
+    ANTHROPIC_CITATIONS_CHANNEL,
+    ANTHROPIC_SERVER_TOOLS_CHANNEL,
+    FAST_AGENT_ERROR_CHANNEL,
+    FAST_AGENT_URL_ELICITATION_CHANNEL,
+)
 from fast_agent.context import Context
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
+from fast_agent.ui.citation_display import (
+    collect_citation_sources,
+    render_sources_additional_text,
+    web_tool_badges,
+)
 from fast_agent.ui.console_display import ConsoleDisplay
 from fast_agent.ui.message_display_helpers import (
     build_tool_use_additional_message,
@@ -33,6 +45,7 @@ from fast_agent.workflow_telemetry import (
 )
 
 if TYPE_CHECKING:
+    from fast_agent.agents.llm_decorator import RemovedContentSummary
     from fast_agent.agents.tool_runner import ToolRunnerHooks
     from fast_agent.ui.streaming import StreamingHandle
 # TODO -- decide what to do with type safety for model/chat_turn()
@@ -101,6 +114,7 @@ class LlmAgent(LlmDecorator):
         additional_message: Optional[Text] = None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool | None = None,
+        render_message: bool = True,
     ) -> None:
         """Display an assistant message with appropriate styling based on stop reason.
 
@@ -113,6 +127,7 @@ class LlmAgent(LlmDecorator):
             model: Optional model name to display
             additional_message: Optional additional message to display
             render_markdown: Force markdown rendering (True) or plain rendering (False)
+            render_message: When False, skip reprinting body text and only show post-turn output
         """
 
         # Determine display content based on stop reason if not provided
@@ -203,6 +218,45 @@ class LlmAgent(LlmDecorator):
                 else Text(str(additional_message))
             )
 
+        message_text = message
+        show_post_turn_metadata = message.stop_reason != LlmStopReason.TOOL_USE
+
+        sources_text = render_sources_additional_text(message) if show_post_turn_metadata else None
+        debug_web = bool(os.environ.get("FAST_AGENT_WEBDEBUG"))
+        if debug_web:
+            channels = message.channels or {}
+            channel_names = sorted(channels.keys()) if isinstance(channels, dict) else []
+            source_count = len(collect_citation_sources(message))
+            print(
+                "[webdebug]"
+                f" agent={self.name}"
+                f" channels={channel_names}"
+                f" server_tool_blocks={len(channels.get(ANTHROPIC_SERVER_TOOLS_CHANNEL, [])) if isinstance(channels, dict) else 0}"
+                f" citation_blocks={len(channels.get(ANTHROPIC_CITATIONS_CHANNEL, [])) if isinstance(channels, dict) else 0}"
+                f" source_count={source_count}"
+                f" show_post_turn_metadata={show_post_turn_metadata}"
+                f" sources_rendered={bool(sources_text)}"
+            )
+        if sources_text is not None:
+            additional_segments.append(sources_text)
+
+        badge_items = web_tool_badges(message) if show_post_turn_metadata else []
+        if debug_web:
+            print(f"[webdebug] agent={self.name} badges={badge_items}")
+        if badge_items:
+            additional_segments.append(
+                Text(f"\n\nWeb activity: {', '.join(badge_items)}", style="bright_cyan")
+            )
+
+            merged_bottom = list(bottom_items or [])
+            for badge in badge_items:
+                if badge not in merged_bottom:
+                    merged_bottom.append(badge)
+            bottom_items = merged_bottom
+            if highlight_items is None:
+                # A3 style only renders bottom metadata when a highlight is provided.
+                highlight_items = badge_items[0]
+
         additional_message_text = None
         if additional_segments:
             combined = Text()
@@ -210,11 +264,14 @@ class LlmAgent(LlmDecorator):
                 combined += segment
             additional_message_text = combined
 
-        message_text = message
-
         # Use provided name/model or fall back to defaults
         display_name = name if name is not None else self.name
         display_model = model if model is not None else (self.llm.model_name if self.llm else None)
+
+        if display_model is not None and self.llm is not None:
+            websocket_indicator = getattr(self.llm, "websocket_turn_indicator", None)
+            if isinstance(websocket_indicator, str) and websocket_indicator:
+                display_model = f"{display_model} {websocket_indicator}"
 
         if message.tool_calls and display_model is not None:
             usage_accumulator = self.usage_accumulator
@@ -244,17 +301,161 @@ class LlmAgent(LlmDecorator):
             if show_hook_indicator is not None
             else getattr(self, "has_after_llm_call_hook", False)
         )
-        await self.display.show_assistant_message(
-            message_text,
-            bottom_items=bottom_items,
-            highlight_index=highlight_index,
-            max_item_length=max_item_length,
-            name=display_name,
-            model=display_model,
-            additional_message=additional_message_text,
-            render_markdown=render_markdown,
-            show_hook_indicator=hook_indicator,
+        if render_message:
+            await self.display.show_assistant_message(
+                message_text,
+                bottom_items=bottom_items,
+                highlight_index=highlight_index,
+                max_item_length=max_item_length,
+                name=display_name,
+                model=display_model,
+                additional_message=additional_message_text,
+                render_markdown=render_markdown,
+                show_hook_indicator=hook_indicator,
+            )
+        else:
+            if additional_message_text is not None:
+                self.display.show_status_message(additional_message_text)
+            self.display.show_mermaid_diagrams_from_message_text(message_text)
+        self._display_url_elicitations_from_history(display_name)
+
+    def _summary_text_for_result(
+        self,
+        message: PromptMessageExtended,
+        summary: "RemovedContentSummary | None",
+    ) -> Text | None:
+        if summary is None or message.stop_reason == LlmStopReason.TOOL_USE:
+            return None
+        return Text(f"\n\n{summary.message}", style="dim red italic")
+
+    def _can_preserve_streamed_final_frame(
+        self,
+        *,
+        message: PromptMessageExtended,
+        summary_text: Text | None,
+        streaming_mode: str,
+        stream_handle: "StreamingHandle",
+    ) -> bool:
+        """Return True when the streamed frame can replace final reprint safely."""
+        if streaming_mode != "markdown":
+            return False
+        if summary_text is not None:
+            return False
+        if message.stop_reason != LlmStopReason.END_TURN:
+            return False
+        if stream_handle.has_scrolled():
+            return False
+
+        display_text = message.all_text() or message.last_text() or ""
+        if not display_text.strip():
+            return False
+        return True
+
+    def _display_url_elicitations_from_history(self, agent_name: str | None) -> None:
+        """Display deferred URL elicitations from the previous tool-result turn."""
+        channels = self._get_previous_user_channels()
+        if not channels:
+            return
+
+        payload_blocks = channels.get(FAST_AGENT_URL_ELICITATION_CHANNEL, [])
+        if not payload_blocks:
+            return
+
+        payload_entries: list[dict[str, object]] = []
+        for block in payload_blocks:
+            raw_text = get_text(block)
+            if not raw_text:
+                continue
+            try:
+                decoded = json.loads(raw_text)
+            except Exception:
+                continue
+
+            if isinstance(decoded, list):
+                payload_entries.extend(item for item in decoded if isinstance(item, dict))
+            elif isinstance(decoded, dict):
+                payload_entries.append(decoded)
+
+        for payload in payload_entries:
+            self._display_single_url_elicitation_payload(payload, agent_name)
+
+    def _get_previous_user_channels(self) -> dict[str, list]:
+        try:
+            history = self.message_history
+            if history and len(history) >= 2:
+                prev = history[-2]
+                if prev and prev.role == "user":
+                    channels = prev.channels or {}
+                    if isinstance(channels, dict):
+                        return channels
+        except Exception:
+            pass
+        return {}
+
+    def _display_single_url_elicitation_payload(
+        self,
+        payload: dict[str, object],
+        agent_name: str | None,
+    ) -> None:
+        from fast_agent.ui import console
+
+        server_name = str(payload.get("server_name", "unknown"))
+        raw_elicitations = payload.get("elicitations")
+        raw_issues = payload.get("issues")
+
+        elicitations = (
+            [item for item in raw_elicitations if isinstance(item, dict)]
+            if isinstance(raw_elicitations, list)
+            else []
         )
+        issues = [str(item) for item in raw_issues] if isinstance(raw_issues, list) else []
+
+        if elicitations:
+            count = len(elicitations)
+            for index, elicitation in enumerate(elicitations, start=1):
+                message = str(elicitation.get("message", "Authorization required."))
+                if count > 1:
+                    message = f"[{index}/{count}] {message}"
+                url = str(elicitation.get("url", ""))
+                elicitation_id = str(elicitation.get("elicitation_id", ""))
+
+                self.display.show_url_elicitation(
+                    message=message,
+                    url=url,
+                    server_name=server_name,
+                    agent_name=agent_name,
+                    elicitation_id=elicitation_id,
+                )
+
+        if issues:
+            if elicitations:
+                console.console.print(
+                    "[yellow]"
+                    f"MCP server {server_name} returned non-compliant URL elicitation payload:"
+                    "[/yellow]"
+                )
+            else:
+                console.console.print(
+                    "[yellow]"
+                    f"MCP server {server_name} returned malformed URL elicitation error.data:"
+                    "[/yellow]"
+                )
+
+            for issue in issues[:3]:
+                console.console.print(f"[dim yellow]  - {issue}[/dim yellow]")
+
+            hidden_issue_count = len(issues) - 3
+            if hidden_issue_count > 0:
+                console.console.print(
+                    f"[dim yellow]  - ... and {hidden_issue_count} more issue(s)[/dim yellow]"
+                )
+
+            if not elicitations:
+                console.console.print(
+                    "[dim yellow]"
+                    "No valid URL elicitations could be extracted from error.data."
+                    "[/dim yellow]"
+                )
 
     def _display_user_messages(
         self,
@@ -377,24 +578,35 @@ class LlmAgent(LlmDecorator):
                     if remove_tool_listener:
                         remove_tool_listener()
 
-                if summary:
-                    summary_text = Text(f"\n\n{summary.message}", style="dim red italic")
+                summary_text = self._summary_text_for_result(result, summary)
 
+                await stream_handle.wait_for_drain()
                 self._maybe_close_streaming_for_tool_calls(result)
+                preserve_streamed_frame = self._can_preserve_streamed_final_frame(
+                    message=result,
+                    summary_text=summary_text,
+                    streaming_mode=streaming_mode,
+                    stream_handle=stream_handle,
+                ) and stream_handle.preserve_final_frame()
                 stream_handle.finalize(result)
                 self._active_stream_handle = None
 
-            await self.show_assistant_message(
-                result,
-                additional_message=summary_text,
-                render_markdown=render_markdown,
-            )
+            if preserve_streamed_frame:
+                await self.show_assistant_message(
+                    result,
+                    additional_message=summary_text,
+                    render_markdown=render_markdown,
+                    render_message=False,
+                )
+            else:
+                await self.show_assistant_message(
+                    result,
+                    additional_message=summary_text,
+                    render_markdown=render_markdown,
+                )
         else:
             result, summary = await self._generate_with_summary(messages, request_params, tools)
-
-            summary_text = (
-                Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
-            )
+            summary_text = self._summary_text_for_result(result, summary)
             await self.show_assistant_message(result, additional_message=summary_text)
 
         return result
@@ -465,6 +677,6 @@ class LlmAgent(LlmDecorator):
         (result, message), summary = await self._structured_with_summary(
             messages, model, request_params
         )
-        summary_text = Text(f"\n\n{summary.message}", style="dim red italic") if summary else None
+        summary_text = self._summary_text_for_result(message, summary)
         await self.show_assistant_message(message=message, additional_message=summary_text)
         return result, message

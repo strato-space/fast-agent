@@ -56,6 +56,27 @@ class McpDisconnectCommand(CommandBase):
 
 
 @dataclass(frozen=True, slots=True)
+class McpReconnectCommand(CommandBase):
+    server_name: str | None
+    error: str | None
+    kind: Literal["mcp_reconnect"] = "mcp_reconnect"
+
+
+McpSessionAction = Literal["jar", "new", "use", "clear", "list"]
+
+
+@dataclass(frozen=True, slots=True)
+class McpSessionCommand(CommandBase):
+    action: McpSessionAction
+    server_identity: str | None
+    session_id: str | None
+    title: str | None
+    clear_all: bool
+    error: str | None
+    kind: Literal["mcp_session"] = "mcp_session"
+
+
+@dataclass(frozen=True, slots=True)
 class ListToolsCommand(CommandBase):
     kind: Literal["list_tools"] = "list_tools"
 
@@ -87,6 +108,20 @@ class SkillsCommand(CommandBase):
     action: str
     argument: str | None
     kind: Literal["skills_command"] = "skills_command"
+
+
+@dataclass(frozen=True, slots=True)
+class CardsCommand(CommandBase):
+    action: str
+    argument: str | None
+    kind: Literal["cards_command"] = "cards_command"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelsCommand(CommandBase):
+    action: str
+    argument: str | None
+    kind: Literal["models_command"] = "models_command"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +184,12 @@ class HistoryReviewCommand(CommandBase):
 class HistoryFixCommand(CommandBase):
     agent: str | None
     kind: Literal["history_fix"] = "history_fix"
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryWebClearCommand(CommandBase):
+    agent: str | None
+    kind: Literal["history_webclear"] = "history_webclear"
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +286,25 @@ class ModelVerbosityCommand(CommandBase):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelWebSearchCommand(CommandBase):
+    value: str | None
+    kind: Literal["model_web_search"] = "model_web_search"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelWebFetchCommand(CommandBase):
+    value: str | None
+    kind: Literal["model_web_fetch"] = "model_web_fetch"
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptCommand(CommandBase):
+    """Represents a Ctrl+C user interrupt captured by the prompt layer."""
+
+    kind: Literal["interrupt"] = "interrupt"
+
+
+@dataclass(frozen=True, slots=True)
 class UnknownCommand(CommandBase):
     command: str
     kind: Literal["unknown_command"] = "unknown_command"
@@ -258,12 +318,16 @@ CommandPayload = (
     | McpListCommand
     | McpConnectCommand
     | McpDisconnectCommand
+    | McpReconnectCommand
+    | McpSessionCommand
     | ListToolsCommand
     | ListPromptsCommand
     | ListSkillsCommand
     | ShowHistoryCommand
     | ClearCommand
     | SkillsCommand
+    | CardsCommand
+    | ModelsCommand
     | SelectPromptCommand
     | SwitchAgentCommand
     | HashAgentCommand
@@ -273,6 +337,7 @@ CommandPayload = (
     | HistoryRewindCommand
     | HistoryReviewCommand
     | HistoryFixCommand
+    | HistoryWebClearCommand
     | LoadAgentCardCommand
     | ReloadAgentsCommand
     | AgentCommand
@@ -287,6 +352,9 @@ CommandPayload = (
     | ShellCommand
     | ModelReasoningCommand
     | ModelVerbosityCommand
+    | ModelWebSearchCommand
+    | ModelWebFetchCommand
+    | InterruptCommand
     | UnknownCommand
 )
 

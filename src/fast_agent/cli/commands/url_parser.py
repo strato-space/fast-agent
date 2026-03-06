@@ -11,6 +11,22 @@ from urllib.parse import urlparse
 from fast_agent.mcp.hf_auth import TokenProvider, add_hf_auth_header
 
 
+def _normalize_auth_token(auth_token: str) -> str:
+    """Normalize ``--auth`` values into the raw token string.
+
+    ``parse_server_urls`` always emits ``Authorization: Bearer <token>``.
+    Accept optional ``Bearer `` input here to avoid generating duplicated
+    prefixes like ``Bearer Bearer <token>``.
+    """
+
+    normalized = auth_token.strip()
+    if normalized.lower().startswith("bearer "):
+        normalized = normalized[7:].strip()
+    if not normalized:
+        raise ValueError("Auth token cannot be empty")
+    return normalized
+
+
 def parse_server_url(
     url: str,
 ) -> tuple[str, Literal["http", "sse"], str]:
@@ -50,14 +66,20 @@ def parse_server_url(
     normalized_path = path.rstrip("/")
     if normalized_path.endswith("/sse"):
         transport_type = "sse"
-    elif not normalized_path.endswith("/mcp"):
-        # If path doesn't end with /mcp or /sse (handling trailing slash), append /mcp once
-        url = f"{url.rstrip('/')}" + "/mcp"
+
+    parsed_url_text = url
+    if (
+        transport_type == "http"
+        and not parsed_url.query
+        and not normalized_path.endswith("/mcp")
+    ):
+        fallback_path = "/mcp" if not normalized_path else f"{normalized_path}/mcp"
+        parsed_url_text = parsed_url._replace(path=fallback_path).geturl()
 
     # Generate a server name based on hostname and port
-    server_name = generate_server_name(url)
+    server_name = generate_server_name(parsed_url_text)
 
-    return server_name, transport_type, url
+    return server_name, transport_type, parsed_url_text
 
 
 def generate_server_name(url: str) -> str:
@@ -111,7 +133,7 @@ def parse_server_urls(
 
     Args:
         urls_param: Comma-separated list of URLs
-        auth_token: Optional bearer token for authorization
+        auth_token: Optional authorization token value (``Bearer `` prefix optional)
         hub_token_provider: Optional callable that returns a HuggingFace token.
             Defaults to using huggingface_hub.get_token(). Pass a custom provider
             for testing.
@@ -131,7 +153,8 @@ def parse_server_urls(
     # Prepare headers if auth token is provided
     headers = None
     if auth_token:
-        headers = {"Authorization": f"Bearer {auth_token}"}
+        normalized_token = _normalize_auth_token(auth_token)
+        headers = {"Authorization": f"Bearer {normalized_token}"}
 
     # Parse each URL
     result = []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -9,10 +10,11 @@ from typing import TYPE_CHECKING, Any, Iterable
 import frontmatter
 import yaml
 
-from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.agents.agent_types import AgentConfig, AgentType, MCPConnectTarget
 from fast_agent.constants import DEFAULT_AGENT_INSTRUCTION, SMART_AGENT_INSTRUCTION
 from fast_agent.core.direct_decorators import _resolve_instruction
 from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.core.tool_input_schema import validate_tool_input_schema
 from fast_agent.skills import SKILLS_DEFAULT
 from fast_agent.types import RequestParams
 
@@ -41,6 +43,7 @@ _AGENT_FIELDS = {
     "tools",
     "resources",
     "prompts",
+    "mcp_connect",
     "skills",
     "model",
     "use_history",
@@ -56,6 +59,7 @@ _AGENT_FIELDS = {
     "tool_hooks",
     "lifecycle_hooks",
     "trim_tool_history",
+    "tool_input_schema",
     "messages",
     "shell",
     "cwd",
@@ -463,6 +467,7 @@ def _build_agent_data(
     path: Path,
 ) -> AgentCardData:
     servers = _ensure_str_list(raw.get("servers", []), "servers", path)
+    mcp_connect = _ensure_mcp_connect_entries(raw.get("mcp_connect"), path)
     tools = _ensure_filter_map(raw.get("tools", {}), "tools", path)
     resources = _ensure_filter_map(raw.get("resources", {}), "resources", path)
     prompts = _ensure_filter_map(raw.get("prompts", {}), "prompts", path)
@@ -482,6 +487,7 @@ def _build_agent_data(
         )
 
     api_key = raw.get("api_key")
+    tool_input_schema = _ensure_tool_input_schema(raw.get("tool_input_schema"), path)
 
     # Parse function_tools - can be a string or list of strings
     function_tools_raw = raw.get("function_tools")
@@ -533,6 +539,7 @@ def _build_agent_data(
         name=name,
         instruction=instruction,
         description=description,
+        tool_input_schema=tool_input_schema,
         servers=servers,
         tools=tools,
         resources=resources,
@@ -550,6 +557,7 @@ def _build_agent_data(
         tool_hooks=tool_hooks,
         lifecycle_hooks=lifecycle_hooks,
         trim_tool_history=trim_tool_history,
+        mcp_connect=mcp_connect,
         source_path=path,
     )
 
@@ -697,6 +705,78 @@ def _ensure_filter_map(value: Any, field: str, path: Path) -> dict[str, list[str
     return result
 
 
+def _ensure_headers_map(value: Any, field: str, path: Path) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise AgentConfigError(f"'{field}' must be a mapping in {path}")
+
+    headers: dict[str, str] = {}
+    for key, header_value in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise AgentConfigError(f"'{field}' keys must be non-empty strings in {path}")
+        if not isinstance(header_value, str):
+            raise AgentConfigError(f"'{field}' values must be strings in {path}")
+        headers[key] = header_value
+    return headers
+
+
+def _ensure_auth_map(value: Any, field: str, path: Path) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise AgentConfigError(f"'{field}' must be a mapping in {path}")
+    return dict(value)
+
+
+def _ensure_mcp_connect_entries(value: Any, path: Path) -> list[MCPConnectTarget]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise AgentConfigError(f"'mcp_connect' must be a list in {path}")
+
+    entries: list[MCPConnectTarget] = []
+    for idx, raw_entry in enumerate(value):
+        if not isinstance(raw_entry, dict):
+            raise AgentConfigError(
+                f"'mcp_connect[{idx}]' must be a mapping in {path}",
+            )
+
+        unknown_keys = set(raw_entry.keys()) - {"target", "name", "headers", "auth"}
+        if unknown_keys:
+            unknown_text = ", ".join(sorted(str(key) for key in unknown_keys))
+            raise AgentConfigError(
+                f"'mcp_connect[{idx}]' has unsupported keys in {path}",
+                f"Unknown keys: {unknown_text}",
+            )
+
+        target_raw = raw_entry.get("target")
+        if not isinstance(target_raw, str) or not target_raw.strip():
+            raise AgentConfigError(
+                f"'mcp_connect[{idx}].target' must be a non-empty string in {path}"
+            )
+
+        name_raw = raw_entry.get("name")
+        if name_raw is not None and (not isinstance(name_raw, str) or not name_raw.strip()):
+            raise AgentConfigError(
+                f"'mcp_connect[{idx}].name' must be a non-empty string in {path}"
+            )
+
+        headers = _ensure_headers_map(raw_entry.get("headers"), f"mcp_connect[{idx}].headers", path)
+        auth = _ensure_auth_map(raw_entry.get("auth"), f"mcp_connect[{idx}].auth", path)
+
+        entries.append(
+            MCPConnectTarget(
+                target=target_raw.strip(),
+                name=name_raw.strip() if isinstance(name_raw, str) else None,
+                headers=headers,
+                auth=auth,
+            )
+        )
+
+    return entries
+
+
 def _ensure_request_params(value: Any, path: Path) -> RequestParams | None:
     if value is None:
         return None
@@ -708,6 +788,25 @@ def _ensure_request_params(value: Any, path: Path) -> RequestParams | None:
         return RequestParams(**value)
     except Exception as exc:  # noqa: BLE001
         raise AgentConfigError(f"Invalid request_params in {path}", str(exc)) from exc
+
+
+def _ensure_tool_input_schema(value: Any, path: Path) -> dict[str, Any] | None:
+    validation = validate_tool_input_schema(value)
+    if validation.errors:
+        details = "; ".join(validation.errors)
+        raise AgentConfigError(
+            f"Invalid 'tool_input_schema' in {path}",
+            details,
+        )
+
+    for warning_message in validation.warnings:
+        warnings.warn(
+            f"{path}: tool_input_schema {warning_message}",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    return validation.normalized
 
 
 def _agents_as_tools_options(raw: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -852,6 +951,9 @@ def _build_card_dump(
     if config.description and "description" in allowed_fields:
         card["description"] = config.description
 
+    if config.tool_input_schema is not None and "tool_input_schema" in allowed_fields:
+        card["tool_input_schema"] = config.tool_input_schema
+
     if config.model and "model" in allowed_fields:
         card["model"] = config.model
 
@@ -868,6 +970,19 @@ def _build_card_dump(
 
     if config.servers and "servers" in allowed_fields:
         card["servers"] = list(config.servers)
+
+    if config.mcp_connect and "mcp_connect" in allowed_fields:
+        serialized_mcp_connect: list[dict[str, Any]] = []
+        for entry in config.mcp_connect:
+            serialized_entry: dict[str, Any] = {"target": entry.target}
+            if entry.name:
+                serialized_entry["name"] = entry.name
+            if entry.headers is not None:
+                serialized_entry["headers"] = dict(entry.headers)
+            if entry.auth is not None:
+                serialized_entry["auth"] = dict(entry.auth)
+            serialized_mcp_connect.append(serialized_entry)
+        card["mcp_connect"] = serialized_mcp_connect
 
     if config.tools and "tools" in allowed_fields:
         card["tools"] = config.tools

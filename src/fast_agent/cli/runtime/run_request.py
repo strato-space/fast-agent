@@ -17,6 +17,7 @@ class UrlServerConfig(TypedDict, total=False):
     transport: str
     url: str
     headers: dict[str, str]
+    auth: dict[str, str | bool]
 
 
 class StdioServerConfig(TypedDict):
@@ -49,6 +50,7 @@ class AgentRunRequest:
     skills_directory: Path | None
     environment_dir: Path | None
     noenv: bool
+    force_smart: bool
     shell_runtime: bool
     mode: Mode
     transport: str
@@ -60,6 +62,8 @@ class AgentRunRequest:
     permissions_enabled: bool
     reload: bool
     watch: bool
+    quiet: bool = False
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None
 
     def __post_init__(self) -> None:
         if self.noenv and self.environment_dir is not None:
@@ -98,6 +102,7 @@ class AgentRunRequest:
             "skills_directory": self.skills_directory,
             "environment_dir": self.environment_dir,
             "noenv": self.noenv,
+            "force_smart": self.force_smart,
             "shell_runtime": self.shell_runtime,
             "mode": self.mode,
             "transport": self.transport,
@@ -109,4 +114,6 @@ class AgentRunRequest:
             "permissions_enabled": self.permissions_enabled,
             "reload": self.reload,
             "watch": self.watch,
+            "quiet": self.quiet,
+            "missing_shell_cwd_policy": self.missing_shell_cwd_policy,
         }

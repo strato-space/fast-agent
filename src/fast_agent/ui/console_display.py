@@ -24,6 +24,7 @@ from fast_agent.ui.mermaid_utils import (
 from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
 from fast_agent.ui.message_styles import MessageStyle, resolve_message_style
 from fast_agent.ui.model_display import format_model_display
+from fast_agent.ui.shell_output_truncation import format_shell_output_line_count
 from fast_agent.ui.streaming import (
     NullStreamingHandle as _NullStreamingHandle,
 )
@@ -73,9 +74,7 @@ class ConsoleDisplay:
                 pass
         self._markup = getattr(self._logger_settings, "enable_markup", True)
         self._escape_xml = True
-        self._style = resolve_message_style(
-            getattr(self._logger_settings, "message_style", "a3")
-        )
+        self._style = resolve_message_style(getattr(self._logger_settings, "message_style", "a3"))
         self._tool_display = ToolDisplay(self)
 
     @staticmethod
@@ -85,12 +84,7 @@ class ConsoleDisplay:
         return logger_settings if logger_settings is not None else LoggerSettings()
 
     def _truncate_text(self, text: str, *, truncate: bool) -> str:
-        if (
-            truncate
-            and self.config
-            and self.config.logger.truncate_tools
-            and len(text) > 360
-        ):
+        if truncate and self.config and self.config.logger.truncate_tools and len(text) > 360:
             return text[:360] + "..."
         return text
 
@@ -142,9 +136,7 @@ class ConsoleDisplay:
             streaming_mode = "markdown"
 
         # Legacy compatibility: allow streaming_plain_text override
-        if streaming_mode == "markdown" and getattr(
-            logger_settings, "streaming_plain_text", False
-        ):
+        if streaming_mode == "markdown" and getattr(logger_settings, "streaming_plain_text", False):
             streaming_mode = "plain"
 
         show_chat = bool(getattr(logger_settings, "show_chat", True))
@@ -206,9 +198,33 @@ class ConsoleDisplay:
             return f"{elapsed:.1f}s"
         return format_duration(elapsed)
 
-    def show_shell_exit_code(self, exit_code: int) -> None:
+    def show_shell_exit_code(
+        self,
+        exit_code: int,
+        *,
+        no_output: bool = False,
+        output_line_count: int | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
         """Display a shell-style exit code banner."""
-        line = self._style.shell_exit_line(exit_code, console.console.size.width)
+        detail_parts: list[str] = []
+        if output_line_count is not None and output_line_count > 0:
+            detail_parts.append(format_shell_output_line_count(output_line_count))
+
+        if no_output:
+            detail_parts.append("(no output)")
+
+        formatted_id = ToolDisplay._format_tool_call_id(tool_call_id)
+        if formatted_id:
+            detail_parts.append(f"id: {formatted_id}")
+
+        detail = f" {' '.join(detail_parts)}" if detail_parts else None
+
+        line = self._style.shell_exit_line(
+            exit_code,
+            console.console.size.width,
+            detail,
+        )
         console.console.print()
         console.console.print(line)
         for _ in range(self._style.shell_exit_spacing_after):
@@ -713,7 +729,9 @@ class ConsoleDisplay:
         pre_content: Text | Group | None = None
 
         if isinstance(message_text, PromptMessageExtended):
-            display_text = message_text.last_text() or ""
+            # Prefer full assistant text so streamed/finalized multi-block responses
+            # (e.g., provider-side web tool turns) are preserved after live refresh.
+            display_text = message_text.all_text() or message_text.last_text() or ""
             pre_content = self._extract_reasoning_content(message_text)
         else:
             display_text = message_text
@@ -739,15 +757,26 @@ class ConsoleDisplay:
         )
 
         # Handle mermaid diagrams separately (after the main message)
-        # Extract plain text for mermaid detection
-        plain_text = display_text
-        if isinstance(display_text, Text):
-            plain_text = display_text.plain
+        self.show_mermaid_diagrams_from_message_text(message_text)
 
-        if isinstance(plain_text, str):
-            diagrams = extract_mermaid_diagrams(plain_text)
-            if diagrams:
-                self._display_mermaid_diagrams(diagrams)
+    def show_mermaid_diagrams_from_message_text(
+        self,
+        message_text: Union[str, Text, "PromptMessageExtended"],
+    ) -> None:
+        """Display mermaid links extracted from assistant text payload."""
+        from fast_agent.types import PromptMessageExtended
+
+        plain_text = ""
+        if isinstance(message_text, PromptMessageExtended):
+            plain_text = message_text.all_text() or message_text.last_text() or ""
+        elif isinstance(message_text, Text):
+            plain_text = message_text.plain
+        elif isinstance(message_text, str):
+            plain_text = message_text
+
+        diagrams = extract_mermaid_diagrams(plain_text)
+        if diagrams:
+            self._display_mermaid_diagrams(diagrams)
 
     @contextmanager
     def streaming_assistant_message(
@@ -855,7 +884,12 @@ class ConsoleDisplay:
         console.console.print(content, markup=self._markup)
 
     def show_url_elicitation(
-        self, message: str, url: str, server_name: str, agent_name: str | None = None
+        self,
+        message: str,
+        url: str,
+        server_name: str,
+        agent_name: str | None = None,
+        elicitation_id: str | None = None,
     ) -> None:
         """Display URL elicitation request with clickable link.
 
@@ -867,6 +901,7 @@ class ConsoleDisplay:
             url: The URL the server wants the user to navigate to
             server_name: Name of the MCP server making the request
             agent_name: Optional name of the agent (for future use)
+            elicitation_id: Optional URL elicitation ID
         """
         if self.config and not self.config.logger.show_chat:
             return
@@ -877,15 +912,29 @@ class ConsoleDisplay:
         parsed = urlparse(url)
         domain = parsed.netloc or url  # Fallback to full URL if no domain
 
-        # Line 1: bullet + type + [server] + message (all inline)
+        console.console.print()
+
+        # Line 1: prominent requirement indicator
         header = Text()
-        header.append("● ", style="dim")
-        header.append("url-elicitation ", style="dim")
-        header.append(f"[{server_name}] ", style="cyan")
-        header.append(message, style="default")
+        header.append("● ", style="bright_yellow bold")
+        header.append("URL elicitation required", style="bright_yellow bold")
         console.console.print(header, markup=self._markup)
 
-        # Line 2: domain (highlighted) + full URL (dim)
+        # Line 2: server + message
+        message_line = Text()
+        message_line.append("  ", style="dim")
+        message_line.append(f"[{server_name}] ", style="cyan bold")
+        message_line.append(message, style="bold")
+        console.console.print(message_line, markup=self._markup)
+
+        # Line 3: elicitation ID (if present)
+        if elicitation_id:
+            id_line = Text()
+            id_line.append("  ", style="dim")
+            id_line.append(f"elicitationId: {elicitation_id}", style="dim")
+            console.console.print(id_line, markup=self._markup)
+
+        # Line 4: domain (highlighted) + full URL (dim)
         url_line = Text()
         url_line.append("  ", style="dim")
         url_line.append(domain, style="yellow bold")
@@ -893,7 +942,7 @@ class ConsoleDisplay:
         url_line.append(url, style="dim")
         console.console.print(url_line, markup=self._markup)
 
-        # Line 3: clickable link
+        # Line 5: clickable link
         link_line = Text()
         link_line.append("  ", style="dim")
         link_line.append("Open URL", style=f"bright_blue link {url}")

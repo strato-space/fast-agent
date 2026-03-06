@@ -1,0 +1,6 @@
+# fast-agent runtime artifacts
+sessions/
+ui/
+auths.md
+*.jsonl
+mcp-cookie.json
