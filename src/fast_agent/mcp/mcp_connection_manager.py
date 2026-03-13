@@ -588,16 +588,16 @@ async def _server_lifecycle_task(server_conn: ServerConnection) -> None:
 def _is_oauth_timeout_message(message: str | None) -> bool:
     if not message:
         return False
-    normalized = message.lower()
-    if "oauth" not in normalized:
-        return False
+    normalized = " ".join(str(message).lower().split())
 
-    timeout_markers = (
-        "timed out",
-        "timeout",
-        "not completed in time",
+    oauth_timeout_phrases = (
+        "oauth authorization timed out",
+        "oauth authorization was not completed in time",
+        "oauth callback timeout",
+        "oauth callback timed out",
+        "oauth flow timed out",
     )
-    return any(marker in normalized for marker in timeout_markers)
+    return any(phrase in normalized for phrase in oauth_timeout_phrases)
 
 
 def _is_oauth_registration_404_message(message: str | None) -> bool:

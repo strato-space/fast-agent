@@ -267,6 +267,15 @@ def test_is_oauth_timeout_message_requires_real_timeout_markers() -> None:
         is False
     )
 
+    # Guard against traceback text that mentions oauth variable names and timeout kwargs
+    # without any real OAuth timeout happening.
+    assert (
+        _is_oauth_timeout_message(
+            "ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. auth=oauth_auth timeout=10"
+        )
+        is False
+    )
+
 
 def test_is_oauth_registration_404_message_detects_registration_failures() -> None:
     assert (
