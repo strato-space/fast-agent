@@ -1673,6 +1673,15 @@ class AgentACPServer(ACPAgent):
             return None
         return extract_session_title(cast("Mapping[str, object]", metadata))
 
+    @staticmethod
+    def _extract_session_cwd(metadata: object) -> str | None:
+        if not isinstance(metadata, Mapping):
+            return None
+        cwd = cast("Mapping[str, object]", metadata).get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+        return None
+
     def _build_history_updates(
         self,
         history: Sequence[PromptMessageExtended],
@@ -1758,14 +1767,15 @@ class AgentACPServer(ACPAgent):
     ) -> ListSessionsResponse:
         """List saved sessions for the current environment."""
         _ = kwargs
-        request_cwd = self._resolve_request_cwd(
-            cwd=cwd,
-            request_name="session/list",
-            warn_if_missing=False,
-        )
-        manager_cwd = Path(request_cwd).expanduser().resolve()
-        manager = get_session_manager(cwd=manager_cwd)
+        filter_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
+        manager = get_session_manager()
         sessions = manager.list_sessions()
+        if filter_cwd is not None:
+            sessions = [
+                session_info
+                for session_info in sessions
+                if self._extract_session_cwd(session_info.metadata) == filter_cwd
+            ]
 
         start_index = 0
         if cursor:
@@ -1789,10 +1799,11 @@ class AgentACPServer(ACPAgent):
             page = sessions[start_index:]
             next_cursor = None
 
-        session_cwd = manager_cwd
+        legacy_cwd = str(manager.base_dir.parent.parent.resolve())
         acp_sessions = []
         for session_info in page:
             title = self._extract_session_title(session_info.metadata)
+            session_cwd = self._extract_session_cwd(session_info.metadata) or legacy_cwd
             acp_sessions.append(
                 AcpSessionInfo(
                     session_id=session_info.name,
@@ -1827,13 +1838,43 @@ class AgentACPServer(ACPAgent):
         async with self._session_lock:
             existing_session = session_id in self._session_state
 
+        manager = get_session_manager()
+        persisted_session = manager.load_session(session_id)
+        if not persisted_session:
+            logger.error(
+                "Session not found for load_session",
+                name="acp_load_session_not_found",
+                session_id=session_id,
+            )
+            raise RequestError(
+                -32002,
+                f"Session not found: {session_id}",
+                {
+                    "uri": session_id,
+                    "reason": "Session not found",
+                    "details": (
+                        f"Session {session_id} could not be resolved from {request_cwd}"
+                    ),
+                },
+            )
+
+        persisted_cwd = self._extract_session_cwd(persisted_session.info.metadata)
+        effective_cwd = persisted_cwd or request_cwd
+        if persisted_cwd and persisted_cwd != request_cwd:
+            logger.info(
+                "ACP load session using persisted session cwd",
+                name="acp_load_session_cwd_restored",
+                session_id=session_id,
+                requested_cwd=request_cwd,
+                session_cwd=persisted_cwd,
+            )
+
         session_state, session_modes = await self._initialize_session_state(
             session_id,
-            cwd=request_cwd,
+            cwd=effective_cwd,
             mcp_servers=mcp_servers or [],
         )
 
-        manager = get_session_manager(cwd=Path(request_cwd).expanduser().resolve())
         fallback_agent_name = self._resolve_session_fallback_agent_name(session_state.instance)
         result = manager.resume_session_agents(
             session_state.instance.agents,
@@ -1841,11 +1882,6 @@ class AgentACPServer(ACPAgent):
             fallback_agent_name=fallback_agent_name,
         )
         if not result:
-            logger.error(
-                "Session not found for load_session",
-                name="acp_load_session_not_found",
-                session_id=session_id,
-            )
             if not existing_session:
                 async with self._session_lock:
                     self.sessions.pop(session_id, None)

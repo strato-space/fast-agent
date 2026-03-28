@@ -57,13 +57,15 @@ async def save_session_history(ctx: "HookContext") -> None:
         if raw_session_cwd:
             session_cwd = Path(str(raw_session_cwd)).expanduser().resolve()
 
-    manager = get_session_manager(cwd=session_cwd)
+    manager = get_session_manager()
     session = manager.current_session
     if session is None:
         metadata: dict[str, object] = {"agent_name": ctx.agent_name}
         model_name = getattr(agent_config, "model", None) if agent_config else None
         if model_name:
             metadata["model"] = model_name
+        if session_cwd is not None:
+            metadata["cwd"] = str(session_cwd)
         if acp_session_id:
             manager.create_session_with_id(str(acp_session_id), metadata=metadata)
         else:
@@ -77,6 +79,11 @@ async def save_session_history(ctx: "HookContext") -> None:
         ):
             session.info.metadata["acp_session_id"] = acp_session_id
             session._save_metadata()
+        if session is not None and session_cwd is not None:
+            session_cwd_value = str(session_cwd)
+            if session.info.metadata.get("cwd") != session_cwd_value:
+                session.info.metadata["cwd"] = session_cwd_value
+                session._save_metadata()
 
     previous_title = extract_session_title(session.info.metadata) if session else None
 

@@ -90,7 +90,7 @@ async def test_acp_prompt_saves_session_history(
 
 
 @pytest.mark.integration
-async def test_acp_prompt_saves_session_history_under_request_cwd(
+async def test_acp_prompt_saves_session_history_in_app_store_with_session_cwd_metadata(
     tmp_path: Path,
 ) -> None:
     server_cwd = tmp_path / "server"
@@ -130,10 +130,13 @@ async def test_acp_prompt_saves_session_history_under_request_cwd(
             prompt=[text_block("persist under request cwd")],
         )
         await _wait_for_session_info_update(client, session_response.session_id)
+        listed = await connection.list_sessions(cwd=str(session_cwd))
 
-    session_dir = session_cwd / ".fast-agent" / "sessions" / session_response.session_id
+    session_dir = server_cwd / ".fast-agent" / "sessions" / session_response.session_id
     assert session_dir.exists()
-    assert (session_dir / "session.json").exists()
+    metadata = json.loads((session_dir / "session.json").read_text())
+    assert metadata["metadata"]["cwd"] == str(session_cwd.resolve())
+    assert any(info.session_id == session_response.session_id for info in listed.sessions)
 
 
 @pytest.mark.integration
@@ -290,7 +293,9 @@ async def test_acp_session_list_returns_saved_sessions(
     session = None
     try:
         manager = get_session_manager()
-        session = manager.create_session(metadata={"title": "ACP list test"})
+        session = manager.create_session(
+            metadata={"title": "ACP list test", "cwd": str(tmp_path.resolve())}
+        )
     finally:
         session_manager_module._session_manager = None
         os.chdir(original_cwd)

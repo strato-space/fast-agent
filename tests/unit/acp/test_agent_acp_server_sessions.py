@@ -74,10 +74,14 @@ async def test_load_session_falls_back_when_primary_agent_was_removed(
 
     resume_calls: list[str | None] = []
 
-    def fake_get_session_manager(*, cwd: Any) -> Any:
+    def fake_get_session_manager(*, cwd: Any = None) -> Any:
         del cwd
 
         class _Manager:
+            def load_session(self, name: str) -> Any:
+                del name
+                return SimpleNamespace(info=SimpleNamespace(metadata={}))
+
             def resume_session_agents(
                 self,
                 agents: Any,
