@@ -227,6 +227,7 @@ class ACPSessionState:
 
     session_id: str
     instance: AgentInstance
+    session_cwd: str | None = None
     current_agent_name: str | None = None
     progress_manager: ACPToolProgressManager | None = None
     permission_handler: ACPToolPermissionAdapter | None = None
@@ -1364,6 +1365,8 @@ class AgentACPServer(ACPAgent):
                 session_state = ACPSessionState(session_id=session_id, instance=instance)
                 self._session_state[session_id] = session_state
 
+            session_state.session_cwd = cwd
+
             # Serialize prompts per session
             if session_id not in self._prompt_locks:
                 self._prompt_locks[session_id] = asyncio.Lock()
@@ -1592,11 +1595,14 @@ class AgentACPServer(ACPAgent):
                 acp_context = ACPContext(
                     connection=self._connection,
                     session_id=session_id,
+                    session_cwd=cwd,
                     client_capabilities=self._parsed_client_capabilities,
                     client_info=self._parsed_client_info,
                     protocol_version=self._protocol_version,
                 )
                 session_state.acp_context = acp_context
+            else:
+                acp_context.set_session_cwd(cwd)
 
             # Store references to runtimes and handlers in ACPContext
             if session_state.terminal_runtime:
@@ -2129,23 +2135,6 @@ class AgentACPServer(ACPAgent):
                 self._prompt_locks[session_id] = lock
             return lock
 
-    async def _send_prompt_user_updates(
-        self,
-        *,
-        session_id: str,
-        prompt: Sequence[ACPContentBlock],
-        message_id: str | None,
-    ) -> None:
-        """Acknowledge the accepted user turn through session updates."""
-        if not self._connection:
-            return
-
-        for block in prompt:
-            update = update_user_message(block)
-            if message_id:
-                update.message_id = message_id
-            await self._connection.session_update(session_id=session_id, update=update)
-
     async def _prompt_locked(
         self,
         prompt: list[ACPContentBlock],
@@ -2200,20 +2189,6 @@ class AgentACPServer(ACPAgent):
 
             # Inline resource URIs for slash commands (e.g., /card @file.txt)
             processed_prompt = inline_resources_for_slash_command(prompt)
-
-            if self._connection and processed_prompt:
-                try:
-                    await self._send_prompt_user_updates(
-                        session_id=session_id,
-                        prompt=processed_prompt,
-                        message_id=message_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error sending prompt acknowledgement update: {e}",
-                        name="acp_prompt_ack_update_error",
-                        exc_info=True,
-                    )
 
             # Convert ACP content blocks to MCP format
             mcp_content_blocks = convert_acp_prompt_to_mcp_content_blocks(processed_prompt)

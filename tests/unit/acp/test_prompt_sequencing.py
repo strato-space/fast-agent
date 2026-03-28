@@ -187,7 +187,7 @@ async def test_cancelled_prompt_does_not_poison_next_acp_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_message_id_is_acknowledged_in_response_and_updates() -> None:
+async def test_prompt_message_id_is_acknowledged_in_response_without_user_echo() -> None:
     started = asyncio.Event()
     proceed = asyncio.Event()
     proceed.set()
@@ -227,12 +227,7 @@ async def test_prompt_message_id_is_acknowledged_in_response_and_updates() -> No
     assert response.stop_reason == "end_turn"
     assert response.user_message_id == message_id
 
-    assert len(connection.notifications) == 2
-    user_update = connection.notifications[0]["update"]
-    assert user_update.session_update == "user_message_chunk"
-    assert user_update.message_id == message_id
-    assert user_update.content.text == "p1"
-
-    agent_update = connection.notifications[1]["update"]
+    assert len(connection.notifications) == 1
+    agent_update = connection.notifications[0]["update"]
     assert agent_update.session_update == "agent_message_chunk"
     assert agent_update.content.text == "first"

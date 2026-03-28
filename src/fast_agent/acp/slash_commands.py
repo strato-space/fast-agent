@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Awaitable,
@@ -538,7 +539,9 @@ class SlashCommandHandler:
             return
         from fast_agent.session import extract_session_title, get_session_manager
 
-        manager = get_session_manager()
+        session_cwd = self._acp_context.session_cwd
+        manager_cwd = Path(session_cwd).expanduser().resolve() if session_cwd else None
+        manager = get_session_manager(cwd=manager_cwd)
         session = manager.current_session
         if session is None:
             return

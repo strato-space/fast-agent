@@ -90,6 +90,53 @@ async def test_acp_prompt_saves_session_history(
 
 
 @pytest.mark.integration
+async def test_acp_prompt_saves_session_history_under_request_cwd(
+    tmp_path: Path,
+) -> None:
+    server_cwd = tmp_path / "server"
+    session_cwd = tmp_path / "workspace"
+    server_cwd.mkdir()
+    session_cwd.mkdir()
+
+    config_path = TEST_DIR / "fastagent.config.yaml"
+    cmd = [
+        sys.executable,
+        "-m",
+        "fast_agent.cli",
+        "serve",
+        "--config-path",
+        str(config_path),
+        "--transport",
+        "acp",
+        "--model",
+        "passthrough",
+        "--name",
+        "fast-agent-acp-session-cwd-test",
+    ]
+
+    client = TestClient()
+    async with spawn_agent_process(
+        lambda _: client,
+        *cmd,
+        cwd=server_cwd,
+    ) as (connection, _process):
+        await _initialize_connection(connection)
+        session_response = await connection.new_session(
+            mcp_servers=[],
+            cwd=str(session_cwd),
+        )
+        await connection.prompt(
+            session_id=session_response.session_id,
+            prompt=[text_block("persist under request cwd")],
+        )
+        await _wait_for_session_info_update(client, session_response.session_id)
+
+    session_dir = session_cwd / ".fast-agent" / "sessions" / session_response.session_id
+    assert session_dir.exists()
+    assert (session_dir / "session.json").exists()
+
+
+@pytest.mark.integration
 async def test_acp_session_title_command_emits_info_update(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -115,6 +115,7 @@ class ACPContext:
         connection: "AgentSideConnection",
         session_id: str,
         *,
+        session_cwd: str | None = None,
         client_capabilities: ClientCapabilities | None = None,
         client_info: ClientInfo | None = None,
         protocol_version: int | None = None,
@@ -125,12 +126,14 @@ class ACPContext:
         Args:
             connection: The ACP connection for sending requests/notifications
             session_id: The ACP session ID
+            session_cwd: The session-associated working directory, if known
             client_capabilities: Client capabilities from initialization
             client_info: Client information from initialization
             protocol_version: ACP protocol version
         """
         self._connection = connection
         self._session_id = session_id
+        self._session_cwd = session_cwd
         self._client_capabilities = client_capabilities or ClientCapabilities()
         self._client_info = client_info or ClientInfo()
         self._protocol_version = protocol_version
@@ -172,6 +175,11 @@ class ACPContext:
     def session_id(self) -> str:
         """Get the ACP session ID."""
         return self._session_id
+
+    @property
+    def session_cwd(self) -> str | None:
+        """Get the session-associated working directory, if known."""
+        return self._session_cwd
 
     @property
     def connection(self) -> "AgentSideConnection":
@@ -330,6 +338,10 @@ class ACPContext:
     def set_filesystem_runtime(self, runtime: "ACPFilesystemRuntime") -> None:
         """Set the filesystem runtime (called by server)."""
         self._filesystem_runtime = runtime
+
+    def set_session_cwd(self, cwd: str | None) -> None:
+        """Set the session-associated working directory (called by server)."""
+        self._session_cwd = cwd
 
     # =========================================================================
     # Properties - Handlers

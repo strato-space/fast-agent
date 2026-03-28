@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from fast_agent.context import get_current_context
@@ -42,16 +43,21 @@ async def save_session_history(ctx: "HookContext") -> None:
     if not ctx.message_history:
         return
 
-    manager = get_session_manager()
     history_agent = _SessionHistoryAgentProxy(
         agent=cast("AgentProtocol", ctx.agent),
         message_history=ctx.message_history,
     )
     acp_session_id = None
+    session_cwd: Path | None = None
     agent_context = getattr(ctx.agent, "context", None)
     acp_context = getattr(agent_context, "acp", None) if agent_context else None
     if acp_context is not None:
         acp_session_id = getattr(acp_context, "session_id", None)
+        raw_session_cwd = getattr(acp_context, "session_cwd", None)
+        if raw_session_cwd:
+            session_cwd = Path(str(raw_session_cwd)).expanduser().resolve()
+
+    manager = get_session_manager(cwd=session_cwd)
     session = manager.current_session
     if session is None:
         metadata: dict[str, object] = {"agent_name": ctx.agent_name}
