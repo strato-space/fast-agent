@@ -28,6 +28,7 @@ from fast_agent.constants import (
 )
 from fast_agent.context import Context
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.history.tool_activities import display_remote_tool_activities
 from fast_agent.llm.model_display_name import resolve_llm_display_name
 from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended, RequestParams
@@ -177,6 +178,7 @@ class LlmAgent(LlmDecorator):
         hook_indicator = self._resolve_assistant_hook_indicator(show_hook_indicator)
         message_text = message
         if render_message:
+            display_remote_tool_activities(self.display, message, name=display_name)
             await self.display.show_assistant_message(
                 message_text,
                 bottom_items=bottom_items,

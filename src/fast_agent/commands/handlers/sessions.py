@@ -74,6 +74,15 @@ def _find_last_assistant_text(history: list[PromptMessageExtended]) -> str | Non
     return find_last_assistant_preview_text(history)
 
 
+def _strip_wrapping_quotes(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text or None
+
+
 def _build_session_entries(entries: list[SessionEntrySummary], *, usage: str) -> Text:
     content = Text()
     content.append_text(Text("Sessions:", style="bold"))
@@ -137,6 +146,7 @@ async def handle_create_session(
     from fast_agent.session import get_session_manager
 
     manager = get_session_manager()
+    session_name = _strip_wrapping_quotes(session_name)
     session = manager.create_session(session_name)
     label = session.info.metadata.get("title") or session.info.name
     outcome.add_message(f"Created session: {label}", channel="info", right_info="session")
@@ -411,6 +421,7 @@ async def handle_title_session(
         return _noenv_outcome()
 
     outcome = CommandOutcome()
+    title = _strip_wrapping_quotes(title)
     if not title:
         outcome.add_message("Usage: /session title <text>", channel="error")
         return outcome
@@ -442,6 +453,7 @@ async def handle_fork_session(
     from fast_agent.session import get_session_manager
 
     manager = get_session_manager()
+    title = _strip_wrapping_quotes(title)
     forked = manager.fork_current_session(title=title)
     if forked is None:
         outcome.add_message("No session available to fork.", channel="warning", right_info="session")

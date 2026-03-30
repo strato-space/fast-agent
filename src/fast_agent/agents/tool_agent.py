@@ -1,8 +1,9 @@
 import asyncio
+import json
 import time
 from contextvars import ContextVar
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
 from fastmcp.tools import FunctionTool, ToolResult
 from mcp.types import CallToolResult, ListToolsResult, Tool
@@ -12,6 +13,7 @@ from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.agents.tool_runner import ToolRunner, ToolRunnerHooks, _ToolLoopAgent
 from fast_agent.constants import (
     FAST_AGENT_ERROR_CHANNEL,
+    FAST_AGENT_TOOL_METADATA,
     HUMAN_INPUT_TOOL_NAME,
     should_parallelize_tool_calls,
 )
@@ -165,6 +167,23 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 inputSchema=tool.parameters,
             )
         )
+
+    def _tool_display_metadata(self, tool_name: str) -> dict[str, Any] | None:
+        tool = self._execution_tools.get(tool_name)
+        if tool is None or not isinstance(tool.meta, Mapping):
+            return None
+        metadata = dict(tool.meta)
+        return metadata or None
+
+    @staticmethod
+    def _jsonable_tool_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not metadata:
+            return None
+        try:
+            json.dumps(metadata)
+        except TypeError:
+            return None
+        return dict(metadata)
 
     @property
     def has_external_hooks(self) -> bool:
@@ -509,6 +528,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
 
         tool_results: dict[str, CallToolResult] = {}
         tool_timings: dict[str, ToolTimingInfo] = {}
+        tool_metadata: dict[str, dict[str, Any]] = {}
         tool_loop_error: str | None = None
         tool_schemas = (await self.list_tools()).tools
         available_tools = [t.name for t in tool_schemas]
@@ -549,6 +569,9 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         if should_parallel and planned_calls:
             for correlation_id, tool_name, tool_args in planned_calls:
                 highlight_index = resolve_highlight_index(available_tools, tool_name)
+                metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+                if metadata:
+                    tool_metadata[correlation_id] = metadata
 
                 self.display.show_tool_call(
                     name=self.name,
@@ -557,6 +580,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                     tool_name=tool_name,
                     highlight_index=highlight_index,
                     max_item_length=12,
+                    metadata=metadata,
                     tool_call_id=correlation_id,
                     show_hook_indicator=self.has_before_tool_call_hook,
                 )
@@ -599,12 +623,18 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 )
 
             return self._finalize_tool_results(
-                tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+                tool_results,
+                tool_timings=tool_timings,
+                tool_metadata=tool_metadata,
+                tool_loop_error=tool_loop_error,
             )
 
         for correlation_id, tool_name, tool_args in planned_calls:
             # Find the index of the current tool in available_tools for highlighting
             highlight_index = resolve_highlight_index(available_tools, tool_name)
+            metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+            if metadata:
+                tool_metadata[correlation_id] = metadata
 
             self.display.show_tool_call(
                 name=self.name,
@@ -613,6 +643,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 tool_name=tool_name,
                 highlight_index=highlight_index,
                 max_item_length=12,
+                metadata=metadata,
                 show_hook_indicator=self.has_before_tool_call_hook,
             )
 
@@ -639,7 +670,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             )
 
         return self._finalize_tool_results(
-            tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+            tool_loop_error=tool_loop_error,
         )
 
     def _mark_tool_loop_error(
@@ -668,10 +702,9 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         tool_results: dict[str, CallToolResult],
         *,
         tool_timings: dict[str, ToolTimingInfo] | None = None,
+        tool_metadata: dict[str, dict[str, Any]] | None = None,
         tool_loop_error: str | None = None,
     ) -> PromptMessageExtended:
-        import json
-
         from mcp.types import TextContent
 
         from fast_agent.constants import (
@@ -694,6 +727,13 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 channels = {}
             channels[FAST_AGENT_TOOL_TIMING] = [
                 TextContent(type="text", text=json.dumps(tool_timings))
+            ]
+
+        if tool_metadata:
+            if channels is None:
+                channels = {}
+            channels[FAST_AGENT_TOOL_METADATA] = [
+                TextContent(type="text", text=json.dumps(tool_metadata))
             ]
 
         deferred_url_elicitations: list[dict[str, object]] = []

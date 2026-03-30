@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 MARKDOWN_STREAM_TARGET_RATIO = 0.93
-MARKDOWN_STREAM_REFRESH_PER_SECOND = 8
+MARKDOWN_STREAM_REFRESH_PER_SECOND = 16
 MARKDOWN_STREAM_PRE_SCROLL_THROTTLE_RATIO = 0.7
 STREAM_RENDER_WIDTH_GUTTER = 1
 # Keep only a small anti-flicker pad now that scroll-indicator churn is debounced.
@@ -72,6 +72,7 @@ STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS = _resolve_progress_resume_debounce_seco
 def _alt_screen_streaming_enabled() -> bool:
     raw_value = os.getenv("FAST_AGENT_STREAM_ALT_SCREEN", "").strip().lower()
     return raw_value in {"1", "true", "yes", "on"}
+
 
 _FENCE_OPEN_LINE_RE = re.compile(r"^\s{0,3}(?P<delim>`{3,}|~{3,})(?P<info>.*)$")
 
@@ -279,11 +280,7 @@ class _DiffLive(RenderHook):
         if first_diff == len(old_lines) and len(lines) > len(old_lines):
             self._write_appended_lines(lines[first_diff:])
             return
-        if (
-            old_lines
-            and len(lines) > len(old_lines)
-            and first_diff == len(old_lines) - 1
-        ):
+        if old_lines and len(lines) > len(old_lines) and first_diff == len(old_lines) - 1:
             self._rewrite_growing_last_line(old_lines[-1], lines[first_diff:])
             return
 
@@ -1047,7 +1044,9 @@ class StreamingMessageHandle:
                         )
                         renderables.append(markdown)
                     else:
-                        renderables.append(Text(f"{segment.text}{cursor_suffix}", style="dim italic"))
+                        renderables.append(
+                            Text(f"{segment.text}{cursor_suffix}", style="dim italic")
+                        )
                 else:
                     if segment.kind == "tool":
                         header_text = (
@@ -1187,11 +1186,7 @@ class StreamingMessageHandle:
 
         merged: list["StreamSegment"] = []
         for segment in segments:
-            if (
-                merged
-                and segment.kind == "markdown"
-                and merged[-1].kind == "markdown"
-            ):
+            if merged and segment.kind == "markdown" and merged[-1].kind == "markdown":
                 merged[-1] = merged[-1].copy_with_text(merged[-1].text + segment.text)
                 continue
             merged.append(segment)

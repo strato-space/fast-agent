@@ -398,6 +398,72 @@ async def test_get_server_formats_stdio_missing_cwd_without_traceback(
     assert "Traceback" not in details
 
 
+@pytest.mark.asyncio
+async def test_connection_manager_exit_skips_grace_sleep_without_running_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTaskGroup:
+        def __init__(self) -> None:
+            self.exited = False
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+            self.exited = True
+
+    manager = MCPConnectionManager(server_registry=cast("Any", _DummyRegistry()))
+    fake_task_group = _FakeTaskGroup()
+    manager._task_group_active = True
+    manager._task_group = fake_task_group
+    manager._tg = fake_task_group
+
+    async def _fake_disconnect_all() -> bool:
+        return False
+
+    async def _unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("shutdown grace sleep should be skipped")
+
+    manager.disconnect_all = _fake_disconnect_all  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _unexpected_sleep)
+
+    await manager.__aexit__(None, None, None)
+
+    assert fake_task_group.exited is True
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_exit_waits_briefly_after_requesting_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTaskGroup:
+        def __init__(self) -> None:
+            self.exited = False
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+            self.exited = True
+
+    manager = MCPConnectionManager(server_registry=cast("Any", _DummyRegistry()))
+    fake_task_group = _FakeTaskGroup()
+    manager._task_group_active = True
+    manager._task_group = fake_task_group
+    manager._tg = fake_task_group
+    sleep_calls: list[float] = []
+
+    async def _fake_disconnect_all() -> bool:
+        return True
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    manager.disconnect_all = _fake_disconnect_all  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    await manager.__aexit__(None, None, None)
+
+    assert sleep_calls == [0.5]
+    assert fake_task_group.exited is True
+
+
 def test_is_oauth_timeout_message_requires_real_timeout_markers() -> None:
     assert _is_oauth_timeout_message("OAuth authorization timed out") is True
     assert _is_oauth_timeout_message("OAuth authorization was not completed in time.") is True

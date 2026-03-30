@@ -14,7 +14,11 @@ from fast_agent.agents.smart_agent import (
     _apply_runtime_mcp_connections,
     _resolve_default_agent_name,
 )
+from fast_agent.config import MCPServerSettings, MCPSettings, Settings
+from fast_agent.context import Context
 from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.llm.fastagent_llm import FastAgentLLM
+from fast_agent.llm.provider_types import Provider
 from fast_agent.types import RequestParams
 
 
@@ -66,6 +70,80 @@ def test_instruction_propagates_to_default_request_params():
         f"Expected systemPrompt to be '{instruction}', "
         f"but got {config.default_request_params.systemPrompt}"
     )
+
+
+class _StubProviderManagedLLM(FastAgentLLM):
+    def __init__(self, provider: Provider = Provider.ANTHROPIC) -> None:
+        super().__init__(provider=provider)
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages,
+        request_params=None,
+        tools=None,
+        is_template: bool = False,
+    ):
+        del request_params, tools, is_template
+        return multipart_messages[-1]
+
+    def _convert_extended_messages_to_provider(self, messages):
+        del messages
+        return []
+
+
+def test_provider_managed_servers_are_excluded_from_local_aggregator() -> None:
+    context = Context(
+        config=Settings(
+            mcp=MCPSettings(
+                servers={
+                    "stripe": MCPServerSettings(
+                        name="stripe",
+                        management="provider",
+                        transport="http",
+                        url="https://mcp.stripe.com",
+                    ),
+                    "filesystem": MCPServerSettings(
+                        name="filesystem",
+                        command="npx",
+                        args=["@modelcontextprotocol/server-filesystem"],
+                    ),
+                }
+            )
+        )
+    )
+    agent = McpAgent(
+        config=AgentConfig(name="billing", servers=["stripe", "filesystem"]),
+        context=context,
+    )
+
+    assert agent.aggregator.server_names == ["filesystem"]
+    assert agent.list_attached_mcp_servers() == ["stripe"]
+
+
+def test_provider_managed_servers_attach_state_to_supported_llm() -> None:
+    context = Context(
+        config=Settings(
+            mcp=MCPSettings(
+                servers={
+                    "stripe": MCPServerSettings(
+                        name="stripe",
+                        management="provider",
+                        transport="http",
+                        url="https://mcp.stripe.com",
+                    )
+                }
+            )
+        )
+    )
+    agent = McpAgent(
+        config=AgentConfig(name="billing", servers=["stripe"]),
+        context=context,
+    )
+    llm = _StubProviderManagedLLM(provider=Provider.ANTHROPIC)
+
+    agent._on_llm_attached(llm)
+
+    assert llm.provider_managed_mcp_state.server_names == ("stripe",)
 
 
 def test_instruction_takes_precedence_over_systemPrompt():

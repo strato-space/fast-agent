@@ -147,6 +147,31 @@ class ToolDisplay:
         display_path = self._fit_path_for_display(stripped_path, max_width)
         return f"{prefix}{display_path}{offset_suffix}"
 
+    def _format_code_tool_call_markdown(
+        self,
+        tool_args: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> tuple[str, list[str]]:
+        code_arg = str(metadata.get("code_arg") or "code")
+        language = str(metadata.get("language") or "")
+        raw_code = tool_args.get(code_arg)
+
+        if isinstance(raw_code, str):
+            code_text = raw_code.rstrip()
+        elif raw_code is None:
+            code_text = ""
+        else:
+            code_text = json.dumps(raw_code, ensure_ascii=False, indent=2).rstrip()
+
+        footer_items: list[str] = []
+        for key, value in tool_args.items():
+            if key == code_arg:
+                continue
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            footer_items.append(f"{key}: {rendered}")
+
+        return f"```{language}\n{code_text}\n```", footer_items
+
     def _configured_output_line_limit(self) -> int | None:
         config = self._display.config
         if not config:
@@ -955,6 +980,13 @@ class ToolDisplay:
                     bottom_items.append(
                         f"timeout: {timeout_seconds}s, warning every {warning_interval}s"
                     )
+            elif metadata.get("variant") == "code":
+                content, footer_items = self._format_code_tool_call_markdown(tool_args, metadata)
+                render_markdown = True
+                truncate_content = False
+                max_item_length = max(max_item_length or 0, 50) or None
+                if footer_items:
+                    bottom_items = [*(bottom_items or []), *footer_items]
             elif is_apply_patch_tool_name(tool_name):
                 patch_input = extract_apply_patch_input(tool_args)
                 preview = (

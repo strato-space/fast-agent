@@ -78,6 +78,70 @@ def test_tool_stream_status_uses_fallback_chunk_when_missing() -> None:
     assert "searching..." in text
 
 
+def test_tool_stream_replace_resets_snapshot_content() -> None:
+    assembler = _make_assembler()
+
+    assembler.handle_tool_event(
+        "start",
+        {
+            "tool_name": "huggingface_mcp/hf_whoami",
+            "tool_use_id": "mcp-1",
+            "chunk": "{}",
+        },
+    )
+    assembler.handle_tool_event(
+        "replace",
+        {
+            "tool_name": "huggingface_mcp/hf_whoami",
+            "tool_use_id": "mcp-1",
+            "chunk": "{}",
+        },
+    )
+    assembler.handle_tool_event(
+        "stop",
+        {"tool_name": "huggingface_mcp/hf_whoami", "tool_use_id": "mcp-1"},
+    )
+
+    text = "".join(segment.text for segment in assembler.segments)
+    assert "{}{}" not in text
+    assert text.count("{}") == 1
+
+
+def test_tool_stream_remote_labels_are_explicit() -> None:
+    assembler = _make_assembler()
+
+    assembler.handle_tool_event(
+        "start",
+        {
+            "tool_name": "huggingface_mcp/hf_whoami",
+            "tool_display_name": "remote tool call: huggingface_mcp/hf_whoami",
+            "tool_use_id": "mcp-1",
+            "chunk": "{}",
+        },
+    )
+    assembler.handle_tool_event(
+        "replace",
+        {
+            "tool_name": "huggingface_mcp/hf_whoami",
+            "tool_display_name": "remote tool result: huggingface_mcp/hf_whoami",
+            "tool_use_id": "mcp-1:result",
+            "chunk": "evalstate",
+        },
+    )
+    assembler.handle_tool_event(
+        "stop",
+        {
+            "tool_name": "huggingface_mcp/hf_whoami",
+            "tool_display_name": "remote tool result: huggingface_mcp/hf_whoami",
+            "tool_use_id": "mcp-1:result",
+        },
+    )
+
+    text = "\n".join(segment.text for segment in assembler.segments)
+    assert "remote tool call: huggingface_mcp/hf_whoami" in text
+    assert "remote tool result: huggingface_mcp/hf_whoami" in text
+
+
 def test_tool_stream_apply_patch_preview_keeps_other_args() -> None:
     assembler = _make_assembler()
     command = (

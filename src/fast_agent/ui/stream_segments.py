@@ -518,6 +518,19 @@ class StreamSegmentAssembler:
             self._update_tool_segment(state, pretty=False)
             return True
 
+        if event_type == "replace":
+            chunk = str(info.get("chunk") or "") if info else ""
+            if not chunk:
+                return False
+            if state is None:
+                state = self._start_tool(tool_use_id, tool_name, create_segment=False)
+            state.raw_text = ""
+            state.display_text = ""
+            state.decoder = LiteralNewlineDecoder()
+            state.append(chunk)
+            self._update_tool_segment(state, pretty=False)
+            return True
+
         if event_type == "status":
             chunk = str(info.get("chunk") or "") if info else ""
             if not chunk and info:

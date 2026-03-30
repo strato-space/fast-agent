@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
+from fast_agent.constants import FAST_AGENT_TOOL_METADATA
+from fast_agent.history.tool_activities import display_remote_tool_activities
 from fast_agent.ui.citation_display import (
     render_sources_pre_content,
     web_tool_badges,
@@ -36,6 +39,7 @@ async def display_history_turn(
     display = ConsoleDisplay(config=config)
     user_group: list[PromptMessageExtended] = []
     tool_name_lookup: dict[str, str] = {}
+    tool_metadata_lookup: dict[str, dict[str, Any]] = {}
 
     def _tool_name_from_call(call_id: str, call: object) -> str:
         params = getattr(call, "params", None)
@@ -58,6 +62,27 @@ async def display_history_turn(
             if sep in normalized:
                 normalized = normalized.rsplit(sep, 1)[-1]
         return normalized == "read_text_file" or normalized.endswith("__read_text_file")
+
+    for message in turn:
+        channels = getattr(message, "channels", None)
+        if not isinstance(channels, Mapping):
+            continue
+        payloads = channels.get(FAST_AGENT_TOOL_METADATA)
+        if not isinstance(payloads, list):
+            continue
+        for payload in payloads:
+            text = getattr(payload, "text", None)
+            if not isinstance(text, str):
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            for call_id, metadata in data.items():
+                if isinstance(call_id, str) and isinstance(metadata, dict):
+                    tool_metadata_lookup[call_id] = dict(metadata)
 
     def flush_user_group() -> None:
         if not user_group:
@@ -88,6 +113,12 @@ async def display_history_turn(
         flush_user_group()
 
         if message.role == "assistant":
+            display_remote_tool_activities(
+                display,
+                message,
+                name=agent_name,
+                truncate_content=False,
+            )
             last_text = message.last_text()
             shell_access = tool_use_requests_shell_access(
                 message,
@@ -142,6 +173,7 @@ async def display_history_turn(
                         tool_name=tool_name,
                         tool_args=tool_args,
                         name=agent_name,
+                        metadata=tool_metadata_lookup.get(call_id),
                         tool_call_id=call_id,
                     )
 

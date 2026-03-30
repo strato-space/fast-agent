@@ -1682,6 +1682,15 @@ class AgentACPServer(ACPAgent):
             return cwd
         return None
 
+    @staticmethod
+    def _legacy_session_cwd(manager: Any) -> str:
+        workspace_dir = getattr(manager, "workspace_dir", None)
+        if isinstance(workspace_dir, Path):
+            return str(workspace_dir.resolve())
+        if isinstance(workspace_dir, str) and workspace_dir.strip():
+            return str(Path(workspace_dir).expanduser().resolve())
+        return str(Path(manager.base_dir).resolve().parent.parent)
+
     def _build_history_updates(
         self,
         history: Sequence[PromptMessageExtended],
@@ -1770,11 +1779,12 @@ class AgentACPServer(ACPAgent):
         filter_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
         manager = get_session_manager()
         sessions = manager.list_sessions()
+        legacy_cwd = self._legacy_session_cwd(manager)
         if filter_cwd is not None:
             sessions = [
                 session_info
                 for session_info in sessions
-                if self._extract_session_cwd(session_info.metadata) == filter_cwd
+                if (self._extract_session_cwd(session_info.metadata) or legacy_cwd) == filter_cwd
             ]
 
         start_index = 0
@@ -1799,7 +1809,6 @@ class AgentACPServer(ACPAgent):
             page = sessions[start_index:]
             next_cursor = None
 
-        legacy_cwd = str(manager.base_dir.parent.parent.resolve())
         acp_sessions = []
         for session_info in page:
             title = self._extract_session_title(session_info.metadata)

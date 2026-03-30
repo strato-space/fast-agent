@@ -821,11 +821,12 @@ class MCPConnectionManager(ContextDependent):
         """Ensure clean shutdown of all connections before exiting."""
         try:
             # First request all servers to shutdown
-            await self.disconnect_all()
+            had_running_servers = await self.disconnect_all()
 
-            # Add a small delay to allow for clean shutdown
-            with suppress(asyncio.CancelledError):
-                await asyncio.sleep(0.5)
+            # Add a small delay only when live servers were asked to shut down.
+            if had_running_servers:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.5)
 
             # Then close the task group if it's active
             if self._task_group_active:
@@ -1337,14 +1338,14 @@ class MCPConnectionManager(ContextDependent):
         logger.info(f"{server_name}: Reconnection successful")
         return server_conn
 
-    async def disconnect_all(self) -> None:
+    async def disconnect_all(self) -> bool:
         """Disconnect all servers that are running under this connection manager."""
         # Get a copy of servers to shutdown
         servers_to_shutdown = []
 
         async with self._lock:
             if not self.running_servers:
-                return
+                return False
 
             # Make a copy of the servers to shut down
             servers_to_shutdown = list(self.running_servers.items())
@@ -1355,3 +1356,4 @@ class MCPConnectionManager(ContextDependent):
         for name, conn in servers_to_shutdown:
             logger.info(f"{name}: Requesting shutdown...")
             conn.request_shutdown()
+        return True

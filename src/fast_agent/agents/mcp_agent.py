@@ -21,6 +21,7 @@ from typing import (
     Sequence,
     TypeVar,
     Union,
+    cast,
     runtime_checkable,
 )
 
@@ -48,10 +49,11 @@ from fast_agent.constants import (
     SHELL_NOTICE_PREFIX,
     should_parallelize_tool_calls,
 )
-from fast_agent.core.exceptions import PromptExitError
+from fast_agent.core.exceptions import AgentConfigError, PromptExitError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.llm.model_database import ModelDatabase
+from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.terminal_output_limits import (
     calculate_terminal_output_limit_for_model,
     calculate_terminal_output_limit_for_resolved_model,
@@ -69,6 +71,11 @@ from fast_agent.mcp.mcp_aggregator import (
     MCPDetachResult,
     NamespacedTool,
     ServerStatus,
+)
+from fast_agent.mcp.provider_management import (
+    ProviderManagedMCPState,
+    build_provider_managed_mcp_state,
+    split_managed_server_names,
 )
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest
 from fast_agent.skills.registry import SkillRegistry
@@ -152,9 +159,28 @@ class McpAgent(ABC, ToolAgent):
             **kwargs,
         )
 
+        configured_servers = tuple(self.config.servers)
+        server_settings_by_name = None
+        if context and context.config and context.config.mcp:
+            server_settings_by_name = context.config.mcp.servers
+        self._provider_managed_mcp_state = ProviderManagedMCPState()
+        client_managed_servers = list(configured_servers)
+        self._provider_managed_server_names: tuple[str, ...] = ()
+        if server_settings_by_name is not None:
+            self._provider_managed_mcp_state = build_provider_managed_mcp_state(
+                agent_config=self.config,
+                server_settings_by_name=server_settings_by_name,
+            )
+            client_managed_servers, provider_managed_servers = split_managed_server_names(
+                configured_servers,
+                server_settings_by_name,
+            )
+            self._provider_managed_server_names = tuple(provider_managed_servers)
+        self._configured_server_names = tuple(configured_servers)
+
         # Create aggregator with composition
         self._aggregator = MCPAggregator(
-            server_names=self.config.servers,
+            server_names=client_managed_servers,
             connection_persistence=connection_persistence,
             name=self.config.name,
             context=context,
@@ -320,6 +346,8 @@ class McpAgent(ABC, ToolAgent):
         Shutdown the agent and close all MCP server connections.
         NOTE: This method is called automatically when the agent is used as an async context manager.
         """
+        if self._shutdown_complete:
+            return
         await self._run_lifecycle_hook("on_shutdown")
         await self._aggregator.close()
         await self._finalize_shutdown(run_hook=False)
@@ -364,6 +392,13 @@ class McpAgent(ABC, ToolAgent):
         server_config: MCPServerSettings | None = None,
         options: MCPAttachOptions | None = None,
     ) -> MCPAttachResult:
+        resolved_server_config = server_config
+        if resolved_server_config is None and self._context and self._context.config and self._context.config.mcp:
+            resolved_server_config = self._context.config.mcp.servers.get(server_name)
+        if resolved_server_config is not None and resolved_server_config.management == "provider":
+            raise AgentConfigError(
+                f"Provider-managed MCP server '{server_name}' cannot be attached locally."
+            )
         return await self._aggregator.attach_server(
             server_name=server_name,
             server_config=server_config,
@@ -374,7 +409,12 @@ class McpAgent(ABC, ToolAgent):
         return await self._aggregator.detach_server(server_name)
 
     def list_attached_mcp_servers(self) -> list[str]:
-        return self._aggregator.list_attached_servers()
+        return self._unique_preserving_order(
+            [
+                *self._aggregator.list_attached_servers(),
+                *self._provider_managed_server_names,
+            ]
+        )
 
     @property
     def aggregator(self) -> MCPAggregator:
@@ -675,6 +715,15 @@ class McpAgent(ABC, ToolAgent):
 
     def _on_llm_attached(self, llm: FastAgentLLMProtocol) -> None:
         super()._on_llm_attached(llm)
+
+        if self._provider_managed_mcp_state.has_servers():
+            if llm.provider not in {Provider.ANTHROPIC, Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+                raise AgentConfigError(
+                    "Provider-managed MCP is only supported for Anthropic Messages "
+                    "and OpenAI Responses-family providers."
+                )
+            if hasattr(llm, "set_provider_managed_mcp_state"):
+                cast("Any", llm).set_provider_managed_mcp_state(self._provider_managed_mcp_state)
 
         if isinstance(self._filesystem_runtime, LocalFilesystemRuntime):
             self._filesystem_runtime.set_enabled_tools(
@@ -1269,6 +1318,7 @@ class McpAgent(ABC, ToolAgent):
 
         tool_results: dict[str, CallToolResult] = {}
         tool_timings: dict[str, ToolTimingInfo] = {}
+        tool_metadata: dict[str, dict[str, Any]] = {}
         tool_loop_error: str | None = None
 
         # Cache available tool names exactly as advertised to the LLM for display/highlighting
@@ -1406,6 +1456,8 @@ class McpAgent(ABC, ToolAgent):
                 and not route_to_namespaced_candidate
             ):
                 metadata = self._filesystem_runtime.metadata()
+            elif local_tool is not None:
+                metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
 
             display_tool_name, bottom_items, highlight_index = self._prepare_tool_display(
                 tool_name=tool_name,
@@ -1427,6 +1479,8 @@ class McpAgent(ABC, ToolAgent):
                     tool_call_id=correlation_id if should_parallel else None,
                     show_hook_indicator=self.has_before_tool_call_hook,
                 )
+            if metadata:
+                tool_metadata[correlation_id] = metadata
 
             planned_calls.append(
                 {
@@ -1533,7 +1587,10 @@ class McpAgent(ABC, ToolAgent):
                     )
 
             return self._finalize_tool_results(
-                tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+                tool_results,
+                tool_timings=tool_timings,
+                tool_metadata=tool_metadata,
+                tool_loop_error=tool_loop_error,
             )
 
         for call in planned_calls:
@@ -1599,7 +1656,10 @@ class McpAgent(ABC, ToolAgent):
                 )
 
         return self._finalize_tool_results(
-            tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+            tool_loop_error=tool_loop_error,
         )
 
     def _prepare_tool_display(
@@ -1925,10 +1985,7 @@ class McpAgent(ABC, ToolAgent):
         """
         # Get the list of MCP servers (if not provided)
         if bottom_items is None:
-            if self._aggregator and self._aggregator.server_names:
-                server_names = list(self._aggregator.server_names)
-            else:
-                server_names = []
+            server_names = list(self.list_attached_mcp_servers())
         else:
             server_names = list(bottom_items)
 

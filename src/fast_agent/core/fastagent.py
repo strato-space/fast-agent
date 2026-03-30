@@ -63,6 +63,7 @@ from fast_agent.core.validation import (
 from fast_agent.mcp.connect_targets import resolve_target_entry
 from fast_agent.mcp.prompts.prompt_load import load_prompt
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest, SkillRegistry, SkillsDefault
+from fast_agent.tools.function_tool_config import function_tool_entrypoint
 from fast_agent.ui.console import configure_console_stream
 from fast_agent.ui.usage_display import display_usage_report
 
@@ -81,6 +82,7 @@ logger = get_logger(__name__)
 SkillEntry: TypeAlias = SkillManifest | SkillRegistry | Path | str
 SkillConfig: TypeAlias = SkillEntry | list[SkillEntry | None] | None | SkillsDefault
 FileSignature: TypeAlias = tuple[int, int]
+_PROMPT_EXIT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -983,15 +985,16 @@ class FastAgent(DecoratorMixin):
     @staticmethod
     def _resolve_function_tool_paths(
         card_path: Path,
-        function_tools: Sequence[str] | None,
+        function_tools: Sequence[object] | None,
     ) -> set[Path]:
         tool_paths: set[Path] = set()
         if not function_tools:
             return tool_paths
         for spec in function_tools:
-            if not isinstance(spec, str) or ":" not in spec:
+            entrypoint = function_tool_entrypoint(spec)
+            if not entrypoint or ":" not in entrypoint:
                 continue
-            module_path_str, _func_name = spec.rsplit(":", 1)
+            module_path_str, _func_name = entrypoint.rsplit(":", 1)
             module_path = Path(module_path_str)
             if not module_path.is_absolute():
                 module_path = (card_path.parent / module_path).resolve()
@@ -1231,9 +1234,21 @@ class FastAgent(DecoratorMixin):
                     )
 
                 overrides: dict[str, Any] = {}
+                entry_description = getattr(entry, "description", None)
+                if isinstance(entry_description, str):
+                    overrides["description"] = entry_description
+                entry_management = getattr(entry, "management", None)
+                if isinstance(entry_management, str):
+                    overrides["management"] = entry_management
                 entry_headers = getattr(entry, "headers", None)
                 if isinstance(entry_headers, dict):
                     overrides["headers"] = dict(entry_headers)
+                entry_access_token = getattr(entry, "access_token", None)
+                if isinstance(entry_access_token, str):
+                    overrides["access_token"] = entry_access_token
+                entry_defer_loading = getattr(entry, "defer_loading", None)
+                if isinstance(entry_defer_loading, bool):
+                    overrides["defer_loading"] = entry_defer_loading
                 entry_auth = getattr(entry, "auth", None)
                 if isinstance(entry_auth, dict):
                     overrides["auth"] = dict(entry_auth)
@@ -2263,6 +2278,7 @@ class FastAgent(DecoratorMixin):
         *,
         had_error: bool,
         settings: RunSettings,
+        shutdown_timeout: float | None = None,
     ) -> None:
         try:
             from fast_agent.ui.progress_display import progress_display
@@ -2278,7 +2294,20 @@ class FastAgent(DecoratorMixin):
             had_error=had_error,
             settings=settings,
         )
-        await self._dispose_managed_instances(active_agents)
+        if shutdown_timeout is None:
+            await self._dispose_managed_instances(active_agents)
+            return
+
+        try:
+            await asyncio.wait_for(
+                self._dispose_managed_instances(active_agents),
+                timeout=shutdown_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out while shutting down agents after exit request",
+                timeout_seconds=shutdown_timeout,
+            )
 
     @asynccontextmanager
     async def run(self) -> AsyncIterator["AgentApp"]:
@@ -2289,6 +2318,7 @@ class FastAgent(DecoratorMixin):
         active_agents: dict[str, AgentProtocol] = {}
         had_error = False
         run_state: ManagedRunState | None = None
+        shutdown_timeout: float | None = None
         await self.app.initialize()
         settings = self._prepare_run_settings()
 
@@ -2322,6 +2352,7 @@ class FastAgent(DecoratorMixin):
 
             except PromptExitError as e:
                 # User requested exit - not an error, show usage report
+                shutdown_timeout = _PROMPT_EXIT_SHUTDOWN_TIMEOUT_SECONDS
                 self._handle_error(e)
                 raise SystemExit(0)
             except (
@@ -2342,6 +2373,7 @@ class FastAgent(DecoratorMixin):
                     active_agents,
                     had_error=had_error,
                     settings=settings,
+                    shutdown_timeout=shutdown_timeout,
                 )
 
     async def _apply_instruction_context(

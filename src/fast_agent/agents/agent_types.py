@@ -12,6 +12,7 @@ from mcp.client.session import ElicitationFnT
 
 from fast_agent.constants import DEFAULT_AGENT_INSTRUCTION
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest, SkillRegistry, SkillsDefault
+from fast_agent.tools.function_tool_config import FunctionToolSpec
 
 # Forward imports to avoid circular dependencies
 from fast_agent.types import RequestParams
@@ -46,7 +47,7 @@ SkillConfig: TypeAlias = (
 # Function tools can be:
 # - A callable (Python function)
 # - A string spec like "module.py:function_name" (for dynamic loading)
-FunctionToolConfig: TypeAlias = Callable[..., Any] | str
+FunctionToolConfig: TypeAlias = Callable[..., Any] | str | FunctionToolSpec
 
 FunctionToolsConfig: TypeAlias = list[FunctionToolConfig] | None
 
@@ -63,7 +64,11 @@ class MCPConnectTarget:
 
     target: str
     name: str | None = None
+    description: str | None = None
+    management: str | None = None
     headers: dict[str, str] | None = None
+    access_token: str | None = None
+    defer_loading: bool | None = None
     auth: dict[str, Any] | None = None
 
 

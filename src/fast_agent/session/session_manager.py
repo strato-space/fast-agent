@@ -508,6 +508,7 @@ class SessionManager:
         base = (cwd or pathlib.Path.cwd()).resolve()
         env_override = _normalized_environment_override(base)
         env_paths = resolve_environment_paths(cwd=base, override=env_override)
+        self.workspace_dir = base
         self.base_dir = env_paths.sessions
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._current_session: Session | None = None

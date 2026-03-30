@@ -96,3 +96,13 @@ async def test_noenv_resume_session_returns_disabled_message() -> None:
     assert outcome.messages
     assert str(outcome.messages[0].text) == session_handlers.NOENV_SESSION_MESSAGE
     assert outcome.messages[0].channel == "warning"
+
+
+def test_strip_wrapping_quotes_removes_matching_outer_quotes() -> None:
+    assert session_handlers._strip_wrapping_quotes('"quoted title"') == "quoted title"
+    assert session_handlers._strip_wrapping_quotes("'quoted title'") == "quoted title"
+
+
+def test_strip_wrapping_quotes_preserves_unmatched_quotes() -> None:
+    assert session_handlers._strip_wrapping_quotes('"quoted title') == '"quoted title'
+    assert session_handlers._strip_wrapping_quotes("plain title") == "plain title"
