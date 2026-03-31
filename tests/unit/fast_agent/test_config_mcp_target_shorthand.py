@@ -245,6 +245,49 @@ def test_client_managed_access_token_synthesizes_authorization_header() -> None:
     assert demo.headers == {"Authorization": "Bearer secret-token"}
 
 
+def test_target_shorthand_with_access_token_keeps_synthesized_authorization_header() -> None:
+    settings = Settings.model_validate(
+        {
+            "mcp": {
+                "servers": {
+                    "demo": {
+                        "target": "https://demo.hf.space",
+                        "access_token": "Bearer secret-token",
+                    }
+                }
+            }
+        }
+    )
+
+    assert settings.mcp is not None
+    demo = settings.mcp.servers["demo"]
+    assert demo.url == "https://demo.hf.space/mcp"
+    assert demo.access_token == "secret-token"
+    assert demo.headers == {"Authorization": "Bearer secret-token"}
+
+
+def test_targets_list_shorthand_with_access_token_keeps_synthesized_authorization_header() -> None:
+    settings = Settings.model_validate(
+        {
+            "mcp": {
+                "targets": [
+                    {
+                        "name": "demo",
+                        "target": "https://demo.hf.space",
+                        "access_token": "Bearer secret-token",
+                    }
+                ]
+            }
+        }
+    )
+
+    assert settings.mcp is not None
+    demo = settings.mcp.servers["demo"]
+    assert demo.url == "https://demo.hf.space/mcp"
+    assert demo.access_token == "secret-token"
+    assert demo.headers == {"Authorization": "Bearer secret-token"}
+
+
 def test_access_token_conflicts_with_explicit_authorization_header() -> None:
     with pytest.raises(ValidationError) as exc_info:
         Settings.model_validate(

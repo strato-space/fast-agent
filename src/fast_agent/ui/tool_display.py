@@ -188,6 +188,22 @@ class ToolDisplay:
         return tool_name
 
     @classmethod
+    def _normalize_tool_footer_items(
+        cls,
+        bottom_items: list[str] | None,
+        *,
+        display_tool_name: str,
+    ) -> list[str] | None:
+        if not bottom_items:
+            return bottom_items
+        if len(bottom_items) != 1:
+            return bottom_items
+        only_item = cls._display_tool_name(bottom_items[0])
+        if only_item == display_tool_name:
+            return None
+        return bottom_items
+
+    @classmethod
     def _format_tool_call_id(cls, tool_call_id: str | None) -> str | None:
         if not tool_call_id:
             return None
@@ -911,6 +927,10 @@ class ToolDisplay:
             metadata = metadata or {}
 
             display_tool_name = self._display_tool_name(tool_name)
+            bottom_items = self._normalize_tool_footer_items(
+                bottom_items,
+                display_tool_name=display_tool_name,
+            )
             right_info = self._build_tool_right_info(
                 f"{type_label} - {display_tool_name}",
                 tool_call_id,

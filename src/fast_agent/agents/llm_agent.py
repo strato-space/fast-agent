@@ -10,8 +10,8 @@ This class extends LlmDecorator with LLM-specific interaction behaviors includin
 
 import json
 import os
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from a2a.types import AgentCapabilities
 from mcp import Tool
@@ -603,6 +603,11 @@ class LlmAgent(LlmDecorator):
         self._force_non_streaming_reason = reason
         return True
 
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        """Resolve display metadata for a streamed tool call, if available."""
+        _ = tool_name
+        return None
+
     async def generate_impl(
         self,
         messages: List[PromptMessageExtended],
@@ -640,6 +645,7 @@ class LlmAgent(LlmDecorator):
             with self.display.streaming_assistant_message(
                 name=display_name,
                 model=display_model,
+                tool_metadata_resolver=self.resolve_stream_tool_metadata,
             ) as stream_handle:
                 self._active_stream_handle = stream_handle
                 write_interactive_trace(

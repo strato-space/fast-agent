@@ -501,6 +501,33 @@ class MCPSettings(BaseModel):
     servers: dict[str, MCPServerSettings] = {}
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
+    @staticmethod
+    def _serialize_resolved_target_settings(
+        settings: MCPServerSettings,
+    ) -> dict[str, Any]:
+        """Serialize shorthand target settings back to an idempotent raw payload."""
+        payload = settings.model_dump(mode="python")
+
+        # resolve_target_entry() already normalizes access_token into Authorization
+        # for client-managed URL servers. Strip that synthesized header here so the
+        # final MCPServerSettings validation only applies the normalization once.
+        if settings.management != "provider" and settings.access_token is not None:
+            headers = payload.get("headers")
+            if isinstance(headers, dict):
+                expected_authorization = f"Bearer {settings.access_token}"
+                filtered_headers = {
+                    key: value
+                    for key, value in headers.items()
+                    if not (
+                        isinstance(key, str)
+                        and key.lower() == "authorization"
+                        and value == expected_authorization
+                    )
+                }
+                payload["headers"] = filtered_headers or None
+
+        return payload
+
     @classmethod
     def _normalize_target_list_entries(
         cls,
@@ -542,7 +569,7 @@ class MCPSettings(BaseModel):
                 source_path=source_path,
             )
 
-            resolved_payload = resolved_settings.model_dump(mode="python")
+            resolved_payload = cls._serialize_resolved_target_settings(resolved_settings)
             existing_payload = normalized_targets.get(resolved_name)
             if existing_payload is not None and existing_payload != resolved_payload:
                 raise ValueError(
@@ -590,7 +617,9 @@ class MCPSettings(BaseModel):
                 overrides=overrides,
                 source_path=source_path,
             )
-            normalized_servers[server_key] = resolved_settings.model_dump(mode="python")
+            normalized_servers[server_key] = cls._serialize_resolved_target_settings(
+                resolved_settings
+            )
 
         return normalized_servers
 

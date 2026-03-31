@@ -1,7 +1,7 @@
 import json
 from contextlib import contextmanager
 from json import JSONDecodeError
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Union
 
 from mcp.types import CallToolResult
 from rich.console import Group
@@ -933,6 +933,7 @@ class ConsoleDisplay:
         name: str | None = None,
         model: str | None = None,
         show_hook_indicator: bool = False,
+        tool_metadata_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> Iterator[StreamingHandle]:
         """Create a streaming context for assistant messages."""
         if not display_chat_enabled():
@@ -975,6 +976,7 @@ class ConsoleDisplay:
             header_left=left,
             header_right=right_info,
             tool_header_name=name,
+            tool_metadata_resolver=tool_metadata_resolver,
             progress_display=progress_display,
         )
         try:

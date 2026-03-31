@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import IO, TYPE_CHECKING, Any, Callable, Protocol, TextIO, cast
+from typing import IO, TYPE_CHECKING, Any, Callable, Mapping, Protocol, TextIO, cast
 
 from rich.console import Console, Group, RenderHook
 from rich.control import Control
@@ -14,6 +14,7 @@ from rich.file_proxy import FileProxy
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.segment import ControlType, Segment
+from rich.syntax import Syntax
 from rich.text import Text
 
 from fast_agent.core.logging.logger import get_logger
@@ -454,6 +455,7 @@ class StreamingMessageHandle:
         header_left: str = "",
         header_right: str = "",
         tool_header_name: str | None = None,
+        tool_metadata_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
         progress_display: Any = None,
         performance_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
@@ -476,6 +478,7 @@ class StreamingMessageHandle:
         self._segment_assembler = StreamSegmentAssembler(
             base_kind=base_kind,
             tool_prefix=self._tool_header_prefix_plain,
+            tool_metadata_resolver=tool_metadata_resolver,
         )
         self._markdown_truncator = MarkdownTruncator(target_height_ratio=1.0)
         self._plain_truncator = PlainTextTruncator(target_height_ratio=1.0)
@@ -1049,33 +1052,9 @@ class StreamingMessageHandle:
                         )
                 else:
                     if segment.kind == "tool":
-                        header_text = (
-                            self._tool_header_prefix.copy()
-                            if self._tool_header_prefix is not None
-                            else Text()
+                        renderables.append(
+                            self._render_tool_segment(segment, cursor_suffix=cursor_suffix)
                         )
-                        tool_name = segment.tool_name or "tool"
-                        if tool_name:
-                            if header_text.plain:
-                                header_text.append(" ")
-                            header_text.append(tool_name, style=self._tool_header_color or "")
-
-                        tool_text = header_text
-                        if segment.text:
-                            _, _, args_text = segment.text.partition("\n")
-                            if args_text:
-                                tool_text.append("\n")
-                                if "apply_patch preview:" in args_text:
-                                    tool_text.append_text(
-                                        style_apply_patch_preview_text(
-                                            args_text, default_style="white"
-                                        )
-                                    )
-                                else:
-                                    tool_text.append(args_text)
-                        if cursor_suffix:
-                            tool_text.append(cursor_suffix, style="dim")
-                        renderables.append(tool_text)
                     else:
                         renderables.append(Text(f"{segment.text}{cursor_suffix}"))
 
@@ -1191,6 +1170,51 @@ class StreamingMessageHandle:
                 continue
             merged.append(segment)
         return merged
+
+    def _tool_header_text(self, segment: "StreamSegment") -> Text:
+        header_text = self._tool_header_prefix.copy() if self._tool_header_prefix is not None else Text()
+        tool_name = segment.tool_name or "tool"
+        if tool_name:
+            if header_text.plain:
+                header_text.append(" ")
+            header_text.append(tool_name, style=self._tool_header_color or "")
+        return header_text
+
+    def _render_tool_segment(
+        self,
+        segment: "StreamSegment",
+        *,
+        cursor_suffix: str,
+    ) -> "RenderableType":
+        preview = segment.code_preview
+        if preview is not None and preview.code.strip():
+            code_text = preview.code + cursor_suffix if cursor_suffix else preview.code
+            return Group(
+                self._tool_header_text(segment),
+                Syntax(
+                    code_text,
+                    preview.language,
+                    theme=self._display.code_style,
+                    line_numbers=False,
+                    word_wrap=False,
+                ),
+            )
+
+        header_text = self._tool_header_text(segment)
+        tool_text = header_text
+        if segment.text:
+            _, _, args_text = segment.text.partition("\n")
+            if args_text:
+                tool_text.append("\n")
+                if "apply_patch preview:" in args_text:
+                    tool_text.append_text(
+                        style_apply_patch_preview_text(args_text, default_style="white")
+                    )
+                else:
+                    tool_text.append(args_text)
+        if cursor_suffix:
+            tool_text.append(cursor_suffix, style="dim")
+        return tool_text
 
     async def _render_worker(self) -> None:
         assert self._queue is not None

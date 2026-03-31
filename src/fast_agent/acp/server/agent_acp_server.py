@@ -6,10 +6,12 @@ and other clients to interact with fast-agent agents over stdio using the ACP pr
 """
 
 import asyncio
+import base64
+import json
 from dataclasses import dataclass, field
 from importlib.metadata import version as get_version
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Sequence, cast
+from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence, cast
 
 from acp import (
     Agent as ACPAgent,
@@ -228,6 +230,8 @@ class ACPSessionState:
     session_id: str
     instance: AgentInstance
     session_cwd: str | None = None
+    session_store_scope: Literal["workspace", "app"] = "workspace"
+    session_store_cwd: str | None = None
     current_agent_name: str | None = None
     progress_manager: ACPToolProgressManager | None = None
     permission_handler: ACPToolPermissionAdapter | None = None
@@ -774,19 +778,63 @@ class AgentACPServer(ACPAgent):
         *,
         cwd: str | None,
         request_name: str,
-        warn_if_missing: bool = True,
-    ) -> str:
-        if cwd:
-            return cwd
-        default_cwd = str(Path.cwd())
-        if warn_if_missing:
-            logger.warning(
-                "Missing cwd for ACP request; defaulting to process cwd",
-                name="acp_missing_cwd",
-                request=request_name,
-                default_cwd=default_cwd,
+        required: bool,
+    ) -> str | None:
+        if cwd is None:
+            if not required:
+                return None
+            raise RequestError.invalid_params(
+                {
+                    "cwd": cwd,
+                    "request": request_name,
+                    "reason": "cwd is required and must be an absolute path",
+                }
             )
-        return default_cwd
+
+        path = Path(cwd).expanduser()
+        if not path.is_absolute():
+            raise RequestError.invalid_params(
+                {
+                    "cwd": cwd,
+                    "request": request_name,
+                    "reason": "cwd must be an absolute path",
+                }
+            )
+        return str(path.resolve())
+
+    @staticmethod
+    def _encode_session_list_cursor(offset: int) -> str:
+        payload = json.dumps(
+            {"version": 1, "offset": offset},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_session_list_cursor(cursor: str) -> int:
+        padding = "=" * (-len(cursor) % 4)
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(f"{cursor}{padding}".encode("ascii")).decode("utf-8")
+            )
+        except Exception as exc:
+            raise RequestError.invalid_params(
+                {
+                    "cursor": cursor,
+                    "reason": "Invalid session list cursor",
+                }
+            ) from exc
+
+        offset = payload.get("offset") if isinstance(payload, dict) else None
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if not isinstance(offset, int) or offset < 0 or version != 1:
+            raise RequestError.invalid_params(
+                {
+                    "cursor": cursor,
+                    "reason": "Invalid session list cursor",
+                }
+            )
+        return offset
 
     async def _maybe_refresh_shared_instance(self) -> None:
         if self._instance_scope != "shared" or not self._get_registry_version:
@@ -1366,6 +1414,8 @@ class AgentACPServer(ACPAgent):
                 self._session_state[session_id] = session_state
 
             session_state.session_cwd = cwd
+            if session_state.session_store_scope == "workspace":
+                session_state.session_store_cwd = cwd
 
             # Serialize prompts per session
             if session_id not in self._prompt_locks:
@@ -1596,6 +1646,8 @@ class AgentACPServer(ACPAgent):
                     connection=self._connection,
                     session_id=session_id,
                     session_cwd=cwd,
+                    session_store_scope=session_state.session_store_scope,
+                    session_store_cwd=session_state.session_store_cwd,
                     client_capabilities=self._parsed_client_capabilities,
                     client_info=self._parsed_client_info,
                     protocol_version=self._protocol_version,
@@ -1603,6 +1655,10 @@ class AgentACPServer(ACPAgent):
                 session_state.acp_context = acp_context
             else:
                 acp_context.set_session_cwd(cwd)
+                acp_context.set_session_store(
+                    session_state.session_store_scope,
+                    session_state.session_store_cwd,
+                )
 
             # Store references to runtimes and handlers in ACPContext
             if session_state.terminal_runtime:
@@ -1691,6 +1747,21 @@ class AgentACPServer(ACPAgent):
             return str(Path(workspace_dir).expanduser().resolve())
         return str(Path(manager.base_dir).resolve().parent.parent)
 
+    @staticmethod
+    def _session_manager_entries(cwd: str | None) -> list[tuple[Any, str]]:
+        if cwd is None:
+            manager = get_session_manager()
+            return [(manager, AgentACPServer._legacy_session_cwd(manager))]
+
+        request_manager = get_session_manager(cwd=Path(cwd))
+        entries = [
+            (request_manager, AgentACPServer._legacy_session_cwd(request_manager))
+        ]
+        app_manager = get_session_manager()
+        if Path(app_manager.base_dir).resolve() != Path(request_manager.base_dir).resolve():
+            entries.append((app_manager, AgentACPServer._legacy_session_cwd(app_manager)))
+        return entries
+
     def _build_history_updates(
         self,
         history: Sequence[PromptMessageExtended],
@@ -1726,11 +1797,13 @@ class AgentACPServer(ACPAgent):
 
         try:
             title = self._extract_session_title(session.info.metadata)
-            info_update = SessionInfoUpdate(
-                session_update="session_info_update",
-                title=title,
-                updated_at=session.info.last_activity.isoformat(),
-            )
+            info_payload: dict[str, Any] = {
+                "session_update": "session_info_update",
+                "updated_at": session.info.last_activity.isoformat(),
+            }
+            if title is not None:
+                info_payload["title"] = title
+            info_update = SessionInfoUpdate(**info_payload)
             await self._connection.session_update(
                 session_id=session_state.session_id,
                 update=info_update,
@@ -1776,43 +1849,52 @@ class AgentACPServer(ACPAgent):
     ) -> ListSessionsResponse:
         """List saved sessions for the current environment."""
         _ = kwargs
-        filter_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
-        manager = get_session_manager()
-        sessions = manager.list_sessions()
-        legacy_cwd = self._legacy_session_cwd(manager)
-        if filter_cwd is not None:
-            sessions = [
-                session_info
-                for session_info in sessions
-                if (self._extract_session_cwd(session_info.metadata) or legacy_cwd) == filter_cwd
-            ]
+        filter_cwd = self._resolve_request_cwd(
+            cwd=cwd,
+            request_name="session/list",
+            required=False,
+        )
+        session_entries = self._session_manager_entries(filter_cwd)
+
+        sessions_by_id: dict[str, tuple[Any, str]] = {}
+        for manager, legacy_cwd in session_entries:
+            for session_info in manager.list_sessions():
+                session_cwd = self._extract_session_cwd(session_info.metadata) or legacy_cwd
+                if filter_cwd is not None and session_cwd != filter_cwd:
+                    continue
+
+                existing_entry = sessions_by_id.get(session_info.name)
+                if (
+                    existing_entry is None
+                    or session_info.last_activity > existing_entry[0].last_activity
+                ):
+                    sessions_by_id[session_info.name] = (session_info, session_cwd)
+
+        sessions = sorted(
+            sessions_by_id.values(),
+            key=lambda item: item[0].last_activity,
+            reverse=True,
+        )
 
         start_index = 0
         if cursor:
-            try:
-                start_index = int(cursor)
-            except ValueError:
-                logger.warning(
-                    "Invalid session list cursor",
-                    name="acp_session_list_cursor_invalid",
-                    cursor=cursor,
-                )
-                start_index = 0
+            start_index = self._decode_session_list_cursor(cursor)
 
         limit = get_session_history_window()
         if limit > 0:
             page = sessions[start_index : start_index + limit]
             next_cursor = (
-                str(start_index + limit) if start_index + limit < len(sessions) else None
+                self._encode_session_list_cursor(start_index + limit)
+                if start_index + limit < len(sessions)
+                else None
             )
         else:
             page = sessions[start_index:]
             next_cursor = None
 
         acp_sessions = []
-        for session_info in page:
+        for session_info, session_cwd in page:
             title = self._extract_session_title(session_info.metadata)
-            session_cwd = self._extract_session_cwd(session_info.metadata) or legacy_cwd
             acp_sessions.append(
                 AcpSessionInfo(
                     session_id=session_info.name,
@@ -1836,7 +1918,9 @@ class AgentACPServer(ACPAgent):
         request_cwd = self._resolve_request_cwd(
             cwd=cwd,
             request_name="session/load",
+            required=True,
         )
+        assert request_cwd is not None
         logger.info(
             "ACP load session request",
             name="acp_load_session",
@@ -1847,8 +1931,21 @@ class AgentACPServer(ACPAgent):
         async with self._session_lock:
             existing_session = session_id in self._session_state
 
-        manager = get_session_manager()
-        persisted_session = manager.load_session(session_id)
+        persisted_session = None
+        manager = None
+        manager_store_scope: Literal["workspace", "app"] = "workspace"
+        manager_store_cwd: str | None = request_cwd
+        for index, (candidate_manager, _legacy_cwd) in enumerate(
+            self._session_manager_entries(request_cwd)
+        ):
+            candidate_session = candidate_manager.get_session(session_id)
+            if candidate_session is None:
+                continue
+            manager = candidate_manager
+            persisted_session = candidate_session
+            manager_store_scope = "workspace" if index == 0 else "app"
+            manager_store_cwd = request_cwd if manager_store_scope == "workspace" else None
+            break
         if not persisted_session:
             logger.error(
                 "Session not found for load_session",
@@ -1866,23 +1963,41 @@ class AgentACPServer(ACPAgent):
                     ),
                 },
             )
+        assert manager is not None
 
         persisted_cwd = self._extract_session_cwd(persisted_session.info.metadata)
-        effective_cwd = persisted_cwd or request_cwd
-        if persisted_cwd and persisted_cwd != request_cwd:
-            logger.info(
-                "ACP load session using persisted session cwd",
-                name="acp_load_session_cwd_restored",
+        if persisted_cwd and str(Path(persisted_cwd).expanduser().resolve()) != request_cwd:
+            logger.warning(
+                "ACP load session cwd mismatch",
+                name="acp_load_session_cwd_mismatch",
                 session_id=session_id,
                 requested_cwd=request_cwd,
-                session_cwd=persisted_cwd,
+                persisted_cwd=persisted_cwd,
+            )
+            raise RequestError(
+                -32002,
+                f"Session not found: {session_id}",
+                {
+                    "uri": session_id,
+                    "reason": "Session not found",
+                    "details": (
+                        f"Session {session_id} could not be resolved from {request_cwd}"
+                    ),
+                },
             )
 
         session_state, session_modes = await self._initialize_session_state(
             session_id,
-            cwd=effective_cwd,
+            cwd=request_cwd,
             mcp_servers=mcp_servers or [],
         )
+        session_state.session_store_scope = manager_store_scope
+        session_state.session_store_cwd = manager_store_cwd
+        if session_state.acp_context:
+            session_state.acp_context.set_session_store(
+                manager_store_scope,
+                manager_store_cwd,
+            )
 
         fallback_agent_name = self._resolve_session_fallback_agent_name(session_state.instance)
         result = manager.resume_session_agents(
@@ -1956,12 +2071,10 @@ class AgentACPServer(ACPAgent):
                 session_state.acp_context.set_current_mode(current_agent)
 
         if self._connection:
-            asyncio.create_task(
-                self._send_session_history_updates(
-                    session_state,
-                    session,
-                    current_agent,
-                )
+            await self._send_session_history_updates(
+                session_state,
+                session,
+                current_agent,
             )
 
         logger.info(
@@ -1985,7 +2098,9 @@ class AgentACPServer(ACPAgent):
         request_cwd = self._resolve_request_cwd(
             cwd=cwd,
             request_name="session/resume",
+            required=True,
         )
+        assert request_cwd is not None
         response = await self.load_session(
             cwd=request_cwd,
             mcp_servers=mcp_servers or [],
@@ -2008,8 +2123,10 @@ class AgentACPServer(ACPAgent):
         request_cwd = self._resolve_request_cwd(
             cwd=cwd,
             request_name="session/new",
+            required=True,
         )
-        manager = get_session_manager(cwd=Path(request_cwd).expanduser().resolve())
+        assert request_cwd is not None
+        manager = get_session_manager(cwd=Path(request_cwd))
         session_id = manager.generate_session_id()
 
         logger.info(

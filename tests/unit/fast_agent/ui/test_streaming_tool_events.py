@@ -1,10 +1,14 @@
 import json
 
-from fast_agent.ui.stream_segments import StreamSegmentAssembler
+from fast_agent.ui.stream_segments import StreamSegmentAssembler, extract_partial_json_string_field
 
 
-def _make_assembler() -> StreamSegmentAssembler:
-    return StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+def _make_assembler(*, tool_metadata_resolver=None) -> StreamSegmentAssembler:
+    return StreamSegmentAssembler(
+        base_kind="markdown",
+        tool_prefix="->",
+        tool_metadata_resolver=tool_metadata_resolver,
+    )
 
 
 def test_tool_stream_delta_bootstraps_mode() -> None:
@@ -192,3 +196,72 @@ def test_tool_stream_apply_patch_preview_supports_shell_aliases() -> None:
     text = "".join(segment.text for segment in assembler.segments)
     assert "apply_patch preview:" in text
     assert "*** Delete File: a.txt" in text
+
+
+def test_extract_partial_json_string_field_decodes_incomplete_code_value() -> None:
+    extracted = extract_partial_json_string_field(
+        '{"query":"count","code":"resp = await hf_trending()\\nprin',
+        field_name="code",
+    )
+
+    assert extracted is not None
+    assert extracted.key == "code"
+    assert extracted.value == "resp = await hf_trending()\nprin"
+    assert extracted.complete is False
+
+
+def test_tool_stream_code_preview_tracks_partial_code() -> None:
+    metadata = {
+        "variant": "code",
+        "code_arg": "code",
+        "language": "python",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: metadata if tool_name == "hf_hub_query_raw" else None
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "hf_hub_query_raw",
+            "tool_use_id": "tool-code-1",
+            "chunk": '{"query":"count","code":"resp = await hf_trending()\\nprin',
+        },
+    )
+
+    assert len(assembler.segments) == 1
+    preview = assembler.segments[0].code_preview
+    assert preview is not None
+    assert preview.language == "python"
+    assert preview.code == "resp = await hf_trending()\nprin"
+    assert preview.complete is False
+
+
+def test_tool_stream_code_preview_uses_namespaced_tool_metadata() -> None:
+    metadata = {
+        "variant": "code",
+        "code_arg": "code",
+        "language": "python",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: (
+            metadata if tool_name == "huggingface_mcp/hf_hub_query_raw" else None
+        )
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "huggingface_mcp/hf_hub_query_raw",
+            "tool_display_name": "remote tool call: huggingface_mcp/hf_hub_query_raw",
+            "tool_use_id": "tool-code-2",
+            "chunk": '{"query":"count","code":"resp = await hf_trending()\\nprin',
+        },
+    )
+
+    assert len(assembler.segments) == 1
+    preview = assembler.segments[0].code_preview
+    assert preview is not None
+    assert preview.language == "python"
+    assert preview.code == "resp = await hf_trending()\nprin"
+    assert preview.complete is False

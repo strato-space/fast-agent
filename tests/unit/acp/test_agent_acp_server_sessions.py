@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from acp.exceptions import RequestError
 from acp.schema import SessionModeState
 
 from fast_agent.acp.server.agent_acp_server import ACPSessionState, AgentACPServer
@@ -76,11 +78,19 @@ async def test_load_session_falls_back_when_primary_agent_was_removed(
 
     resume_calls: list[str | None] = []
 
-    def fake_get_session_manager(*, cwd: Any = None) -> Any:
-        del cwd
+    def fake_get_session_manager(
+        *,
+        cwd: Any = None,
+        environment_override: Any = None,
+        respect_env_override: bool = True,
+    ) -> Any:
+        del cwd, environment_override, respect_env_override
 
         class _Manager:
-            def load_session(self, name: str) -> Any:
+            workspace_dir = Path("/workspace")
+            base_dir = workspace_dir / ".fast-agent" / "sessions"
+
+            def get_session(self, name: str) -> Any:
                 del name
                 return SimpleNamespace(info=SimpleNamespace(metadata={}))
 
@@ -108,7 +118,7 @@ async def test_load_session_falls_back_when_primary_agent_was_removed(
     )
 
     response = await server.load_session(
-        cwd=".",
+        cwd="/workspace",
         session_id="s-1",
         mcp_servers=[],
     )
@@ -118,6 +128,84 @@ async def test_load_session_falls_back_when_primary_agent_was_removed(
     assert resume_calls == ["renamed"]
     assert session_state.current_agent_name == "renamed"
     assert response.modes.current_mode_id == "renamed"
+
+
+@pytest.mark.asyncio
+async def test_load_session_uses_request_cwd_for_session_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    primary_instance = _build_instance(["main"])
+    server = _build_server(primary_instance)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_state = ACPSessionState(
+        session_id="s-1",
+        instance=primary_instance,
+    )
+    manager_cwds: list[Any] = []
+
+    async def fake_initialize_session_state(
+        session_id: str,
+        *,
+        cwd: str,
+        mcp_servers: list[Any],
+    ) -> tuple[ACPSessionState, SessionModeState]:
+        del session_id, mcp_servers
+        assert cwd == str(workspace.resolve())
+        return session_state, SessionModeState(available_modes=[], current_mode_id="main")
+
+    def fake_get_session_manager(
+        *,
+        cwd: Any = None,
+        environment_override: Any = None,
+        respect_env_override: bool = True,
+    ) -> Any:
+        manager_cwds.append((cwd, environment_override, respect_env_override))
+
+        class _Manager:
+            workspace_dir = workspace
+            base_dir = workspace / ".fast-agent" / "sessions"
+
+            def get_session(self, name: str) -> Any:
+                assert name == "s-1"
+                return SimpleNamespace(
+                    info=SimpleNamespace(metadata={"cwd": str(workspace.resolve())})
+                )
+
+            def resume_session_agents(
+                self,
+                agents: Any,
+                name: str | None = None,
+                fallback_agent_name: str | None = None,
+            ) -> Any:
+                del agents, name, fallback_agent_name
+                return SimpleNamespace(
+                    session=SimpleNamespace(),
+                    loaded={},
+                    missing_agents=[],
+                    usage_notices=[],
+                )
+
+        return _Manager()
+
+    monkeypatch.setattr(server, "_initialize_session_state", fake_initialize_session_state)
+    monkeypatch.setattr(
+        "fast_agent.acp.server.agent_acp_server.get_session_manager",
+        fake_get_session_manager,
+    )
+
+    response = await server.load_session(
+        cwd=str(workspace),
+        session_id="s-1",
+        mcp_servers=[],
+    )
+
+    assert response is not None
+    assert manager_cwds == [
+        (workspace.resolve(), None, True),
+        (None, None, True),
+    ]
 
 
 @pytest.mark.asyncio
@@ -157,7 +245,7 @@ async def test_list_sessions_keeps_legacy_sessions_when_cwd_matches(
 
     monkeypatch.setattr(
         "fast_agent.acp.server.agent_acp_server.get_session_manager",
-        lambda: _Manager(),
+        lambda *, cwd=None, environment_override=None, respect_env_override=True: _Manager(),
     )
 
     response = await server.list_sessions(cwd=str(workspace))
@@ -202,10 +290,274 @@ async def test_list_sessions_uses_manager_workspace_for_legacy_sessions(
 
     monkeypatch.setattr(
         "fast_agent.acp.server.agent_acp_server.get_session_manager",
-        lambda: _Manager(),
+        lambda *, cwd=None, environment_override=None, respect_env_override=True: _Manager(),
     )
 
     response = await server.list_sessions(cwd=str(workspace))
 
     assert [session.session_id for session in response.sessions] == ["legacy"]
     assert [session.cwd for session in response.sessions] == [str(workspace.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_uses_request_cwd_for_session_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    server = _build_server(_build_instance(["main"]))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    now = datetime.now()
+    manager_cwds: list[Any] = []
+
+    class _Manager:
+        workspace_dir = workspace
+        base_dir = workspace / ".fast-agent" / "sessions"
+
+        def list_sessions(self) -> list[SessionInfo]:
+            return [
+                SessionInfo(
+                    name="workspace-session",
+                    created_at=now,
+                    last_activity=now,
+                    metadata={},
+                )
+            ]
+
+    def fake_get_session_manager(
+        *,
+        cwd: Any = None,
+        environment_override: Any = None,
+        respect_env_override: bool = True,
+    ) -> Any:
+        manager_cwds.append((cwd, environment_override, respect_env_override))
+        return _Manager()
+
+    monkeypatch.setattr(
+        "fast_agent.acp.server.agent_acp_server.get_session_manager",
+        fake_get_session_manager,
+    )
+
+    response = await server.list_sessions(cwd=str(workspace))
+
+    assert [session.session_id for session in response.sessions] == ["workspace-session"]
+    assert manager_cwds == [
+        (workspace.resolve(), None, True),
+        (None, None, True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_session_prefers_workspace_duplicate_session_across_stores(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    primary_instance = _build_instance(["main"])
+    server = _build_server(primary_instance)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_state = ACPSessionState(
+        session_id="s-1",
+        instance=primary_instance,
+    )
+    resume_managers: list[str] = []
+
+    async def fake_initialize_session_state(
+        session_id: str,
+        *,
+        cwd: str,
+        mcp_servers: list[Any],
+    ) -> tuple[ACPSessionState, SessionModeState]:
+        del session_id, mcp_servers
+        assert cwd == str(workspace.resolve())
+        return session_state, SessionModeState(available_modes=[], current_mode_id="main")
+
+    class _Manager:
+        def __init__(self, label: str, last_activity: datetime, *, metadata: dict[str, Any]) -> None:
+            self.label = label
+            self.base_dir = workspace / f"{label}-sessions"
+            self.workspace_dir = workspace
+            self._session = SimpleNamespace(
+                info=SimpleNamespace(
+                    metadata=metadata,
+                    last_activity=last_activity,
+                )
+            )
+
+        def get_session(self, name: str) -> Any:
+            assert name == "s-1"
+            return self._session
+
+        def resume_session_agents(
+            self,
+            agents: Any,
+            name: str | None = None,
+            fallback_agent_name: str | None = None,
+        ) -> Any:
+            del agents, name, fallback_agent_name
+            resume_managers.append(self.label)
+            return SimpleNamespace(
+                session=SimpleNamespace(),
+                loaded={},
+                missing_agents=[],
+                usage_notices=[],
+            )
+
+    request_manager = _Manager(
+        "workspace",
+        datetime(2024, 1, 1, 10, 0, 0),
+        metadata={"cwd": str(workspace.resolve())},
+    )
+    app_manager = _Manager(
+        "app",
+        datetime(2024, 1, 1, 11, 0, 0),
+        metadata={},
+    )
+
+    def fake_get_session_manager(
+        *,
+        cwd: Any = None,
+        environment_override: Any = None,
+        respect_env_override: bool = True,
+    ) -> Any:
+        del environment_override, respect_env_override
+        if cwd is not None:
+            return request_manager
+        return app_manager
+
+    monkeypatch.setattr(server, "_initialize_session_state", fake_initialize_session_state)
+    monkeypatch.setattr(
+        "fast_agent.acp.server.agent_acp_server.get_session_manager",
+        fake_get_session_manager,
+    )
+
+    response = await server.load_session(
+        cwd=str(workspace),
+        session_id="s-1",
+        mcp_servers=[],
+    )
+
+    assert response is not None
+    assert resume_managers == ["workspace"]
+
+
+@pytest.mark.asyncio
+async def test_load_session_falls_back_to_app_store_when_workspace_store_misses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    primary_instance = _build_instance(["main"])
+    server = _build_server(primary_instance)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_state = ACPSessionState(
+        session_id="s-1",
+        instance=primary_instance,
+    )
+    resume_managers: list[str] = []
+
+    async def fake_initialize_session_state(
+        session_id: str,
+        *,
+        cwd: str,
+        mcp_servers: list[Any],
+    ) -> tuple[ACPSessionState, SessionModeState]:
+        del session_id, mcp_servers
+        assert cwd == str(workspace.resolve())
+        return session_state, SessionModeState(available_modes=[], current_mode_id="main")
+
+    class _WorkspaceManager:
+        workspace_dir = workspace
+        base_dir = workspace / ".fast-agent" / "sessions"
+
+        def get_session(self, name: str) -> Any:
+            assert name == "s-1"
+            return None
+
+    class _AppManager:
+        workspace_dir = tmp_path / "server"
+        base_dir = workspace_dir / ".fast-agent" / "sessions"
+
+        def get_session(self, name: str) -> Any:
+            assert name == "s-1"
+            return SimpleNamespace(info=SimpleNamespace(metadata={}))
+
+        def resume_session_agents(
+            self,
+            agents: Any,
+            name: str | None = None,
+            fallback_agent_name: str | None = None,
+        ) -> Any:
+            del agents, name, fallback_agent_name
+            resume_managers.append("app")
+            return SimpleNamespace(
+                session=SimpleNamespace(),
+                loaded={},
+                missing_agents=[],
+                usage_notices=[],
+            )
+
+    workspace_manager = _WorkspaceManager()
+    app_manager = _AppManager()
+
+    def fake_get_session_manager(
+        *,
+        cwd: Any = None,
+        environment_override: Any = None,
+        respect_env_override: bool = True,
+    ) -> Any:
+        del environment_override, respect_env_override
+        if cwd is not None:
+            return workspace_manager
+        return app_manager
+
+    monkeypatch.setattr(server, "_initialize_session_state", fake_initialize_session_state)
+    monkeypatch.setattr(
+        "fast_agent.acp.server.agent_acp_server.get_session_manager",
+        fake_get_session_manager,
+    )
+
+    response = await server.load_session(
+        cwd=str(workspace),
+        session_id="s-1",
+        mcp_servers=[],
+    )
+
+    assert response is not None
+    assert resume_managers == ["app"]
+    assert session_state.session_store_scope == "app"
+    assert session_state.session_store_cwd is None
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_rejects_relative_cwd() -> None:
+    server = _build_server(_build_instance(["main"]))
+
+    with pytest.raises(RequestError) as exc_info:
+        await server.list_sessions(cwd="relative/path")
+
+    assert exc_info.value.code == -32602
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_rejects_invalid_cursor() -> None:
+    server = _build_server(_build_instance(["main"]))
+
+    with pytest.raises(RequestError) as exc_info:
+        await server.list_sessions(cursor="not-a-valid-cursor")
+
+    assert exc_info.value.code == -32602
+
+
+@pytest.mark.asyncio
+async def test_load_session_rejects_relative_cwd() -> None:
+    server = _build_server(_build_instance(["main"]))
+
+    with pytest.raises(RequestError) as exc_info:
+        await server.load_session(
+            cwd="relative/path",
+            session_id="s-1",
+            mcp_servers=[],
+        )
+
+    assert exc_info.value.code == -32602

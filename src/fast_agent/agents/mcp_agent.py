@@ -59,6 +59,7 @@ from fast_agent.llm.terminal_output_limits import (
     calculate_terminal_output_limit_for_resolved_model,
 )
 from fast_agent.mcp.common import (
+    create_namespaced_name,
     get_resource_name,
     get_server_name,
     is_namespaced_name,
@@ -1710,6 +1711,27 @@ class McpAgent(ABC, ToolAgent):
         if bottom_items is not None:
             bottom_items = [TOOL_DISPLAY_NAMES.get(name, name) for name in bottom_items]
         return display_tool_name, bottom_items, highlight_index
+
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        metadata = super().resolve_stream_tool_metadata(tool_name)
+        if metadata:
+            return metadata
+
+        lookup_name = tool_name.strip()
+        if not lookup_name:
+            return None
+
+        if not is_namespaced_name(lookup_name) and "/" in lookup_name:
+            server_name, base_tool_name = lookup_name.split("/", 1)
+            if server_name and base_tool_name:
+                lookup_name = create_namespaced_name(server_name, base_tool_name)
+
+        namespaced_tool = self._aggregator._namespaced_tool_map.get(lookup_name)
+        if namespaced_tool is None or not isinstance(namespaced_tool.tool.meta, Mapping):
+            return None
+
+        metadata = dict(namespaced_tool.tool.meta)
+        return self._jsonable_tool_metadata(metadata)
 
     @staticmethod
     def _is_read_text_file_tool_name(tool_name: str) -> bool:

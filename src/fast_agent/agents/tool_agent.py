@@ -175,6 +175,9 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         metadata = dict(tool.meta)
         return metadata or None
 
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        return self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+
     @staticmethod
     def _jsonable_tool_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         if not metadata:
