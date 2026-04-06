@@ -46,7 +46,16 @@ SkillConfig: TypeAlias = (
 # Function tools can be:
 # - A callable (Python function)
 # - A string spec like "module.py:function_name" (for dynamic loading)
-FunctionToolConfig: TypeAlias = Callable[..., Any] | str
+@dataclass(frozen=True)
+class ScopedFunctionToolConfig:
+    """A single local Python tool registration with scoped metadata."""
+
+    function: Callable[..., Any]
+    name: str | None = None
+    description: str | None = None
+
+
+FunctionToolConfig: TypeAlias = Callable[..., Any] | str | ScopedFunctionToolConfig
 
 FunctionToolsConfig: TypeAlias = list[FunctionToolConfig] | None
 
@@ -69,16 +78,23 @@ class MCPConnectTarget:
 
 @dataclass
 class AgentConfig:
-    """Configuration for an Agent instance"""
+    """Configuration for an Agent instance.
+
+    Naming note:
+    - ``tools`` filters MCP-discovered tools by server name.
+    - ``function_tools`` configures local Python function tools.
+    - Runtime constructors such as ``ToolAgent(..., tools=...)`` use ``tools``
+      for the resolved executable function-tool objects, not these MCP filters.
+    """
 
     name: str
     instruction: str = DEFAULT_AGENT_INSTRUCTION
     description: str | None = None
     tool_input_schema: dict[str, Any] | None = None
     servers: list[str] = field(default_factory=list)
-    tools: dict[str, list[str]] = field(default_factory=dict)  # filters for tools
-    resources: dict[str, list[str]] = field(default_factory=dict)  # filters for resources
-    prompts: dict[str, list[str]] = field(default_factory=dict)  # filters for prompts
+    tools: dict[str, list[str]] = field(default_factory=dict)  # MCP tool filters by server
+    resources: dict[str, list[str]] = field(default_factory=dict)  # MCP resource filters by server
+    prompts: dict[str, list[str]] = field(default_factory=dict)  # MCP prompt filters by server
     skills: SkillConfig = SKILLS_DEFAULT
     skill_manifests: list[SkillManifest] = field(default_factory=list, repr=False)
     model: str | None = None
@@ -90,7 +106,7 @@ class AgentConfig:
     tool_only: bool = False
     elicitation_handler: ElicitationFnT | None = None
     api_key: str | None = None
-    function_tools: FunctionToolsConfig = None
+    function_tools: FunctionToolsConfig = None  # Local Python function tools
     shell: bool = False
     cwd: Path | None = None
     tool_hooks: ToolHooksConfig = None

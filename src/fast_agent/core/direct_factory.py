@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence, TypeVa
 from fastmcp.tools import FunctionTool
 
 from fast_agent.agents import McpAgent
-from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.agents.agent_types import AgentConfig, AgentType, FunctionToolConfig
 from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.agents.workflow.evaluator_optimizer import (
     EvaluatorOptimizerAgent,
@@ -24,6 +24,7 @@ from fast_agent.context import Context
 from fast_agent.core import Core
 from fast_agent.core.agent_card_types import AgentCardData
 from fast_agent.core.exceptions import AgentConfigError, ModelConfigError
+from fast_agent.core.function_tool_support import custom_class_supports_function_tools
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.model_resolution import (
     HARDCODED_DEFAULT_MODEL,
@@ -107,11 +108,11 @@ def _load_configured_function_tools(
     if tools_config_raw is None:
         tools_config_raw = agent_data.get("function_tools")
 
-    tools_config: list[Callable[..., Any] | str] | None = None
+    tools_config: list[FunctionToolConfig] | None = None
     if isinstance(tools_config_raw, str):
         tools_config = [tools_config_raw]
     elif isinstance(tools_config_raw, list):
-        tools_config = cast("list[Callable[..., Any] | str]", tools_config_raw)
+        tools_config = cast("list[FunctionToolConfig]", tools_config_raw)
 
     if not tools_config:
         return []
@@ -119,6 +120,32 @@ def _load_configured_function_tools(
     source_path = agent_data.get("source_path")
     base_path = Path(source_path).parent if source_path else None
     return load_function_tools(tools_config, base_path)
+
+
+def _resolve_function_tools_with_globals(
+    config: AgentConfig,
+    agent_data: Mapping[str, Any],
+    build_ctx: "AgentBuildContext",
+) -> list[FunctionTool]:
+    """Load per-agent function tools, falling back to global @fast.tool tools.
+
+    If the agent has explicit function_tools configured (including an empty list),
+    only those are used. Otherwise, globally registered tools from ``@fast.tool``
+    are provided.
+
+    Naming note:
+    the returned value is a list of resolved executable function tools. In the
+    custom-agent path, these are later passed to the constructor as ``tools=``,
+    which is distinct from ``AgentConfig.tools`` MCP filter settings.
+    """
+    if config.function_tools is not None or agent_data.get("function_tools") is not None:
+        return _load_configured_function_tools(config, agent_data)
+
+    global_tools = getattr(build_ctx.app_instance, "_registered_tools", None)
+    if global_tools:
+        return list(global_tools)
+
+    return []
 
 
 def _register_loaded_agent(
@@ -226,7 +253,7 @@ def _build_agents_as_tools_inputs(
     options = _build_agents_as_tools_options(agent_data)
     return AgentsAsToolsBuildInputs(
         config=config,
-        function_tools=_load_configured_function_tools(config, agent_data),
+        function_tools=_resolve_function_tools_with_globals(config, agent_data, build_ctx),
         child_agents=_resolve_child_agents(
             name,
             child_names,
@@ -603,7 +630,7 @@ async def _create_basic_agent(
             child_message_files=inputs.child_message_files,
         )
     else:
-        function_tools = _load_configured_function_tools(config, agent_data)
+        function_tools = _resolve_function_tools_with_globals(config, agent_data, build_ctx)
         agent = _create_agent_with_ui_if_needed(
             McpAgent,
             config,
@@ -644,7 +671,7 @@ async def _create_smart_agent(
             child_message_files=inputs.child_message_files,
         )
     else:
-        function_tools = _load_configured_function_tools(config, agent_data)
+        function_tools = _resolve_function_tools_with_globals(config, agent_data, build_ctx)
 
         from fast_agent.agents.smart_agent import SmartAgent, SmartAgentWithUI
 
@@ -690,10 +717,29 @@ async def _create_custom_agent(
             f"Custom agent '{name}' missing class reference ('agent_class' or 'cls')"
         )
 
+    explicit_function_tools = (
+        config.function_tools is not None or agent_data.get("function_tools") is not None
+    )
+    function_tools = _resolve_function_tools_with_globals(config, agent_data, build_ctx)
+    custom_supports_function_tools = custom_class_supports_function_tools(cls)
+    if function_tools and explicit_function_tools and not custom_supports_function_tools:
+        raise AgentConfigError(
+            "Custom agent does not accept function tools",
+            f"Custom agent '{name}' cannot use function_tools because "
+            f"{getattr(cls, '__name__', cls)!r} does not accept tools=.",
+        )
+
+    create_kwargs: dict[str, Any] = {}
+    if function_tools and custom_supports_function_tools:
+        # Custom agent constructors follow the existing ToolAgent/McpAgent
+        # convention: resolved function tools are passed as ``tools=``.
+        create_kwargs["tools"] = function_tools
+
     agent = _create_agent_with_ui_if_needed(
         cls,
         config,
         build_ctx.app_instance.context,
+        **create_kwargs,
     )
     await _initialize_agent_with_llm(agent, config, build_ctx.model_factory_func)
 
