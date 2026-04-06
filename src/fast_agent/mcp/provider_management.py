@@ -57,6 +57,13 @@ def normalize_client_managed_url_server(
     return final_url, final_headers or None
 
 
+def normalize_provider_managed_url_server(*, transport: str, url: str) -> str:
+    final_url = url
+    if transport == "http":
+        _server_name, _transport, final_url = parse_server_url(url)
+    return final_url
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderManagedMCPAttachment:
     server_name: str

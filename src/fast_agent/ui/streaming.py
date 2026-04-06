@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -22,6 +21,10 @@ from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.ui import console
 from fast_agent.ui.apply_patch_preview import style_apply_patch_preview_text
 from fast_agent.ui.markdown_helpers import prepare_markdown_content
+from fast_agent.ui.markdown_renderables import (
+    build_markdown_renderable,
+    close_incomplete_code_blocks,
+)
 from fast_agent.ui.markdown_truncator import MarkdownTruncator
 from fast_agent.ui.plain_text_truncator import PlainTextTruncator
 from fast_agent.ui.stream_segments import StreamSegmentAssembler
@@ -73,9 +76,6 @@ STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS = _resolve_progress_resume_debounce_seco
 def _alt_screen_streaming_enabled() -> bool:
     raw_value = os.getenv("FAST_AGENT_STREAM_ALT_SCREEN", "").strip().lower()
     return raw_value in {"1", "true", "yes", "on"}
-
-
-_FENCE_OPEN_LINE_RE = re.compile(r"^\s{0,3}(?P<delim>`{3,}|~{3,})(?P<info>.*)$")
 
 
 @dataclass(frozen=True)
@@ -661,50 +661,7 @@ class StreamingMessageHandle:
             self._live_started = True
 
     def _close_incomplete_code_blocks(self, text: str) -> str:
-        if "```" not in text and "~~~" not in text:
-            return text
-        in_fence = False
-        fence_char = "`"
-        fence_len = 3
-
-        for line in text.splitlines():
-            stripped = line.lstrip(" ")
-            if len(line) - len(stripped) > 3:
-                continue
-
-            if not in_fence:
-                opening = _FENCE_OPEN_LINE_RE.match(line)
-                if not opening:
-                    continue
-
-                delimiter = opening.group("delim")
-                info = opening.group("info")
-                # Backtick fences cannot include backticks in the info string.
-                if delimiter[0] == "`" and "`" in info:
-                    continue
-
-                in_fence = True
-                fence_char = delimiter[0]
-                fence_len = len(delimiter)
-                continue
-
-            if not stripped or stripped[0] != fence_char:
-                continue
-
-            index = 0
-            while index < len(stripped) and stripped[index] == fence_char:
-                index += 1
-
-            if index >= fence_len and stripped[index:].strip() == "":
-                in_fence = False
-
-        if not in_fence:
-            return text
-
-        closing_fence = fence_char * fence_len
-        if text.endswith("\n"):
-            return f"{text}{closing_fence}\n"
-        return f"{text}\n{closing_fence}\n"
+        return close_incomplete_code_blocks(text)
 
     def _set_scroll_indicator_visible(self, visible: bool) -> None:
         if self._scroll_indicator_visible == visible:
@@ -1024,20 +981,19 @@ class StreamingMessageHandle:
                     total_segments=total_segments,
                 )
                 if segment.kind == "markdown":
-                    prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
-                    prepared_for_display = self._close_incomplete_code_blocks(prepared)
-                    if cursor_suffix:
-                        prepared_for_display += cursor_suffix
-                    if prepared_for_display:
-                        renderables.append(
-                            Markdown(prepared_for_display, code_theme=self._display.code_style)
+                    renderables.append(
+                        build_markdown_renderable(
+                            segment.text,
+                            code_theme=self._display.code_style,
+                            escape_xml=self._display._escape_xml,
+                            cursor_suffix=cursor_suffix,
+                            close_incomplete_fences=True,
                         )
-                    else:
-                        renderables.append(Text(""))
+                    )
                 elif segment.kind == "reasoning":
                     if self._render_reasoning_markdown:
                         prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
-                        prepared_for_display = self._close_incomplete_code_blocks(prepared)
+                        prepared_for_display = close_incomplete_code_blocks(prepared)
                         if cursor_suffix:
                             prepared_for_display += cursor_suffix
                         markdown = Markdown(

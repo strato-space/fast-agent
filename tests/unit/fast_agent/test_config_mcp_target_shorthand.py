@@ -224,6 +224,29 @@ def test_provider_managed_target_normalizes_url_and_access_token() -> None:
     assert stripe.headers is None
 
 
+def test_provider_managed_direct_url_normalizes_url_and_access_token() -> None:
+    settings = Settings.model_validate(
+        {
+            "mcp": {
+                "servers": {
+                    "demo": {
+                        "url": "https://demo.hf.space",
+                        "management": "provider",
+                        "access_token": "Bearer token-123",
+                    }
+                }
+            }
+        }
+    )
+
+    assert settings.mcp is not None
+    demo = settings.mcp.servers["demo"]
+    assert demo.management == "provider"
+    assert demo.url == "https://demo.hf.space/mcp"
+    assert demo.access_token == "token-123"
+    assert demo.headers is None
+
+
 def test_client_managed_access_token_synthesizes_authorization_header() -> None:
     settings = Settings.model_validate(
         {

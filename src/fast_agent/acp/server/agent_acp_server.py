@@ -1863,11 +1863,7 @@ class AgentACPServer(ACPAgent):
                 if filter_cwd is not None and session_cwd != filter_cwd:
                     continue
 
-                existing_entry = sessions_by_id.get(session_info.name)
-                if (
-                    existing_entry is None
-                    or session_info.last_activity > existing_entry[0].last_activity
-                ):
+                if session_info.name not in sessions_by_id:
                     sessions_by_id[session_info.name] = (session_info, session_cwd)
 
         sessions = sorted(

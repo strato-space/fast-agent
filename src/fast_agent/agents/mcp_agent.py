@@ -166,17 +166,15 @@ class McpAgent(ABC, ToolAgent):
             server_settings_by_name = context.config.mcp.servers
         self._provider_managed_mcp_state = ProviderManagedMCPState()
         client_managed_servers = list(configured_servers)
-        self._provider_managed_server_names: tuple[str, ...] = ()
         if server_settings_by_name is not None:
             self._provider_managed_mcp_state = build_provider_managed_mcp_state(
                 agent_config=self.config,
                 server_settings_by_name=server_settings_by_name,
             )
-            client_managed_servers, provider_managed_servers = split_managed_server_names(
+            client_managed_servers, _provider_managed_servers = split_managed_server_names(
                 configured_servers,
                 server_settings_by_name,
             )
-            self._provider_managed_server_names = tuple(provider_managed_servers)
         self._configured_server_names = tuple(configured_servers)
 
         # Create aggregator with composition
@@ -410,12 +408,7 @@ class McpAgent(ABC, ToolAgent):
         return await self._aggregator.detach_server(server_name)
 
     def list_attached_mcp_servers(self) -> list[str]:
-        return self._unique_preserving_order(
-            [
-                *self._aggregator.list_attached_servers(),
-                *self._provider_managed_server_names,
-            ]
-        )
+        return self._unique_preserving_order(self._aggregator.list_attached_servers())
 
     @property
     def aggregator(self) -> MCPAggregator:

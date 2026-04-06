@@ -237,6 +237,136 @@ def test_tool_stream_code_preview_tracks_partial_code() -> None:
     assert preview.complete is False
 
 
+def test_tool_stream_shell_preview_tracks_partial_command() -> None:
+    metadata = {
+        "variant": "shell",
+        "shell_name": "bash",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: metadata if tool_name == "execute" else None
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "execute",
+            "tool_use_id": "tool-shell-1",
+            "chunk": '{"command":"uv run scripts/lint.py && uv run scr',
+        },
+    )
+
+    assert len(assembler.segments) == 1
+    preview = assembler.segments[0].code_preview
+    assert preview is not None
+    assert preview.language == "bash"
+    assert preview.code == "uv run scripts/lint.py && uv run scr"
+    assert preview.complete is False
+
+
+def test_tool_stream_shell_preview_skips_apply_patch_commands() -> None:
+    metadata = {
+        "variant": "shell",
+        "shell_name": "bash",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: metadata if tool_name == "execute" else None
+    )
+    command = (
+        "apply_patch <<'PATCH'\n"
+        "*** Begin Patch\n"
+        "*** Add File: a.txt\n"
+        "+hello\n"
+        "*** End Patch\n"
+        "PATCH"
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "execute",
+            "tool_use_id": "tool-shell-2",
+            "chunk": json.dumps({"command": command}),
+        },
+    )
+    assembler.handle_tool_event("stop", {"tool_name": "execute", "tool_use_id": "tool-shell-2"})
+
+    assert assembler.segments[0].code_preview is None
+    assert "apply_patch preview:" in assembler.segments[0].text
+
+
+def test_tool_stream_apply_patch_preview_appears_before_stop() -> None:
+    metadata = {
+        "variant": "shell",
+        "shell_name": "bash",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: metadata if tool_name == "execute" else None
+    )
+    command = (
+        "apply_patch <<'PATCH'\n"
+        "*** Begin Patch\n"
+        "*** Add File: a.txt\n"
+        "+hello\n"
+        "*** End Patch\n"
+        "PATCH"
+    )
+    partial_chunk = (
+        '{"command":"'
+        + command.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "execute",
+            "tool_use_id": "tool-shell-3",
+            "chunk": partial_chunk,
+        },
+    )
+
+    assert assembler.segments[0].code_preview is None
+    assert "apply_patch preview:" in assembler.segments[0].text
+    assert "*** Begin Patch" in assembler.segments[0].text
+
+
+def test_tool_stream_apply_patch_preview_colours_partial_patch_lines() -> None:
+    metadata = {
+        "variant": "shell",
+        "shell_name": "bash",
+    }
+    assembler = _make_assembler(
+        tool_metadata_resolver=lambda tool_name: metadata if tool_name == "execute" else None
+    )
+    command = (
+        "apply_patch <<'PATCH'\n"
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-old\n"
+        "+new"
+    )
+    partial_chunk = (
+        '{"command":"'
+        + command.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    )
+
+    assembler.handle_tool_event(
+        "delta",
+        {
+            "tool_name": "execute",
+            "tool_use_id": "tool-shell-4",
+            "chunk": partial_chunk,
+        },
+    )
+
+    segment = assembler.segments[0]
+    assert segment.code_preview is None
+    assert "apply_patch preview: streaming patch" in segment.text
+    assert "*** Update File: a.txt" in segment.text
+    assert "-old" in segment.text
+    assert "+new" in segment.text
+
+
 def test_tool_stream_code_preview_uses_namespaced_tool_metadata() -> None:
     metadata = {
         "variant": "code",

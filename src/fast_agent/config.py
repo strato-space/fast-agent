@@ -27,6 +27,7 @@ from fast_agent.llm.text_verbosity import TextVerbosityLevel
 from fast_agent.mcp.provider_management import (
     normalize_access_token,
     normalize_client_managed_url_server,
+    normalize_provider_managed_url_server,
 )
 from fast_agent.utils.type_narrowing import is_str_object_dict
 
@@ -480,6 +481,11 @@ class MCPServerSettings(BaseModel):
                 raise ValueError(
                     f"Provider-managed MCP servers have unsupported settings: {invalid_list}"
                 )
+            assert self.url is not None
+            self.url = normalize_provider_managed_url_server(
+                transport=self.transport,
+                url=self.url,
+            )
             return self
 
         if self.access_token is not None and not self.url:

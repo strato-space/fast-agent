@@ -239,6 +239,32 @@ def test_render_tool_segment_uses_syntax_preview_for_code_tools() -> None:
     assert "print(resp)" in rendered
 
 
+def test_render_tool_segment_styles_apply_patch_preview_lines() -> None:
+    handle = _make_handle("markdown")
+    segment = StreamSegment(
+        kind="tool",
+        text=(
+            "execute\n"
+            "apply_patch preview: streaming patch (partial)\n"
+            "*** Begin Patch\n"
+            "*** Update File: a.txt\n"
+            "@@\n"
+            "-old\n"
+            "+new\n"
+        ),
+        tool_name="execute",
+    )
+
+    renderable = handle._render_tool_segment(segment, cursor_suffix="")
+
+    assert isinstance(renderable, Text)
+    span_styles = {str(span.style) for span in renderable.spans}
+    assert "cyan" in span_styles
+    assert "yellow" in span_styles
+    assert "red" in span_styles
+    assert "green" in span_styles
+
+
 def test_diff_live_stop_reprints_full_truncated_frame_when_preserved() -> None:
     output = io.StringIO()
     local_console = Console(file=output, force_terminal=True, color_system=None, width=40)

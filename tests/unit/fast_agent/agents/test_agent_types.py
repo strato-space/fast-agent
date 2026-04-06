@@ -117,7 +117,7 @@ def test_provider_managed_servers_are_excluded_from_local_aggregator() -> None:
     )
 
     assert agent.aggregator.server_names == ["filesystem"]
-    assert agent.list_attached_mcp_servers() == ["stripe"]
+    assert agent.list_attached_mcp_servers() == []
 
 
 def test_provider_managed_servers_attach_state_to_supported_llm() -> None:

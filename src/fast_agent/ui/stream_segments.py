@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from fast_agent.ui.apply_patch_preview import (
     build_apply_patch_preview,
+    build_partial_apply_patch_preview,
     extract_non_command_args,
     format_apply_patch_preview,
     is_shell_execution_tool,
+    shell_syntax_language,
 )
 from fast_agent.utils.reasoning_stream_parser import ReasoningSegment, ReasoningStreamParser
 
@@ -363,6 +365,8 @@ class ToolStreamState:
         extracted = extract_partial_json_string_field(self.raw_text, field_name=field_name)
         if extracted is None or not extracted.value:
             return None
+        if field_name == "command" and build_partial_apply_patch_preview(extracted.value) is not None:
+            return None
         return ToolCodePreview(
             code=extracted.value,
             language=language,
@@ -378,10 +382,11 @@ class ToolStreamState:
             header = f"{tool_name}\n"
 
         args_text = self.display_text
-        if pretty and self.raw_text.strip():
+        if self.raw_text.strip():
             parsed_args = _parse_json_value(self.raw_text)
             if parsed_args is not _JSON_PARSE_FAILED:
-                args_text = json.dumps(parsed_args, indent=2, ensure_ascii=True)
+                if pretty:
+                    args_text = json.dumps(parsed_args, indent=2, ensure_ascii=True)
                 if isinstance(parsed_args, dict) and is_shell_execution_tool(tool_name):
                     command = parsed_args.get("command")
                     if isinstance(command, str):
@@ -391,6 +396,19 @@ class ToolStreamState:
                                 preview,
                                 other_args=extract_non_command_args(parsed_args),
                             )
+                        else:
+                            partial_preview = build_partial_apply_patch_preview(
+                                command,
+                                other_args=extract_non_command_args(parsed_args),
+                            )
+                            if partial_preview is not None:
+                                args_text = partial_preview
+            elif is_shell_execution_tool(tool_name):
+                extracted = extract_partial_json_string_field(self.raw_text, field_name="command")
+                if extracted is not None and extracted.value:
+                    partial_preview = build_partial_apply_patch_preview(extracted.value)
+                    if partial_preview is not None:
+                        args_text = partial_preview
 
         if args_text and pretty and not args_text.endswith("\n"):
             args_text += "\n"
@@ -412,11 +430,23 @@ class ToolCodePreview:
 
 
 def _tool_code_preview_spec(metadata: Mapping[str, Any] | None) -> tuple[str, str] | None:
-    if not metadata or metadata.get("variant") != "code":
+    if not metadata:
         return None
 
-    code_arg = metadata.get("code_arg") or "code"
-    language = metadata.get("language") or "python"
+    variant = metadata.get("variant")
+    if variant == "code":
+        code_arg = metadata.get("code_arg") or "code"
+        language = metadata.get("language") or "python"
+    elif variant == "shell":
+        code_arg = "command"
+        shell_path = metadata.get("shell_path")
+        language = shell_syntax_language(
+            metadata.get("shell_name"),
+            shell_path=shell_path if isinstance(shell_path, str) else None,
+        )
+    else:
+        return None
+
     if not isinstance(code_arg, str) or not code_arg:
         return None
     if not isinstance(language, str) or not language:
