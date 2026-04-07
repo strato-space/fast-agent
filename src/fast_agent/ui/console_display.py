@@ -1088,6 +1088,8 @@ class ConsoleDisplay:
 
         from urllib.parse import urlparse
 
+        console.configure_console_stream("stdout")
+
         # Extract domain for security display
         parsed = urlparse(url)
         domain = parsed.netloc or url  # Fallback to full URL if no domain
