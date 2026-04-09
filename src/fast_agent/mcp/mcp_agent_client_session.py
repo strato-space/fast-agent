@@ -3,6 +3,8 @@ A derived client session for the MCP Agent framework.
 It adds logging and supports sampling requests.
 """
 
+import asyncio
+import json
 import os
 import sys
 from datetime import timedelta
@@ -32,6 +34,7 @@ from mcp.types import (
     InitializeResult,
     ListRootsResult,
     PingRequest,
+    ProgressNotification,
     ReadResourceRequest,
     ReadResourceRequestParams,
     ReadResourceResult,
@@ -76,6 +79,7 @@ _SESSIONS_CAPABILITY_KEY = "sessions"
 _EXPERIMENTAL_SESSION_TEST_CAPABILITY_KEY = "experimental/sessions"
 
 _EXPERIMENTAL_SESSION_META_KEY = "io.modelcontextprotocol/session"
+_URL_ELICITATION_RESULT_PREFIX = "fast-agent-url-elicitation-required:"
 
 
 class _SessionMetadata(BaseModel):
@@ -141,6 +145,8 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         self.session_server_name = kwargs.pop("server_name", None)
         # Extract the notification callbacks if provided
         self._tool_list_changed_callback = kwargs.pop("tool_list_changed_callback", None)
+        # Reference to parent aggregator for late-bound notification callback
+        self._aggregator = kwargs.pop("aggregator", None)
         # Extract server_config if provided
         self.server_config: MCPServerSettings | None = kwargs.pop("server_config", None)
         # Extract agent_model if provided (for auto_sampling fallback)
@@ -685,6 +691,10 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                 )
 
             self._attach_transport_channel(request_id, result)
+            self._attach_url_elicitation_payload_from_result(
+                result,
+                request_method=request_method,
+            )
             self._attach_pending_url_elicitation_payload_for_request(
                 result,
                 request_method=request_method,
@@ -856,6 +866,38 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
         self._ensure_pending_url_elicitation_state()
         self._pending_url_elicitations = []
 
+    def _attach_url_elicitation_payload_from_result(
+        self,
+        result: object,
+        *,
+        request_method: str,
+    ) -> None:
+        if not isinstance(result, CallToolResult) or not result.isError or not result.content:
+            return
+
+        first_block = result.content[0]
+        text = getattr(first_block, "text", None)
+        if not isinstance(text, str) or _URL_ELICITATION_RESULT_PREFIX not in text:
+            return
+
+        _, _, raw_payload = text.partition(_URL_ELICITATION_RESULT_PREFIX)
+        try:
+            payload_data = json.loads(raw_payload.strip())
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload_data, dict):
+            return
+
+        payload = build_url_elicitation_required_display_payload(
+            payload_data,
+            server_name=self.session_server_name or "unknown",
+            request_method=request_method,
+        )
+        try:
+            setattr(result, "_fast_agent_url_elicitation_required", payload)
+        except Exception:
+            pass
+
     @staticmethod
     def get_url_elicitation_required_payload(
         exc: object,
@@ -899,9 +941,6 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                     logger.info(
                         f"Tool list changed for server '{self.session_server_name}', triggering callback"
                     )
-                    # Use asyncio.create_task to prevent blocking the notification handler
-                    import asyncio
-
                     asyncio.create_task(
                         self._handle_tool_list_change_callback(self.session_server_name)
                     )
@@ -910,7 +949,28 @@ class MCPAgentClientSession(ClientSession, ContextDependent):
                         f"Tool list changed for server '{self.session_server_name}' but no callback registered"
                     )
 
+        # Forward non-progress server notifications to the aggregator callback.
+        # Progress updates already flow through the request progress callback path.
+        _cb = getattr(self._aggregator, "server_notification_callback", None) if self._aggregator else None
+        if _cb and not isinstance(notification.root, ProgressNotification):
+            asyncio.create_task(self._handle_server_notification(notification))
+
         return None
+
+    async def _handle_server_notification(self, notification: ServerNotification) -> None:
+        """Forward server notifications to the registered callback."""
+        _cb = getattr(self._aggregator, "server_notification_callback", None) if self._aggregator else None
+        if not _cb:
+            return
+        try:
+            await _cb(
+                self.session_server_name or "unknown",
+                notification,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Error in server notification callback for '{self.session_server_name}': {e}"
+            )
 
     async def _handle_tool_list_change_callback(self, server_name: str) -> None:
         """

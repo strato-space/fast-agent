@@ -4,7 +4,7 @@ Helper functions for working with content objects (Fast Agent namespace).
 """
 
 import json
-from typing import TYPE_CHECKING, Protocol, Sequence, TypeGuard, Union
+from typing import TYPE_CHECKING, Protocol, Sequence, TypeGuard, Union, cast
 
 if TYPE_CHECKING:
     from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
@@ -21,6 +21,7 @@ from mcp.types import (
     TextResourceContents,
 )
 
+type ContentWithTextResource = ContentBlock | TextResourceContents
 
 class ToolResultWarningLogger(Protocol):
     """Minimal logger interface used for best-effort tool result warnings."""
@@ -28,7 +29,7 @@ class ToolResultWarningLogger(Protocol):
     def warning(self, message: str, **data: object) -> None: ...
 
 
-def get_text(content: ContentBlock) -> str | None:
+def get_text(content: ContentWithTextResource) -> str | None:
     """Extract text content from a content object if available."""
     if isinstance(content, TextContent):
         return content.text
@@ -150,7 +151,7 @@ def canonicalize_tool_result_content_for_llm(
     """
 
     raw_content = getattr(result, "content", None)
-    content = list(raw_content) if isinstance(raw_content, list) else []
+    content = cast("list[ContentBlock]", raw_content) if isinstance(raw_content, list) else []
 
     structured_content = getattr(result, "structuredContent", None)
     if structured_content is None:
@@ -196,9 +197,9 @@ def tool_result_text_for_llm(
 
 def _infer_mime_type(url: str, default: str = "application/octet-stream") -> str:
     """Infer MIME type from URL using the mimetypes database."""
-    from urllib.parse import urlparse
+    from urllib.parse import parse_qs, urlparse
 
-    from fast_agent.mcp.mime_utils import guess_mime_type
+    from fast_agent.mcp.mime_utils import guess_mime_type, normalize_mime_type
 
     # Special case: YouTube URLs (Google has native support)
     parsed = urlparse(url.lower())
@@ -208,8 +209,18 @@ def _infer_mime_type(url: str, default: str = "application/octet-stream") -> str
 
     mime = guess_mime_type(url)
     # guess_mime_type returns "application/octet-stream" for unknown types
-    if mime == "application/octet-stream":
-        return default
+    if mime != "application/octet-stream":
+        return mime
+
+    query_args = parse_qs(parsed.query)
+    for key in ("format", "fm", "ext", "mime"):
+        values = query_args.get(key)
+        if not values:
+            continue
+        normalized = normalize_mime_type(values[0])
+        if normalized:
+            return normalized
+
     return mime
 
 

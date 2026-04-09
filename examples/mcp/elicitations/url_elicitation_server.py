@@ -12,11 +12,11 @@ browser, not through the MCP protocol.
 import logging
 import sys
 import uuid
+from typing import Protocol, cast
 
-from mcp import ReadResourceResult
-from mcp.server.fastmcp import FastMCP
-from mcp.types import TextResourceContents
-from pydantic import AnyUrl
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from mcp.types import ElicitResult
 
 # Configure logging
 logging.basicConfig(
@@ -27,10 +27,20 @@ logging.basicConfig(
 logger = logging.getLogger("url_elicitation_server")
 
 # Create MCP server
-mcp = FastMCP("URL Elicitation Demo Server", log_level="INFO")
+mcp = FastMCP("URL Elicitation Demo Server")
 
 # Simulated state - in a real server, this would be persistent storage
 _authorized_sessions: set[str] = set()
+
+
+class URLCapableContext(Protocol):
+    async def elicit_url(
+        self,
+        *,
+        message: str,
+        url: str,
+        elicitation_id: str,
+    ) -> ElicitResult: ...
 
 
 @mcp.tool()
@@ -44,7 +54,7 @@ async def authorize_api_access(service_name: str) -> str:
     Args:
         service_name: The name of the service to authorize access for
     """
-    ctx = mcp.get_context()
+    ctx = cast("URLCapableContext", get_context())
 
     # Generate a unique elicitation ID for tracking
     elicitation_id = str(uuid.uuid4())
@@ -88,7 +98,7 @@ async def enter_api_key(api_name: str) -> str:
     Args:
         api_name: The name of the API requiring a key
     """
-    ctx = mcp.get_context()
+    ctx = cast("URLCapableContext", get_context())
 
     elicitation_id = str(uuid.uuid4())
 
@@ -126,7 +136,7 @@ async def initiate_payment(amount: float, currency: str, description: str) -> st
         currency: The currency code (e.g., USD, EUR)
         description: Description of what the payment is for
     """
-    ctx = mcp.get_context()
+    ctx = cast("URLCapableContext", get_context())
 
     elicitation_id = str(uuid.uuid4())
 
@@ -155,14 +165,14 @@ async def initiate_payment(amount: float, currency: str, description: str) -> st
 
 
 @mcp.resource(uri="elicitation://url-demo")
-async def url_demo_resource() -> ReadResourceResult:
+async def url_demo_resource() -> str:
     """
     Demonstrate URL elicitation via a resource.
 
     This resource shows how URL elicitation can be triggered from
     a resource read operation.
     """
-    ctx = mcp.get_context()
+    ctx = cast("URLCapableContext", get_context())
 
     elicitation_id = str(uuid.uuid4())
 
@@ -184,15 +194,7 @@ async def url_demo_resource() -> ReadResourceResult:
     else:
         response = "Verification cancelled."
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain",
-                uri=AnyUrl("elicitation://url-demo"),
-                text=response,
-            )
-        ]
-    )
+    return response
 
 
 if __name__ == "__main__":

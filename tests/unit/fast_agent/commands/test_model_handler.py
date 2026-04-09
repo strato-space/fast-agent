@@ -1,45 +1,88 @@
+from pathlib import Path
+
 import pytest
 
 from fast_agent.commands.context import CommandContext
 from fast_agent.commands.handlers.model import (
     handle_model_fast,
     handle_model_reasoning,
+    handle_model_switch,
     handle_model_verbosity,
     handle_model_web_fetch,
     handle_model_web_search,
 )
 from fast_agent.config import Settings, ShellSettings
+from fast_agent.core.exceptions import ModelConfigError
+from fast_agent.llm.model_database import ModelParameters
+from fast_agent.llm.model_factory import ModelConfig
+from fast_agent.llm.model_info import ModelInfo
+from fast_agent.llm.model_overlays import LoadedModelOverlay, ModelOverlayManifest
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import ReasoningEffortSetting, ReasoningEffortSpec
 from fast_agent.llm.request_params import RequestParams
+from fast_agent.llm.resolved_model import ResolvedModelSpec, resolve_base_model_params
 from fast_agent.llm.text_verbosity import TextVerbositySpec
 
 
+def _build_overlay(
+    name: str,
+    *,
+    provider: Provider,
+    model_name: str,
+) -> LoadedModelOverlay:
+    return LoadedModelOverlay(
+        manifest=ModelOverlayManifest.model_validate(
+            {
+                "name": name,
+                "provider": provider.value,
+                "model": model_name,
+                "picker": {"label": name},
+            }
+        ),
+        manifest_path=Path(f"/tmp/{name}.yaml"),
+    )
+
+
 class _StubIO:
-    async def emit(self, message):  # type: ignore[no-untyped-def]
+    def __init__(self, *, model_selection_response: str | None = None) -> None:
+        self._model_selection_response = model_selection_response
+        self.last_initial_provider: str | None = None
+        self.last_default_model: str | None = None
+
+    async def emit(self, message):
         return None
 
-    async def prompt_text(self, prompt: str, *, default=None, allow_empty=True):  # type: ignore[no-untyped-def]
+    async def prompt_text(self, prompt: str, *, default=None, allow_empty=True):
         return default
 
     async def prompt_selection(
         self, prompt: str, *, options, allow_cancel=False, default=None
-    ):  # type: ignore[no-untyped-def]
+    ):
         return default
 
-    async def prompt_argument(self, arg_name: str, *, description=None, required=True):  # type: ignore[no-untyped-def]
+    async def prompt_model_selection(
+        self,
+        *,
+        initial_provider=None,
+        default_model=None,
+    ):
+        self.last_initial_provider = initial_provider
+        self.last_default_model = default_model
+        return self._model_selection_response
+
+    async def prompt_argument(self, arg_name: str, *, description=None, required=True):
         return None
 
-    async def display_history_turn(self, agent_name: str, turn, *, turn_index=None, total_turns=None):  # type: ignore[no-untyped-def]
+    async def display_history_turn(self, agent_name: str, turn, *, turn_index=None, total_turns=None):
         return None
 
-    async def display_history_overview(self, agent_name: str, history, usage=None):  # type: ignore[no-untyped-def]
+    async def display_history_overview(self, agent_name: str, history, usage=None):
         return None
 
-    async def display_usage_report(self, agents):  # type: ignore[no-untyped-def]
+    async def display_usage_report(self, agents):
         return None
 
-    async def display_system_prompt(self, agent_name: str, system_prompt: str, *, server_count=0):  # type: ignore[no-untyped-def]
+    async def display_system_prompt(self, agent_name: str, system_prompt: str, *, server_count=0):
         return None
 
 
@@ -56,9 +99,38 @@ class _StubLLM:
         service_tier_default: str | None = None,
         available_service_tiers: tuple[str, ...] | None = None,
         sampling_overrides: dict[str, float | int] | None = None,
+        provider: Provider = Provider.RESPONSES,
+        selected_model_name: str | None = None,
+        model_info_override: ModelInfo | None = None,
+        overlay_name: str | None = None,
     ) -> None:
         self.model_name = model_name
-        self.provider = Provider.RESPONSES
+        self.provider = provider
+        self._model_info_override = model_info_override
+        model_params = resolve_base_model_params(provider=provider, model_name=model_name)
+        if model_info_override is not None:
+            model_params = ModelParameters(
+                context_window=model_info_override.context_window or 0,
+                max_output_tokens=model_info_override.max_output_tokens or 0,
+                tokenizes=model_info_override.tokenizes,
+                json_mode=model_info_override.json_mode,
+                reasoning=model_info_override.reasoning,
+                default_provider=provider,
+            )
+        self.resolved_model = ResolvedModelSpec(
+            raw_input=selected_model_name or model_name,
+            selected_model_name=selected_model_name or model_name,
+            source="overlay" if overlay_name is not None else "direct",
+            model_config=ModelConfig(provider=provider, model_name=model_name),
+            provider=provider,
+            wire_model_name=model_name,
+            overlay=(
+                _build_overlay(overlay_name, provider=provider, model_name=model_name)
+                if overlay_name is not None
+                else None
+            ),
+            model_params=model_params,
+        )
         self.default_request_params = RequestParams()
         if sampling_overrides:
             self.default_request_params = self.default_request_params.model_copy(
@@ -115,6 +187,12 @@ class _StubLLM:
     def service_tier(self) -> str | None:
         return self._service_tier
 
+    @property
+    def model_info(self) -> ModelInfo | None:
+        if self._model_info_override is not None:
+            return self._model_info_override
+        return ModelInfo.from_name(self.model_name, self.provider)
+
     def set_web_search_enabled(self, value: bool | None) -> None:
         if value is not None and not self.web_search_supported:
             raise ValueError("Current model does not support web search configuration.")
@@ -142,10 +220,38 @@ class _StubShellRuntime:
 
 
 class _StubAgent:
-    def __init__(self, llm: _StubLLM, shell_limit: int | None = None) -> None:
+    def __init__(
+        self,
+        llm: _StubLLM,
+        shell_limit: int | None = None,
+        *,
+        set_model_error: Exception | None = None,
+    ) -> None:
         self.llm = llm
         self._llm = llm
         self.shell_runtime = _StubShellRuntime(shell_limit) if shell_limit is not None else None
+        self.config = type("Config", (), {"model": llm.model_name})()
+        self._set_model_error = set_model_error
+
+    async def set_model(self, model: str | None) -> None:
+        if self._set_model_error is not None:
+            raise self._set_model_error
+        self.config.model = model
+        if model is not None:
+            self.llm.model_name = model
+            self._llm.model_name = model
+            self.llm.resolved_model = ResolvedModelSpec(
+                raw_input=model,
+                selected_model_name=model,
+                source="direct",
+                model_config=ModelConfig(provider=self.llm.provider, model_name=model),
+                provider=self.llm.provider,
+                wire_model_name=model,
+            )
+            self._llm.resolved_model = self.llm.resolved_model
+
+    def clear(self, *, clear_prompts: bool = False) -> None:
+        del clear_prompts
 
 
 class _StubAgentProvider:
@@ -155,8 +261,18 @@ class _StubAgentProvider:
     def _agent(self, name: str) -> _StubAgent:  # noqa: ARG002
         return self._instance
 
-    def agent_names(self):
+    def visible_agent_names(self, *, force_include: str | None = None):
+        del force_include
         return ["test"]
+
+    def registered_agent_names(self):
+        return ["test"]
+
+    def registered_agents(self):
+        return {"test": self._instance}
+
+    def resolve_target_agent_name(self, agent_name: str | None = None):
+        return agent_name or "test"
 
     async def list_prompts(self, namespace: str | None, agent_name: str | None = None):  # noqa: ARG002
         return {}
@@ -177,9 +293,47 @@ async def test_model_reasoning_includes_shell_budget_details() -> None:
     text_messages = [str(m.text) for m in outcome.messages]
 
     assert "Provider: responses." in text_messages
-    assert "Resolved model: claude-opus-4-6." in text_messages
+    assert "Selected model: claude-opus-4-6." in text_messages
+    assert "Display model: claude-opus-4-6." in text_messages
+    assert "Wire model: claude-opus-4-6." in text_messages
     assert "Model max output tokens: 128000." in text_messages
-    assert "Shell output budget: 21120 bytes (~6400 tokens, active runtime)." in text_messages
+    assert "Shell output budget: 21120 bytes (~6.4k tokens, active runtime)." in text_messages
+
+
+@pytest.mark.asyncio
+async def test_model_reasoning_is_overlay_aware_for_context_and_output_limits() -> None:
+    llm = _StubLLM(
+        "claude-haiku-4-5",
+        provider=Provider.ANTHROPIC,
+        selected_model_name="haikutiny",
+        overlay_name="haikutiny",
+        model_info_override=ModelInfo(
+            name="claude-haiku-4-5",
+            provider=Provider.ANTHROPIC,
+            context_window=8192,
+            max_output_tokens=1024,
+            tokenizes=["text/plain"],
+            json_mode=None,
+            reasoning=None,
+        ),
+    )
+    provider = _StubAgentProvider(_StubAgent(llm, shell_limit=None))
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_reasoning(ctx, agent_name="test", value=None)
+    text_messages = [str(m.text) for m in outcome.messages]
+
+    assert "Provider: anthropic." in text_messages
+    assert "Selected model: haikutiny." in text_messages
+    assert "Display model: haikutiny." in text_messages
+    assert "Wire model: claude-haiku-4-5." in text_messages
+    assert "Context window: 8192." in text_messages
+    assert "Model max output tokens: 1024." in text_messages
 
 
 @pytest.mark.asyncio
@@ -196,7 +350,7 @@ async def test_model_reasoning_includes_config_override_budget_when_runtime_miss
     outcome = await handle_model_reasoning(ctx, agent_name="test", value=None)
     text_messages = [str(m.text) for m in outcome.messages]
 
-    assert "Shell output budget: 9000 bytes (~2727 tokens, config override)." in text_messages
+    assert "Shell output budget: 9000 bytes (~2.7k tokens, config override)." in text_messages
 
 
 @pytest.mark.asyncio
@@ -266,7 +420,7 @@ async def test_model_reasoning_shows_model_details_when_reasoning_unsupported() 
     text_messages = [str(m.text) for m in outcome.messages]
 
     assert "Provider: responses." in text_messages
-    assert "Resolved model: gpt-4.1." in text_messages
+    assert "Selected model: gpt-4.1." in text_messages
     assert "Current model does not support reasoning effort configuration." in text_messages
 
 
@@ -301,6 +455,31 @@ async def test_model_reasoning_displays_sampling_overrides() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_reasoning_rounds_noisy_sampling_override_floats() -> None:
+    llm = _StubLLM(
+        "unsloth/Qwen3.5-9B-GGUF",
+        sampling_overrides={
+            "temperature": 0.800000011920929,
+            "top_p": 0.949999988079071,
+            "top_k": 40,
+            "min_p": 0.05000000074505806,
+        },
+    )
+    provider = _StubAgentProvider(_StubAgent(llm, shell_limit=None))
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_reasoning(ctx, agent_name="test", value=None)
+    text_messages = [str(m.text) for m in outcome.messages]
+
+    assert "Sampling overrides: temperature=0.8, top_p=0.95, top_k=40, min_p=0.05." in text_messages
+
+
+@pytest.mark.asyncio
 async def test_model_verbosity_shows_model_details_when_unsupported() -> None:
     llm = _StubLLM("o1")
     llm.text_verbosity_spec = None
@@ -316,7 +495,7 @@ async def test_model_verbosity_shows_model_details_when_unsupported() -> None:
     text_messages = [str(m.text) for m in outcome.messages]
 
     assert "Provider: responses." in text_messages
-    assert "Resolved model: o1." in text_messages
+    assert "Selected model: o1." in text_messages
     assert "Current model does not support text verbosity configuration." in text_messages
 
 
@@ -484,3 +663,141 @@ async def test_model_web_search_rejects_invalid_value() -> None:
     text_messages = [str(m.text) for m in outcome.messages]
 
     assert "Invalid web_search value 'maybe'. Allowed values: on, off, default." in text_messages
+
+
+@pytest.mark.asyncio
+async def test_model_switch_sets_explicit_model_and_requests_session_reset() -> None:
+    llm = _StubLLM("claude-haiku-4-5")
+    agent = _StubAgent(llm)
+    provider = _StubAgentProvider(agent)
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value="gpt-4.1-mini")
+
+    assert agent.config.model == "gpt-4.1-mini"
+    assert llm.model_name == "gpt-4.1-mini"
+    assert outcome.reset_session is True
+    assert any(
+        str(message.text) == "Model: switched from claude-haiku-4-5 to gpt-4.1-mini."
+        for message in outcome.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_switch_uses_selector_when_value_missing() -> None:
+    llm = _StubLLM("claude-haiku-4-5")
+    agent = _StubAgent(llm)
+    provider = _StubAgentProvider(agent)
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(model_selection_response="gpt-5-mini"),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value=None)
+
+    assert agent.config.model == "gpt-5-mini"
+    assert llm.model_name == "gpt-5-mini"
+    assert outcome.reset_session is True
+
+
+@pytest.mark.asyncio
+async def test_model_switch_reopens_overlay_selection_on_overlay_provider() -> None:
+    llm = _StubLLM(
+        "claude-haiku-4-5",
+        provider=Provider.ANTHROPIC,
+        selected_model_name="haikutiny",
+        overlay_name="haikutiny",
+    )
+    agent = _StubAgent(llm)
+    provider = _StubAgentProvider(agent)
+    io = _StubIO(model_selection_response="haikutiny")
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=io,
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value=None)
+
+    assert io.last_initial_provider == "overlays"
+    assert io.last_default_model == "haikutiny"
+    assert outcome.reset_session is False
+    assert any("already active" in str(message.text) for message in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_reopens_vertex_selection_for_anthropic_vertex_model() -> None:
+    llm = _StubLLM(
+        "claude-sonnet-4-6",
+        provider=Provider.ANTHROPIC_VERTEX,
+        selected_model_name="anthropic-vertex.claude-sonnet-4-6",
+    )
+    agent = _StubAgent(llm)
+    provider = _StubAgentProvider(agent)
+    io = _StubIO(model_selection_response="anthropic-vertex.claude-sonnet-4-6")
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=io,
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value=None)
+
+    assert io.last_initial_provider == "anthropic-vertex"
+    assert io.last_default_model == "anthropic-vertex.claude-sonnet-4-6"
+    assert outcome.reset_session is False
+    assert any("already active" in str(message.text) for message in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_does_not_reset_session_when_model_is_already_active() -> None:
+    llm = _StubLLM("gpt-5-mini")
+    agent = _StubAgent(llm)
+    provider = _StubAgentProvider(agent)
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value="gpt-5-mini")
+
+    assert outcome.reset_session is False
+    assert any("already active" in str(message.text) for message in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_returns_model_config_errors_without_raising() -> None:
+    llm = _StubLLM("claude-haiku-4-5")
+    agent = _StubAgent(
+        llm,
+        set_model_error=ModelConfigError(
+            "Model reference '$system.typo' could not be resolved",
+            "Available references: $system.default",
+        ),
+    )
+    provider = _StubAgentProvider(agent)
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test",
+        io=_StubIO(),
+        settings=Settings(),
+    )
+
+    outcome = await handle_model_switch(ctx, agent_name="test", value="$system.typo")
+    text_messages = [str(message.text) for message in outcome.messages]
+
+    assert outcome.reset_session is False
+    assert text_messages == [
+        "Model reference '$system.typo' could not be resolved: Available references: $system.default"
+    ]

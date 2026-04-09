@@ -37,19 +37,19 @@ class _SmartAgentStub:
 
 
 @pytest.mark.asyncio
-async def test_run_slash_command_models_doctor_returns_markdown(tmp_path: Path) -> None:
+async def test_run_slash_command_model_doctor_returns_markdown(tmp_path: Path) -> None:
     settings = Settings(environment_dir=str(tmp_path / ".fast-agent"))
     agent = _SmartAgentStub(settings=settings)
 
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
-        result = await _run_slash_command_call(agent, "/models doctor")
+        result = await _run_slash_command_call(agent, "/model doctor")
     finally:
         os.chdir(previous_cwd)
 
-    assert "# models.doctor" in result
-    assert "models doctor" in result
+    assert "# model.doctor" in result
+    assert "model doctor" in result
 
 
 @pytest.mark.asyncio
@@ -59,6 +59,15 @@ async def test_run_slash_command_check_rejects_invalid_argument_syntax(tmp_path:
 
     with pytest.raises(AgentConfigError, match="Invalid check arguments"):
         await _run_slash_command_call(agent, '/check "')
+
+
+@pytest.mark.asyncio
+async def test_run_slash_command_mcp_connect_wraps_parse_errors(tmp_path: Path) -> None:
+    settings = Settings(environment_dir=str(tmp_path / ".fast-agent"))
+    agent = _SmartAgentStub(settings=settings)
+
+    with pytest.raises(AgentConfigError, match="Invalid /mcp connect arguments"):
+        await _run_slash_command_call(agent, "/mcp connect npx demo-server --timeout 0")
 
 
 @pytest.mark.asyncio
@@ -136,4 +145,4 @@ async def test_run_slash_command_cards_help_returns_usage(tmp_path: Path) -> Non
 
     result = await _run_slash_command_call(agent, "/cards --help")
 
-    assert "Usage: /cards [list|add|remove|update|publish|registry|help] [args]" in result
+    assert "Usage: /cards [list|add|remove|readme|update|publish|registry|help] [args]" in result

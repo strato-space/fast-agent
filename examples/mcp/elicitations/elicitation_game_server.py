@@ -9,15 +9,14 @@ import logging
 import random
 import sys
 
-from mcp import ReadResourceResult
-from mcp.server.elicitation import (
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
-from mcp.server.fastmcp import FastMCP
-from mcp.types import TextResourceContents
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(
@@ -28,36 +27,37 @@ logging.basicConfig(
 logger = logging.getLogger("elicitation_game_server")
 
 # Create MCP server
-mcp = FastMCP("Game Character Creation Server", log_level="INFO")
+mcp = FastMCP("Game Character Creation Server")
+
+
+class GameCharacter(BaseModel):
+    character_name: str = Field(description="Name your character", min_length=2, max_length=30)
+    character_class: str = Field(
+        description="Choose your class",
+        json_schema_extra={
+            "enum": ["warrior", "mage", "rogue", "ranger", "paladin", "bard"],
+            "enumNames": [
+                "⚔️ Warrior",
+                "🔮 Mage",
+                "🗡️ Rogue",
+                "🏹 Ranger",
+                "🛡️ Paladin",
+                "🎵 Bard",
+            ],
+        },
+    )
+    strength: int = Field(description="Strength (3-18)", ge=3, le=18, default=10)
+    intelligence: int = Field(description="Intelligence (3-18)", ge=3, le=18, default=10)
+    dexterity: int = Field(description="Dexterity (3-18)", ge=3, le=18, default=10)
+    charisma: int = Field(description="Charisma (3-18)", ge=3, le=18, default=10)
+    lucky_dice: bool = Field(False, description="Roll for a lucky bonus?")
 
 
 @mcp.resource(uri="elicitation://game-character")
-async def game_character() -> ReadResourceResult:
+async def game_character() -> str:
     """Fun game character creation form for the whimsical example."""
 
-    class GameCharacter(BaseModel):
-        character_name: str = Field(description="Name your character", min_length=2, max_length=30)
-        character_class: str = Field(
-            description="Choose your class",
-            json_schema_extra={
-                "enum": ["warrior", "mage", "rogue", "ranger", "paladin", "bard"],
-                "enumNames": [
-                    "⚔️ Warrior",
-                    "🔮 Mage",
-                    "🗡️ Rogue",
-                    "🏹 Ranger",
-                    "🛡️ Paladin",
-                    "🎵 Bard",
-                ],
-            },
-        )
-        strength: int = Field(description="Strength (3-18)", ge=3, le=18, default=10)
-        intelligence: int = Field(description="Intelligence (3-18)", ge=3, le=18, default=10)
-        dexterity: int = Field(description="Dexterity (3-18)", ge=3, le=18, default=10)
-        charisma: int = Field(description="Charisma (3-18)", ge=3, le=18, default=10)
-        lucky_dice: bool = Field(False, description="Roll for a lucky bonus?")
-
-    result = await mcp.get_context().elicit("🎮 Create Your Game Character!", schema=GameCharacter)
+    result = await get_context().elicit("🎮 Create Your Game Character!", GameCharacter)
 
     match result:
         case AcceptedElicitation(data=data):
@@ -93,13 +93,7 @@ async def game_character() -> ReadResourceResult:
         case CancelledElicitation():
             response = "Character creation cancelled"
 
-    return ReadResourceResult(
-        contents=[
-            TextResourceContents(
-                mimeType="text/plain", uri=AnyUrl("elicitation://game-character"), text=response
-            )
-        ]
-    )
+    return response
 
 
 @mcp.tool()
@@ -114,30 +108,8 @@ async def roll_new_character(campaign_name: str = "Adventure") -> str:
         Character details or status message
     """
 
-    class GameCharacter(BaseModel):
-        character_name: str = Field(description="Name your character", min_length=2, max_length=30)
-        character_class: str = Field(
-            description="Choose your class",
-            json_schema_extra={
-                "enum": ["warrior", "mage", "rogue", "ranger", "paladin", "bard"],
-                "enumNames": [
-                    "⚔️ Warrior",
-                    "🔮 Mage",
-                    "🗡️ Rogue",
-                    "🏹 Ranger",
-                    "🛡️ Paladin",
-                    "🎵 Bard",
-                ],
-            },
-        )
-        strength: int = Field(description="Strength (3-18)", ge=3, le=18, default=10)
-        intelligence: int = Field(description="Intelligence (3-18)", ge=3, le=18, default=10)
-        dexterity: int = Field(description="Dexterity (3-18)", ge=3, le=18, default=10)
-        charisma: int = Field(description="Charisma (3-18)", ge=3, le=18, default=10)
-        lucky_dice: bool = Field(False, description="Roll for a lucky bonus?")
-
-    result = await mcp.get_context().elicit(
-        f"🎮 Create Character for {campaign_name}!", schema=GameCharacter
+    result = await get_context().elicit(
+        f"🎮 Create Character for {campaign_name}!", GameCharacter
     )
 
     match result:

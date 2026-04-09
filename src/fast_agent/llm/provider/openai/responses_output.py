@@ -8,6 +8,7 @@ from mcp.types import CallToolRequest, CallToolRequestParams, ContentBlock, Text
 from openai.types.responses import ResponseReasoningItem
 from pydantic_core import from_json
 
+from fast_agent.core.logging.json_serializer import snapshot_json_value
 from fast_agent.event_progress import ProgressAction
 from fast_agent.llm.provider.openai.web_tools import (
     extract_url_citation_payload,
@@ -17,7 +18,10 @@ from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.usage_tracking import CacheUsage, TurnUsage
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.tools.apply_patch_tool import APPLY_PATCH_INPUT_FIELD
-from fast_agent.types.assistant_message_phase import AssistantMessagePhase
+from fast_agent.types.assistant_message_phase import (
+    AssistantMessagePhase,
+    coerce_assistant_message_phase,
+)
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
 
@@ -59,14 +63,37 @@ class ResponsesOutputMixin:
     def _coerce_assistant_message_phase(
         raw_phase: object,
     ) -> AssistantMessagePhase | None:
-        if isinstance(raw_phase, AssistantMessagePhase):
-            return raw_phase
-        if isinstance(raw_phase, str):
-            try:
-                return AssistantMessagePhase.from_string(raw_phase)
-            except ValueError:
-                return None
-        return None
+        return coerce_assistant_message_phase(raw_phase)
+
+    @staticmethod
+    def _extract_phase_message_text(content: object) -> str | None:
+        if not isinstance(content, Sequence) or isinstance(content, str):
+            return None
+
+        text_segments: list[str] = []
+        for part in content:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text:
+                text_segments.append(part_text)
+
+        combined_text = "".join(text_segments).strip()
+        return combined_text or None
+
+    @classmethod
+    def _print_phase_message(
+        cls,
+        output_item: Any,
+        serialized_item: Mapping[str, Any] | None = None,
+    ) -> None:
+        phase = cls._coerce_assistant_message_phase(getattr(output_item, "phase", None))
+        if phase is None:
+            return
+
+        content_text = cls._extract_phase_message_text(getattr(output_item, "content", None))
+        if content_text is None and serialized_item is not None:
+            content_text = json.dumps(dict(serialized_item), ensure_ascii=False)
+        if not content_text:
+            return
 
     @classmethod
     def _serialize_assistant_message_item(cls, item: Any) -> dict[str, Any] | None:
@@ -82,7 +109,7 @@ class ResponsesOutputMixin:
                 raw_phase = payload.get("phase")
                 normalized_phase = cls._coerce_assistant_message_phase(raw_phase)
                 if normalized_phase is not None:
-                    payload["phase"] = normalized_phase.value
+                    payload["phase"] = normalized_phase
                 else:
                     payload.pop("phase", None)
                 return payload
@@ -102,7 +129,7 @@ class ResponsesOutputMixin:
             payload["status"] = status
         phase = cls._coerce_assistant_message_phase(getattr(item, "phase", None))
         if phase is not None:
-            payload["phase"] = phase.value
+            payload["phase"] = phase
 
         serialized_content: list[dict[str, Any]] = []
         for part in getattr(item, "content", []) or []:
@@ -149,20 +176,25 @@ class ResponsesOutputMixin:
 
             serialized_item = self._serialize_assistant_message_item(output_item)
             if serialized_item is not None:
+                self._print_phase_message(output_item, serialized_item)
                 serialized_items.append(serialized_item)
 
         if not phases:
             return [], None
 
-        unique_phases = {phase.value for phase in phases}
+        unique_phases = set(phases)
         message_phase = phases[0] if len(unique_phases) == 1 else None
-        blocks = [TextContent(type="text", text=json.dumps(payload)) for payload in serialized_items]
+        blocks: list[ContentBlock] = [
+            TextContent(type="text", text=json.dumps(payload)) for payload in serialized_items
+        ]
         return blocks, message_phase
 
     def _record_usage(self, usage: Any, model_name: str) -> None:
         try:
             provider_value = getattr(self, "provider", Provider.RESPONSES)
-            provider = provider_value if isinstance(provider_value, Provider) else Provider.RESPONSES
+            provider = (
+                provider_value if isinstance(provider_value, Provider) else Provider.RESPONSES
+            )
             input_tokens = getattr(usage, "input_tokens", 0) or 0
             output_tokens = getattr(usage, "output_tokens", 0) or 0
             total_tokens = getattr(usage, "total_tokens", 0) or (input_tokens + output_tokens)
@@ -184,7 +216,7 @@ class ResponsesOutputMixin:
                 total_tokens=total_tokens,
                 cache_usage=cache_usage,
                 reasoning_tokens=reasoning_tokens,
-                raw_usage=usage,
+                raw_usage=snapshot_json_value(usage),
             )
             self._finalize_turn_usage(turn_usage)
         except Exception as e:
@@ -306,14 +338,13 @@ class ResponsesOutputMixin:
     ) -> list[ContentBlock]:
         reasoning_blocks: list[ContentBlock] = []
         for output_item in getattr(response, "output", []) or []:
-            if not isinstance(output_item, ResponseReasoningItem) and getattr(
-                output_item, "type", None
-            ) != "reasoning":
+            if (
+                not isinstance(output_item, ResponseReasoningItem)
+                and getattr(output_item, "type", None) != "reasoning"
+            ):
                 continue
             summary = getattr(output_item, "summary", None) or []
-            summary_text = "\n".join(
-                part.text for part in summary if getattr(part, "text", None)
-            )
+            summary_text = "\n".join(part.text for part in summary if getattr(part, "text", None))
             if summary_text.strip():
                 reasoning_blocks.append(text_content(summary_text.strip()))
         if reasoning_blocks:
@@ -343,7 +374,9 @@ class ResponsesOutputMixin:
         return encrypted_blocks
 
     @staticmethod
-    def _web_citation_dedupe_key(payload: Mapping[str, Any]) -> tuple[str, str] | tuple[str, str, str]:
+    def _web_citation_dedupe_key(
+        payload: Mapping[str, Any],
+    ) -> tuple[str, str] | tuple[str, str, str]:
         raw_url = payload.get("url")
         if isinstance(raw_url, str) and raw_url:
             return ("url", raw_url.strip().lower())
@@ -372,7 +405,9 @@ class ResponsesOutputMixin:
             if item_type == "web_search_call":
                 tool_payload, call_citations = normalize_web_search_call_payload(output_item)
                 if tool_payload is not None:
-                    web_tool_payloads.append(TextContent(type="text", text=json.dumps(tool_payload)))
+                    web_tool_payloads.append(
+                        TextContent(type="text", text=json.dumps(tool_payload))
+                    )
                 for citation in call_citations:
                     append_citation(citation)
                 continue
@@ -394,3 +429,52 @@ class ResponsesOutputMixin:
                         append_citation(payload)
 
         return web_tool_payloads, citation_payloads
+
+    @staticmethod
+    def _normalize_provider_mcp_output_item(output_item: Any) -> dict[str, Any] | None:
+        item_type = getattr(output_item, "type", None)
+        if item_type not in {"mcp_list_tools", "mcp_call"}:
+            return None
+
+        payload: dict[str, Any] = {
+            "type": "mcp_tool_use",
+            "provider_tool_type": item_type,
+            "name": getattr(output_item, "name", None)
+            or getattr(output_item, "tool_name", None)
+            or item_type,
+        }
+        item_id = getattr(output_item, "id", None)
+        if isinstance(item_id, str) and item_id:
+            payload["id"] = item_id
+        status = getattr(output_item, "status", None)
+        if isinstance(status, str) and status:
+            payload["status"] = status
+        server_label = getattr(output_item, "server_label", None)
+        if isinstance(server_label, str) and server_label:
+            payload["server_name"] = server_label
+        arguments = getattr(output_item, "arguments", None)
+        if isinstance(arguments, str) and arguments:
+            payload["arguments"] = arguments
+            try:
+                parsed_arguments = from_json(arguments, allow_partial=True)
+            except Exception:
+                parsed_arguments = None
+            if isinstance(parsed_arguments, Mapping):
+                payload["input"] = dict(parsed_arguments)
+        return payload
+
+    def _extract_provider_mcp_metadata(
+        self,
+        response: Any,
+    ) -> list[ContentBlock]:
+        payloads: list[ContentBlock] = []
+        for output_item in getattr(response, "output", []) or []:
+            item_type = getattr(output_item, "type", None)
+            if item_type == "mcp_approval_request":
+                raise RuntimeError(
+                    "OpenAI MCP approval requests are not supported by fast-agent yet."
+                )
+            payload = self._normalize_provider_mcp_output_item(output_item)
+            if payload is not None:
+                payloads.append(TextContent(type="text", text=json.dumps(payload)))
+        return payloads

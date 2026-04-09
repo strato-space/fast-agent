@@ -5,11 +5,18 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from acp.helpers import text_block, tool_content
-from acp.schema import ToolCallProgress, ToolCallStart
+from acp.schema import (
+    ContentToolCallContent,
+    FileEditToolCallContent,
+    TerminalToolCallContent,
+    ToolCallProgress,
+    ToolCallStart,
+)
 
 from fast_agent.acp import ACPAwareMixin, ACPCommand
 from fast_agent.acp.acp_aware_mixin import ACPModeInfo
@@ -38,6 +45,57 @@ from hf_inference_acp.wizard.model_catalog import format_model_list_help
 logger = get_logger(__name__)
 
 
+def _package_version(distribution_name: str) -> str | None:
+    try:
+        return package_version(distribution_name)
+    except Exception:
+        return None
+
+
+def _render_setup_check_markdown(
+    *,
+    hf_inference_acp_version: str | None,
+    fast_agent_version: str | None,
+    huggingface_hub_version: str | None,
+    hf_token_source: str | None,
+    config_exists: bool,
+    default_model: str,
+) -> str:
+    """Render `/check` output as markdown, consistent with other ACP commands."""
+    lines = ["# check", ""]
+
+    lines.append("## Runtime")
+    lines.append(
+        f"- **hf-inference-acp**: `{hf_inference_acp_version or 'unknown'}`"
+    )
+    lines.append(f"- **fast-agent-mcp**: `{fast_agent_version or 'unknown'}`")
+    if huggingface_hub_version:
+        lines.append(f"- **huggingface_hub**: `{huggingface_hub_version}`")
+    else:
+        lines.append("- **huggingface_hub**: not installed")
+        lines.append("  - Install with `uv tool install -U huggingface_hub`")
+
+    lines.append("")
+    lines.append("## Authentication")
+    if hf_token_source:
+        lines.append(f"- **HF_TOKEN**: set (`{hf_token_source}`)")
+    else:
+        lines.append("- **HF_TOKEN**: not set")
+        lines.append("  - Use `/login` or set `HF_TOKEN` in your environment")
+
+    lines.append("")
+    lines.append("## Configuration")
+    lines.append(f"- **Config file**: `{CONFIG_FILE}`")
+    if config_exists:
+        lines.append("  - **Status**: exists")
+        lines.append(f"  - **Default model**: `{default_model}`")
+    else:
+        lines.append("  - **Status**: will be created on first use")
+        lines.append(f"  - **Default model**: `{default_model}`")
+
+    return "\n".join(lines)
+
+
 def _normalize_hf_model(model: str) -> str:
     """Normalize a HuggingFace model string by adding hf. prefix if needed.
 
@@ -52,12 +110,14 @@ def _normalize_hf_model(model: str) -> str:
     """
     from fast_agent.llm.model_factory import ModelFactory
 
+    presets = ModelFactory.get_runtime_presets()
+
     # Already has hf. prefix
     if model.startswith("hf."):
         return model
 
     # Check if it's a known alias
-    if model in ModelFactory.MODEL_ALIASES:
+    if model in presets:
         return model
 
     # If it has org/model format, add hf. prefix
@@ -79,7 +139,7 @@ def _resolve_alias_display(model: str) -> tuple[str, str] | None:
     if ":" in model:
         alias_key, alias_suffix = model.rsplit(":", 1)
 
-    alias_target = ModelFactory.MODEL_ALIASES.get(alias_key)
+    alias_target = ModelFactory.get_runtime_presets().get(alias_key)
     if not alias_target:
         return None
 
@@ -281,7 +341,7 @@ class SetupAgent(ACPAwareMixin, McpAgent):
             return f"Error: Invalid model `{model}` - {e}"
 
         # Validate model exists on HuggingFace and has providers
-        validation = await validate_hf_model(model, aliases=ModelFactory.MODEL_ALIASES)
+        validation = await validate_hf_model(model, presets=ModelFactory.get_runtime_presets())
         if not validation.valid:
             return validation.error or "Error: Model validation failed"
 
@@ -321,44 +381,30 @@ class SetupAgent(ACPAwareMixin, McpAgent):
 
     async def _handle_check(self, arguments: str) -> str:
         """Handler for /check command."""
-        lines = ["# Hugging Face Configuration Check\n"]
+        del arguments
 
-        # Check huggingface_hub installation
+        huggingface_hub_version: str | None = None
         try:
             import huggingface_hub
 
-            lines.append(
-                f"- **huggingface_hub**: installed (version {huggingface_hub.__version__})"
-            )
+            huggingface_hub_version = str(huggingface_hub.__version__)
         except ImportError:
-            lines.append("- **huggingface_hub**: NOT INSTALLED")
-            lines.append("  Run: `uv tool install -U huggingface_hub`")
+            huggingface_hub_version = None
 
-        # Check HF_TOKEN
+        token_source: str | None = None
         if has_hf_token():
             # Prefer the original discovery source recorded at startup (if present),
             # otherwise re-run discovery (may report "env" if auto-populated).
-            source = os.environ.get("FAST_AGENT_HF_TOKEN_SOURCE") or get_hf_token_source()
-            suffix = f" (source: {source})" if source else ""
-            lines.append(f"- **HF_TOKEN**: set{suffix}")
-        else:
-            lines.append("- **HF_TOKEN**: NOT SET")
-            lines.append("  Use `/login` or set `HF_TOKEN` environment variable")
+            token_source = os.environ.get("FAST_AGENT_HF_TOKEN_SOURCE") or get_hf_token_source()
 
-        # Check config file and show model with provider info
-        lines.append(f"- **Config file**: `{CONFIG_FILE}`")
-        if CONFIG_FILE.exists():
-            lines.append("  - Status: exists")
-            lines.append(f"  - Default model: `{get_default_model()}`")
-
-            # provider_info = await self._get_model_provider_info(default_model)
-            # if provider_info:
-            #     lines.append(f"  - {provider_info}")
-
-        else:
-            lines.append("  - Status: will be created on first use")
-
-        return "\n".join(lines)
+        return _render_setup_check_markdown(
+            hf_inference_acp_version=_package_version("hf-inference-acp"),
+            fast_agent_version=_package_version("fast-agent-mcp"),
+            huggingface_hub_version=huggingface_hub_version,
+            hf_token_source=token_source,
+            config_exists=CONFIG_FILE.exists(),
+            default_model=get_default_model(),
+        )
 
     async def _handle_reset(self, arguments: str) -> str:
         """Handler for /reset command."""
@@ -599,7 +645,14 @@ class HuggingFaceAgent(ACPAwareMixin, McpAgent):
             if not self.acp:
                 return
             try:
-                content = [tool_content(text_block(message))] if message else None
+                content: (
+                    list[
+                        ContentToolCallContent
+                        | FileEditToolCallContent
+                        | TerminalToolCallContent
+                    ]
+                    | None
+                ) = [tool_content(text_block(message))] if message else None
                 await self.acp.send_session_update(
                     ToolCallProgress(
                         tool_call_id=tool_call_id,
@@ -705,7 +758,7 @@ class HuggingFaceAgent(ACPAwareMixin, McpAgent):
             return f"Error: Invalid model `{model}` - {e}"
 
         # Validate model exists on HuggingFace and has providers
-        validation = await validate_hf_model(model, aliases=ModelFactory.MODEL_ALIASES)
+        validation = await validate_hf_model(model, presets=ModelFactory.get_runtime_presets())
         if not validation.valid:
             return validation.error or "Error: Model validation failed"
 

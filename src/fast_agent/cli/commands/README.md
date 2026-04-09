@@ -23,15 +23,32 @@ fast-agent go [OPTIONS]
 - `--auth TEXT`: Bearer token for authorization with URL-based servers
 - `--client-metadata-url TEXT`: OAuth Client ID Metadata Document URL for URL-based servers
 - `--model TEXT`: Override the default model (e.g., haiku, sonnet, gpt-4)
-- `--message`, `-m TEXT`: Message to send to the agent (skips interactive mode)
-- `--prompt-file`, `-p TEXT`: Path to a prompt file to use (either text or JSON)
+- `--pack`, `--card-pack TEXT`: Install or reuse a named card pack in the selected environment before launch
+- `--pack-registry TEXT`: Marketplace URL or file used to resolve `--pack` when it is not already installed
+- `--message`, `-m TEXT`: Message to send to the agent once, then exit
+- `--prompt-file`, `-p TEXT`: Prompt file to send to the agent once, then exit (either text or JSON)
 - `--quiet`: Disable progress display and logging
+
+The `--model` value can include query overrides such as
+`gpt-5?reasoning=low`, `claude-sonnet-4-6?web_search=on`, or
+`claude-sonnet-4-5?context=1m`. For Anthropic, `?context=1m` is only needed for
+earlier Sonnet 4 / Sonnet 4.5 models; Sonnet 4.6 and Opus 4.6 already have long
+context enabled by default.
+
+When you use `--pack`, the `--model` value is still a fallback. If an AgentCard
+inside the pack declares an explicit model, that card model takes precedence.
 
 ### Examples
 
 ```bash
 # Basic usage with interactive mode
 fast-agent go --model=haiku
+
+# Install or reuse a card pack, then launch immediately
+fast-agent go --pack analyst --model haiku
+
+# Resolve the pack from a specific marketplace file and target a specific agent
+fast-agent go --pack analyst --pack-registry ./marketplace.json --agent planner --model haiku
 
 # Specifying servers from configuration
 fast-agent go --servers=fetch,filesystem --model=haiku
@@ -45,7 +62,7 @@ fast-agent go --url=https://api.example.com/mcp --auth=YOUR_API_TOKEN
 # Non-interactive mode with a single message
 fast-agent go --message="What is the weather today?" --model=haiku
 
-# Using a prompt file
+# Non-interactive mode with a prompt file
 fast-agent go --prompt-file=my-prompt.txt --model=haiku
 ```
 
@@ -93,9 +110,9 @@ fast-agent serve [OPTIONS]
 - `--npx TEXT`: NPX package and args to run as an MCP server (quoted)
 - `--uvx TEXT`: UVX package and args to run as an MCP server (quoted)
 - `--stdio TEXT`: Command to run as STDIO MCP server (quoted)
-- `--transport [http|sse|stdio|acp]`: Transport protocol to expose (default: http)
-- `--host TEXT`: Host address when using HTTP or SSE transport (default: 0.0.0.0)
-- `--port INTEGER`: Port when using HTTP or SSE transport (default: 8000)
+- `--transport [http|stdio|acp]`: Transport protocol to expose (default: http)
+- `--host TEXT`: Host address when using HTTP transport (default: 0.0.0.0)
+- `--port INTEGER`: Port when using HTTP transport (default: 8000)
 - `--shell`, `-x`: Enable a local shell runtime and expose the execute tool
 - `--description`, `-d TEXT`: Description used for each send tool (supports `{agent}` placeholder)
 - `--tool-name-template TEXT`: Template for exposed agent tool names (supports `{agent}` placeholder)
@@ -112,9 +129,6 @@ When configuring agents in code, `skills=None` explicitly disables skills for th
 ```bash
 # HTTP transport on default port
 fast-agent serve --model=haiku --transport=http
-
-# SSE transport on a custom port
-fast-agent serve --transport=sse --port=8723
 
 # Expose an MCP stdio server alongside the agent
 fast-agent serve --stdio "python my_server.py --debug"

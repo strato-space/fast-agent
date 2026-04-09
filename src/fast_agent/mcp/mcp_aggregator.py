@@ -9,6 +9,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Iterable,
     Mapping,
     TypeVar,
     Union,
@@ -17,6 +18,7 @@ from typing import (
 
 from mcp import GetPromptResult, ReadResourceResult
 from mcp.client.session import ClientSession
+from mcp.shared.exceptions import McpError
 from mcp.shared.session import ProgressFnT
 from mcp.types import (
     CallToolResult,
@@ -38,7 +40,11 @@ from fast_agent.context_dependent import ContextDependent
 from fast_agent.core.exceptions import ServerSessionTerminatedError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.logging.progress_payloads import build_progress_payload
-from fast_agent.core.model_resolution import HARDCODED_DEFAULT_MODEL, resolve_model_spec
+from fast_agent.core.model_resolution import (
+    HARDCODED_DEFAULT_MODEL,
+    get_context_cli_model_override,
+    resolve_model_spec,
+)
 from fast_agent.event_progress import ProgressAction
 from fast_agent.mcp.common import SEP, create_namespaced_name, is_namespaced_name
 from fast_agent.mcp.experimental_session_client import ExperimentalSessionClient
@@ -83,6 +89,25 @@ R = TypeVar("R")
 
 SESSION_NOT_FOUND_ERROR_CODE = -32043
 LEGACY_SESSION_REQUIRED_ERROR_CODE = -32002
+METHOD_NOT_FOUND_ERROR_CODE = -32601
+METHOD_NOT_FOUND_MESSAGE = "method not found"
+
+
+def _is_capability_probe_error(exc: Exception) -> bool:
+    """Return True when exc indicates a server does not support a probed method."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    if isinstance(exc, McpError):
+        code = getattr(getattr(exc, "error", None), "code", None)
+        if code == METHOD_NOT_FOUND_ERROR_CODE:
+            return True
+        # Only fall back to message matching when the server omitted the error code;
+        # if a different code is set, trust the code over the message text.
+        if code is None:
+            message = getattr(getattr(exc, "error", None), "message", None)
+            if isinstance(message, str) and METHOD_NOT_FOUND_MESSAGE in message.lower():
+                return True
+    return False
 
 
 class NamespacedTool(BaseModel):
@@ -208,6 +233,17 @@ class MCPAggregator(ContextDependent):
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
+    @staticmethod
+    def _unique_preserving_order(items: Iterable[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
+
     async def __aenter__(self):
         if self.initialized:
             return self
@@ -266,6 +302,7 @@ class MCPAggregator(ContextDependent):
         self._configured_server_names = list(server_names)
         self.server_names = list(server_names)
         self._attached_server_names: list[str] = []
+        self._supplemental_attached_server_names: list[str] = []
         self.connection_persistence = connection_persistence
         self.agent_name = name
         self.config = config  # Store the config for access in session factory
@@ -296,6 +333,10 @@ class MCPAggregator(ContextDependent):
         # Default to NoOpToolPermissionHandler if none provided (allows all).
         self._permission_handler = resolved_permission_handler or NoOpToolPermissionHandler()
 
+        # Server notification callback: async (server_name, notification) -> None
+        # Set this to receive MCP server notifications (log messages, resource updates, etc.)
+        self.server_notification_callback = None
+
         # Set up logger with agent name in namespace if available
         global logger
         logger_name = f"{__name__}.{name}" if name else __name__
@@ -320,6 +361,10 @@ class MCPAggregator(ContextDependent):
 
         # Track discovered Skybridge configurations per server
         self._skybridge_configs: dict[str, SkybridgeServerConfig] = {}
+
+        # Cache for server capabilities in non-persistent mode
+        self._capabilities_cache: dict[str, ServerCapabilities] = {}
+        self._capabilities_cache_lock = Lock()
 
         # Focused API for experimental data-layer session metadata controls.
         self.experimental_sessions = ExperimentalSessionClient(self)
@@ -459,13 +504,10 @@ class MCPAggregator(ContextDependent):
 
             # Access config directly if it was passed from BaseAgent
             if self.config:
-                cli_model_override = None
-                if self.context and getattr(self.context, "config", None):
-                    cli_model_override = getattr(self.context.config, "cli_model_override", None)
                 agent_model, model_source = resolve_model_spec(
                     self.context,
                     model=self.config.model,
-                    cli_model=cli_model_override,
+                    cli_model=get_context_cli_model_override(self.context),
                     hardcoded_default=HARDCODED_DEFAULT_MODEL,
                 )
                 if model_source:
@@ -488,6 +530,7 @@ class MCPAggregator(ContextDependent):
                 api_key=api_key,
                 elicitation_handler=elicitation_handler,
                 tool_list_changed_callback=self._handle_tool_list_changed,
+                aggregator=self,
                 **kwargs,  # Pass through any additional kwargs like server_config
             )
 
@@ -566,6 +609,9 @@ class MCPAggregator(ContextDependent):
         async with self._prompt_cache_lock:
             self._prompt_cache.clear()
 
+        async with self._capabilities_cache_lock:
+            self._capabilities_cache.clear()
+
         self._skybridge_configs.clear()
         self._attached_server_names = []
 
@@ -585,13 +631,12 @@ class MCPAggregator(ContextDependent):
                 method_args={},
             )
             return result.tools or []
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optimistic probe: degrade only for capability gaps
             if supports_tools:
-                logger.error(f"Error loading tools from server '{server_name}'", data=e)
-            else:
-                logger.debug(
-                    f"Server '{server_name}' does not provide tools (list_tools failed): {e}"
-                )
+                raise
+            if not _is_capability_probe_error(e):
+                raise
+            logger.debug(f"Server '{server_name}' does not provide tools (list_tools failed): {e}")
             return []
 
     async def _fetch_server_prompts(self, server_name: str) -> list[Prompt]:
@@ -655,6 +700,10 @@ class MCPAggregator(ContextDependent):
                 tools_total=len(existing_tool_names),
                 prompts_total=len(existing_prompt_names),
             )
+
+        if attach_options.force_reconnect:
+            async with self._capabilities_cache_lock:
+                self._capabilities_cache.pop(server_name, None)
 
         if self.connection_persistence:
             logger.info(
@@ -769,6 +818,9 @@ class MCPAggregator(ContextDependent):
         async with self._prompt_cache_lock:
             self._prompt_cache.pop(server_name, None)
 
+        async with self._capabilities_cache_lock:
+            self._capabilities_cache.pop(server_name, None)
+
         self._skybridge_configs.pop(server_name, None)
         self._attached_server_names = [
             name for name in self._attached_server_names if name != server_name
@@ -783,7 +835,12 @@ class MCPAggregator(ContextDependent):
         )
 
     def list_attached_servers(self) -> list[str]:
-        return list(self._attached_server_names)
+        return self._unique_preserving_order(
+            [*self._attached_server_names, *self._supplemental_attached_server_names]
+        )
+
+    def set_supplemental_attached_servers(self, server_names: Iterable[str]) -> None:
+        self._supplemental_attached_server_names = self._unique_preserving_order(server_names)
 
     def list_configured_detached_servers(self) -> list[str]:
         configured = set(self._configured_server_names)
@@ -791,7 +848,7 @@ class MCPAggregator(ContextDependent):
         registry_data = getattr(server_registry, "registry", None)
         if isinstance(registry_data, dict):
             configured.update(registry_data.keys())
-        return sorted(configured - set(self._attached_server_names))
+        return sorted(configured - set(self.list_attached_servers()))
 
     async def _initialize_skybridge_configs(self, server_names: list[str] | None = None) -> None:
         """Discover Skybridge resources across servers."""
@@ -973,20 +1030,39 @@ class MCPAggregator(ContextDependent):
             },
         )
 
-    async def get_capabilities(self, server_name: str):
+    async def get_capabilities(self, server_name: str) -> ServerCapabilities | None:
         """Get server capabilities if available."""
         if not self.connection_persistence:
-            # For non-persistent connections, we can't easily check capabilities
-            return None
+            # Check cache under lock (fast path)
+            async with self._capabilities_cache_lock:
+                cached = self._capabilities_cache.get(server_name)
+                if cached is not None:
+                    return cached
+
+            # I/O without holding lock — allows concurrent probes for different servers
+            try:
+                server_registry = self._require_server_registry()
+                async with server_registry.initialize_server(
+                    server_name=server_name,
+                ) as _session:
+                    capabilities = server_registry.get_server_capabilities(server_name)
+
+                if capabilities is not None:
+                    async with self._capabilities_cache_lock:
+                        self._capabilities_cache[server_name] = capabilities
+                return capabilities
+            except Exception as e:  # noqa: BLE001 - graceful fallback for capability probes
+                logger.debug(f"Error getting capabilities for server '{server_name}': {e}")
+                return None
 
         try:
             manager = self._require_connection_manager()
             server_conn = await manager.get_server(
-                server_name, client_session_factory=self._create_session_factory(server_name)
+                server_name,
+                client_session_factory=self._create_session_factory(server_name),
             )
-            # server_capabilities is a property, not a coroutine
             return server_conn.server_capabilities
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - graceful fallback for capability probes
             logger.debug(f"Error getting capabilities for server '{server_name}': {e}")
             return None
 
@@ -1292,14 +1368,16 @@ class MCPAggregator(ContextDependent):
                             if session_title is None and isinstance(session_cookie, dict):
                                 cookie_data = session_cookie.get("data")
                                 if isinstance(cookie_data, dict):
-                                    cookie_title = cookie_data.get("title") or cookie_data.get("label")
+                                    cookie_title = cookie_data.get("title") or cookie_data.get(
+                                        "label"
+                                    )
                                     if isinstance(cookie_title, str) and cookie_title.strip():
                                         session_title = cookie_title.strip()
 
                             session_id = server_conn.session_id
                             if not session_id and server_conn._get_session_id_cb:
                                 try:
-                                    session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
+                                    session_id = server_conn._get_session_id_cb()
                                 except Exception:
                                     session_id = None
                             if not session_id and isinstance(session_cookie, dict):
@@ -1371,7 +1449,7 @@ class MCPAggregator(ContextDependent):
                         session_id = "local"
                     elif server_conn and server_conn._get_session_id_cb:
                         try:
-                            session_id = server_conn._get_session_id_cb()  # type: ignore[attr-defined]
+                            session_id = server_conn._get_session_id_cb()
                         except Exception:
                             session_id = None
 
@@ -1516,7 +1594,9 @@ class MCPAggregator(ContextDependent):
                 # Let ServerSessionTerminatedError pass through for reconnection logic
                 raise
             except Exception as e:
-                self._maybe_mark_rejected_session_cookie(server_name=server_name, client=client, exc=e)
+                self._maybe_mark_rejected_session_cookie(
+                    server_name=server_name, client=client, exc=e
+                )
                 error_msg = (
                     f"Failed to {method_name} '{operation_name}' on server '{server_name}': {e}"
                 )
@@ -2187,7 +2267,7 @@ class MCPAggregator(ContextDependent):
                             )
 
             # Try to get the prompt from the specified server
-            method_args = {"name": local_prompt_name} if local_prompt_name else {}
+            method_args: dict[str, Any] = {"name": local_prompt_name} if local_prompt_name else {}
             if arguments:
                 method_args["arguments"] = arguments
 
@@ -2235,7 +2315,7 @@ class MCPAggregator(ContextDependent):
                     continue
 
                 try:
-                    method_args = {"name": local_prompt_name}
+                    method_args: dict[str, Any] = {"name": local_prompt_name}
                     if arguments:
                         method_args["arguments"] = arguments
 
@@ -2283,7 +2363,7 @@ class MCPAggregator(ContextDependent):
             for s_name in supported_servers:
                 try:
                     # Use a quiet approach - don't log errors if not found
-                    method_args = {"name": local_prompt_name}
+                    method_args: dict[str, Any] = {"name": local_prompt_name}
                     if arguments:
                         method_args["arguments"] = arguments
 

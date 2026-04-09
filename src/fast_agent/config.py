@@ -20,9 +20,16 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fast_agent.constants import DEFAULT_ENVIRONMENT_DIR
+from fast_agent.core.exceptions import ConfigFileError
 from fast_agent.llm.reasoning_effort import ReasoningEffortSetting
 from fast_agent.llm.structured_output_mode import StructuredOutputMode
 from fast_agent.llm.text_verbosity import TextVerbosityLevel
+from fast_agent.mcp.provider_management import (
+    normalize_access_token,
+    normalize_client_managed_url_server,
+    normalize_provider_managed_url_server,
+)
+from fast_agent.utils.type_narrowing import is_str_object_dict
 
 
 class MCPServerAuthSettings(BaseModel):
@@ -303,6 +310,9 @@ class MCPServerSettings(BaseModel):
     description: str | None = None
     """The description of the server."""
 
+    management: Literal["client", "provider"] = "client"
+    """Whether fast-agent connects locally or delegates MCP execution to the provider."""
+
     transport: Literal["stdio", "sse", "http"] = "stdio"
     """The transport mechanism."""
 
@@ -335,6 +345,9 @@ class MCPServerSettings(BaseModel):
 
     headers: dict[str, str] | None = None
     """Headers dictionary for HTTP connections"""
+
+    access_token: str | None = None
+    """Provider-neutral bearer token for local URL servers or provider-managed MCP."""
 
     auth: MCPServerAuthSettings | None = None
     """The authentication configuration for the server."""
@@ -376,6 +389,9 @@ class MCPServerSettings(BaseModel):
     experimental_session_advertise_version: int = 2
     """Reserved compatibility knob for session test capability advertisement."""
 
+    defer_loading: bool = False
+    """Provider-managed OpenAI Responses hint to defer remote tool loading."""
+
     @field_validator("experimental_session_advertise_version", mode="after")
     @classmethod
     def _validate_experimental_session_advertise_version(cls, value: int) -> int:
@@ -392,6 +408,15 @@ class MCPServerSettings(BaseModel):
         if value <= 0:
             raise ValueError("max_missed_pings must be greater than zero.")
         return value
+
+    @field_validator("access_token", mode="before")
+    @classmethod
+    def _normalize_access_token(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError("access_token must be a string")
+        return normalize_access_token(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -429,12 +454,85 @@ class MCPServerSettings(BaseModel):
 
         return values
 
+    @model_validator(mode="after")
+    def _normalize_management_specific_settings(self) -> "MCPServerSettings":
+        if self.management == "provider":
+            invalid_fields: list[str] = []
+            if self.command is not None:
+                invalid_fields.append("command")
+            if self.args:
+                invalid_fields.append("args")
+            if self.env:
+                invalid_fields.append("env")
+            if self.cwd is not None:
+                invalid_fields.append("cwd")
+            if self.headers:
+                invalid_fields.append("headers")
+            if self.auth is not None:
+                invalid_fields.append("auth")
+            if self.roots:
+                invalid_fields.append("roots")
+            if not self.url:
+                invalid_fields.append("url")
+            if self.transport not in {"http", "sse"}:
+                invalid_fields.append("transport")
+            if invalid_fields:
+                invalid_list = ", ".join(sorted(invalid_fields))
+                raise ValueError(
+                    f"Provider-managed MCP servers have unsupported settings: {invalid_list}"
+                )
+            assert self.url is not None
+            self.url = normalize_provider_managed_url_server(
+                transport=self.transport,
+                url=self.url,
+            )
+            return self
+
+        if self.access_token is not None and not self.url:
+            raise ValueError("access_token requires a URL-based MCP server")
+
+        if self.url:
+            self.url, self.headers = normalize_client_managed_url_server(
+                transport=self.transport,
+                url=self.url,
+                headers=self.headers,
+                access_token=self.access_token,
+            )
+        return self
+
 
 class MCPSettings(BaseModel):
     """Configuration for all MCP servers."""
 
     servers: dict[str, MCPServerSettings] = {}
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    @staticmethod
+    def _serialize_resolved_target_settings(
+        settings: MCPServerSettings,
+    ) -> dict[str, Any]:
+        """Serialize shorthand target settings back to an idempotent raw payload."""
+        payload = settings.model_dump(mode="python")
+
+        # resolve_target_entry() already normalizes access_token into Authorization
+        # for client-managed URL servers. Strip that synthesized header here so the
+        # final MCPServerSettings validation only applies the normalization once.
+        if settings.management != "provider" and settings.access_token is not None:
+            headers = payload.get("headers")
+            if isinstance(headers, dict):
+                expected_authorization = f"Bearer {settings.access_token}"
+                filtered_headers = {
+                    key: value
+                    for key, value in headers.items()
+                    if not (
+                        isinstance(key, str)
+                        and key.lower() == "authorization"
+                        and value == expected_authorization
+                    )
+                }
+                payload["headers"] = filtered_headers or None
+
+        return payload
 
     @classmethod
     def _normalize_target_list_entries(
@@ -451,10 +549,9 @@ class MCPSettings(BaseModel):
 
         normalized_targets: dict[str, dict[str, Any]] = {}
         for index, raw_entry in enumerate(raw_targets):
-            entry: dict[str, Any]
             if isinstance(raw_entry, str):
-                entry = {"target": raw_entry}
-            elif isinstance(raw_entry, dict):
+                entry: dict[str, object] = {"target": raw_entry}
+            elif is_str_object_dict(raw_entry):
                 entry = raw_entry
             else:
                 raise ValueError(f"`mcp.targets[{index}]` must be a string or mapping")
@@ -478,7 +575,7 @@ class MCPSettings(BaseModel):
                 source_path=source_path,
             )
 
-            resolved_payload = resolved_settings.model_dump(mode="python")
+            resolved_payload = cls._serialize_resolved_target_settings(resolved_settings)
             existing_payload = normalized_targets.get(resolved_name)
             if existing_payload is not None and existing_payload != resolved_payload:
                 raise ValueError(
@@ -526,7 +623,9 @@ class MCPSettings(BaseModel):
                 overrides=overrides,
                 source_path=source_path,
             )
-            normalized_servers[server_key] = resolved_settings.model_dump(mode="python")
+            normalized_servers[server_key] = cls._serialize_resolved_target_settings(
+                resolved_settings
+            )
 
         return normalized_servers
 
@@ -658,6 +757,15 @@ class AnthropicWebFetchSettings(BaseModel):
         return self
 
 
+class AnthropicVertexSettings(BaseModel):
+    """Anthropic-on-Vertex configuration."""
+
+    enabled: bool = False
+    project_id: str | None = None
+    location: str | None = None
+    base_url: str | None = None
+
+
 class AnthropicSettings(BaseModel):
     """Settings for using Anthropic models in the fast-agent application."""
 
@@ -689,6 +797,7 @@ class AnthropicSettings(BaseModel):
         default="auto",
         description="Structured output mode: auto, json, or tool_use",
     )
+    vertex_ai: AnthropicVertexSettings = Field(default_factory=AnthropicVertexSettings)
     web_search: AnthropicWebSearchSettings = Field(default_factory=AnthropicWebSearchSettings)
     web_fetch: AnthropicWebFetchSettings = Field(default_factory=AnthropicWebFetchSettings)
 
@@ -739,9 +848,13 @@ class ResponsesProviderSettingsBase(BaseModel):
         default=None,
         description="Custom headers for all API requests",
     )
-    transport: Literal["sse", "websocket", "auto"] = Field(
-        default="sse",
-        description="Responses transport mode: sse (default), websocket, or auto fallback.",
+    transport: Literal["sse", "websocket", "auto"] | None = Field(
+        default=None,
+        description=(
+            "Responses transport mode override: sse, websocket, or auto. "
+            "When unset, OpenAI Responses and Codex Responses prefer websocket "
+            "with automatic SSE fallback."
+        ),
     )
     service_tier: Literal["fast", "flex"] | None = Field(
         default=None,
@@ -1098,9 +1211,6 @@ class LoggerSettings(BaseModel):
     streaming: Literal["markdown", "plain", "none"] = "markdown"
     """Streaming renderer for assistant responses"""
 
-    message_style: Literal["classic", "a3"] = "a3"
-    """Chat message layout style for console output."""
-
 
 def find_fastagent_config_files(start_path: Path) -> tuple[Path | None, Path | None]:
     """
@@ -1221,8 +1331,11 @@ def load_yaml_mapping(path: Path | None) -> dict[str, Any]:
 
     import yaml  # pylint: disable=C0415
 
-    with open(path, "r", encoding="utf-8") as f:
-        payload = yaml.safe_load(f) or {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigFileError(f"Failed to parse YAML file: {path}", str(exc)) from exc
     if not isinstance(payload, dict):
         return {}
     return resolve_env_vars(payload)
@@ -1316,7 +1429,7 @@ def load_layered_model_settings(
     """Load layered model settings from project + env config.
 
     Precedence: project config < env config.
-    ``model_aliases`` uses deep-merge semantics, while ``default_model`` uses
+    ``model_references`` uses deep-merge semantics, while ``default_model`` uses
     scalar replacement semantics.
     """
     layered_settings, _ = load_layered_settings(start_path=start_path, env_dir=env_dir)
@@ -1325,8 +1438,8 @@ def load_layered_model_settings(
     if "default_model" in layered_settings:
         layered["default_model"] = layered_settings["default_model"]
 
-    if "model_aliases" in layered_settings:
-        layered["model_aliases"] = layered_settings["model_aliases"]
+    if "model_references" in layered_settings:
+        layered["model_references"] = layered_settings["model_references"]
 
     return layered
 
@@ -1355,14 +1468,14 @@ class Settings(BaseSettings):
 
     default_model: str | None = None
     """
-    Default model for agents. Format is provider.model_name.<reasoning_effort> or provider.model?reasoning=<value>,
-    for example openai.o3-mini.low or openai.o3-mini?reasoning=high.
-    Aliases are provided for common models e.g. sonnet, haiku, gpt-4.1, o3-mini etc.
-    If not set, falls back to FAST_AGENT_MODEL env var, then to "gpt-5-mini.low".
+    Default model for agents. Format is provider.model?reasoning=<value>,
+    for example openai.o3-mini?reasoning=high.
+    Built-in model presets are provided for common models e.g. sonnet, haiku, gpt-4.1, o3-mini etc.
+    If not set, falls back to FAST_AGENT_MODEL env var, then to "gpt-5-mini?reasoning=low".
     """
 
-    model_aliases: dict[str, dict[str, str]] = Field(default_factory=dict)
-    """Model aliases grouped by namespace (e.g. $system.default)."""
+    model_references: dict[str, dict[str, str]] = Field(default_factory=dict)
+    """Model references grouped by namespace (e.g. $system.default)."""
 
     auto_sampling: bool = True
     """Enable automatic sampling model selection if not explicitly configured"""
@@ -1460,29 +1573,29 @@ class Settings(BaseSettings):
     _config_file: str | None = PrivateAttr(default=None)
     _secrets_file: str | None = PrivateAttr(default=None)
 
-    @field_validator("model_aliases")
+    @field_validator("model_references")
     @classmethod
-    def _validate_model_aliases(
+    def _validate_model_references(
         cls,
         value: dict[str, dict[str, str]],
     ) -> dict[str, dict[str, str]]:
-        """Validate model alias namespace/key names and normalize values."""
+        """Validate model reference namespace/key names and normalize values."""
         valid_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
         normalized: dict[str, dict[str, str]] = {}
 
         for namespace, entries in value.items():
             if not valid_name.fullmatch(namespace):
-                raise ValueError("model_aliases namespace names must match [A-Za-z_][A-Za-z0-9_-]*")
+                raise ValueError("model_references namespace names must match [A-Za-z_][A-Za-z0-9_-]*")
 
             normalized_entries: dict[str, str] = {}
             for key, model in entries.items():
                 if not valid_name.fullmatch(key):
-                    raise ValueError("model_aliases keys must match [A-Za-z_][A-Za-z0-9_-]*")
+                    raise ValueError("model_references keys must match [A-Za-z_][A-Za-z0-9_-]*")
 
                 model_value = model.strip()
                 if not model_value:
                     raise ValueError(
-                        f"model_aliases.{namespace}.{key} must be a non-empty model string"
+                        f"model_references.{namespace}.{key} must be a non-empty model string"
                     )
                 normalized_entries[key] = model_value
 

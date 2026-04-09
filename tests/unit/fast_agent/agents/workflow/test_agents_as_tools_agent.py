@@ -11,7 +11,7 @@ from mcp.types import CallToolRequestParams, PromptMessage, TextContent
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.llm_agent import LlmAgent
-from fast_agent.agents.tool_runner import ToolRunnerHooks
+from fast_agent.agents.tool_runner import ToolRunner, ToolRunnerHooks
 from fast_agent.agents.workflow.agents_as_tools_agent import (
     AgentsAsToolsAgent,
     AgentsAsToolsOptions,
@@ -257,6 +257,10 @@ class HookedChildAgent(LlmAgent):
     def tool_runner_hooks(self, value: ToolRunnerHooks | None) -> None:
         self._tool_runner_hooks = value
 
+    def _hook_runner(self) -> ToolRunner:
+        """Narrow this lightweight test stub at the hook boundary."""
+        return self  # ty: ignore[invalid-return-type]
+
     async def generate(
         self,
         messages: str
@@ -267,10 +271,10 @@ class HookedChildAgent(LlmAgent):
         tools: list[Tool] | None = None,
     ) -> PromptMessageExtended:
         if self._tool_runner_hooks and self._tool_runner_hooks.before_llm_call:
-            await self._tool_runner_hooks.before_llm_call(self, [])
+            await self._tool_runner_hooks.before_llm_call(self._hook_runner(), [])
         if self._tool_runner_hooks and self._tool_runner_hooks.before_tool_call:
             await self._tool_runner_hooks.before_tool_call(
-                self,
+                self._hook_runner(),
                 PromptMessageExtended(role="assistant", content=[]),
             )
         return PromptMessageExtended(
@@ -321,6 +325,27 @@ async def test_list_tools_uses_child_tool_input_schema():
     child_tool = next(tool for tool in result.tools if tool.name == "agent__child")
 
     assert child_tool.inputSchema == child.config.tool_input_schema
+
+
+@pytest.mark.asyncio
+async def test_list_tools_adds_response_mode_when_child_tool_result_mode_is_selectable():
+    child = FakeChildAgent("child")
+    child.config.default_request_params = RequestParams(tool_result_mode="selectable")
+
+    agent = AgentsAsToolsAgent(AgentConfig("parent"), [child])
+    await agent.initialize()
+
+    result = await agent.list_tools()
+    child_tool = next(tool for tool in result.tools if tool.name == "agent__child")
+    properties = child_tool.inputSchema.get("properties", {})
+
+    assert child_tool.inputSchema.get("required") == ["message"]
+    assert properties.get("response_mode") == {
+        "type": "string",
+        "description": "Override how the child agent returns tool results for this call.",
+        "enum": ["inherit", "postprocess", "passthrough"],
+        "default": "inherit",
+    }
 
 
 @pytest.mark.asyncio
@@ -471,7 +496,7 @@ async def test_child_passthrough_setting_is_inherited_from_parent_request_params
     agent = AgentsAsToolsAgent(AgentConfig("parent"), [child])
     await agent.initialize()
 
-    parent_request_params = RequestParams(tool_result_passthrough=True)
+    parent_request_params = RequestParams(tool_result_mode="passthrough")
     await agent._invoke_child_agent(
         child,
         {"message": "hello child"},
@@ -479,7 +504,7 @@ async def test_child_passthrough_setting_is_inherited_from_parent_request_params
     )
 
     assert child.last_request_params is not None
-    assert child.last_request_params.tool_result_passthrough is True
+    assert child.last_request_params.tool_result_mode == "passthrough"
 
 
 @pytest.mark.asyncio
@@ -492,18 +517,15 @@ async def test_child_response_mode_overrides_inherited_passthrough_and_is_stripp
                 "type": "string",
                 "description": "What to investigate",
             },
-            "response_mode": {
-                "type": "string",
-                "enum": ["inherit", "postprocess", "passthrough"],
-            },
         },
         "required": ["query"],
     }
+    child.config.default_request_params = RequestParams(tool_result_mode="selectable")
 
     agent = AgentsAsToolsAgent(AgentConfig("parent"), [child])
     await agent.initialize()
 
-    parent_request_params = RequestParams(tool_result_passthrough=True)
+    parent_request_params = RequestParams(tool_result_mode="passthrough")
     await agent._invoke_child_agent(
         child,
         {
@@ -514,7 +536,7 @@ async def test_child_response_mode_overrides_inherited_passthrough_and_is_stripp
     )
 
     assert child.last_request_params is not None
-    assert child.last_request_params.tool_result_passthrough is False
+    assert child.last_request_params.tool_result_mode == "postprocess"
     assert child.last_input_text is not None
     assert json.loads(child.last_input_text) == {"query": "find updates"}
 

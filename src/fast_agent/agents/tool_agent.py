@@ -1,10 +1,11 @@
 import asyncio
+import json
 import time
 from contextvars import ContextVar
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
-from mcp.server.fastmcp.tools.base import Tool as FastMCPTool
+from fastmcp.tools import FunctionTool, ToolResult
 from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from fast_agent.agents.agent_types import AgentConfig, AgentType
@@ -12,6 +13,7 @@ from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.agents.tool_runner import ToolRunner, ToolRunnerHooks, _ToolLoopAgent
 from fast_agent.constants import (
     FAST_AGENT_ERROR_CHANNEL,
+    FAST_AGENT_TOOL_METADATA,
     HUMAN_INPUT_TOOL_NAME,
     should_parallelize_tool_calls,
 )
@@ -23,7 +25,9 @@ from fast_agent.interfaces import ToolRunnerHookCapable
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.mcp.tool_execution_handler import ToolExecutionHandler
 from fast_agent.tools.elicitation import get_elicitation_fastmcp_tool
+from fast_agent.tools.function_tool_loader import build_default_function_tool
 from fast_agent.types import LlmStopReason, PromptMessageExtended, RequestParams, ToolTimingInfo
+from fast_agent.ui.message_display_helpers import resolve_highlight_index
 from fast_agent.utils.async_utils import gather_with_cancel
 
 logger = get_logger(__name__)
@@ -88,31 +92,44 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
     A Tool Calling agent that uses FastMCP Tools for execution.
 
     Pass either:
-    - FastMCP Tool objects (created via Tool.from_function)
-    - Regular Python functions (will be wrapped as FastMCP Tools)
+    - native FastMCP FunctionTool objects
+    - regular Python functions (wrapped as FunctionTools)
+
+    Naming note:
+    ``tools`` here means executable local/function tools available to the
+    agent. It does not refer to ``AgentConfig.tools``, which is the MCP
+    filter map used by ``McpAgent``.
     """
 
     def __init__(
         self,
         config: AgentConfig,
-        tools: Sequence[FastMCPTool | Callable] = [],
+        tools: Sequence[FunctionTool | Callable[..., Any]] = (),
         context: Context | None = None,
     ) -> None:
+        """Create a tool-capable agent.
+
+        Args:
+            config: Agent configuration. ``config.tools`` remains the MCP
+                filter map; it is separate from this ``tools`` argument.
+            tools: Executable local/function tools to expose on the agent.
+            context: Optional runtime context.
+        """
         super().__init__(config=config, context=context)
 
-        self._execution_tools: dict[str, FastMCPTool] = {}
+        self._execution_tools: dict[str, FunctionTool] = {}
         self._tool_schemas: list[Tool] = []
         self._agent_tools: dict[str, LlmAgent] = {}
         self._card_tool_names: set[str] = set()
         self.tool_runner_hooks: ToolRunnerHooks | None = None
 
         # Build a working list of tools and auto-inject human-input tool if missing
-        working_tools: list[FastMCPTool | Callable] = list(tools) if tools else []
+        working_tools: list[FunctionTool | Callable[..., Any]] = list(tools) if tools else []
         card_tool_source_ids = {id(tool) for tool in working_tools}
         # Only auto-inject if enabled via AgentConfig
         if self.config.human_input:
             existing_names = {
-                t.name if isinstance(t, FastMCPTool) else getattr(t, "__name__", "")
+                t.name if isinstance(t, FunctionTool) else getattr(t, "__name__", "")
                 for t in working_tools
             }
             if HUMAN_INPUT_TOOL_NAME not in existing_names:
@@ -122,10 +139,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                     logger.warning(f"Failed to initialize human-input tool: {e}")
 
         for tool in working_tools:
-            if isinstance(tool, FastMCPTool):
+            if isinstance(tool, FunctionTool):
                 fast_tool = tool
             elif callable(tool):
-                fast_tool = FastMCPTool.from_function(tool)
+                fast_tool = build_default_function_tool(tool)
             else:
                 logger.warning(f"Skipping unknown tool type: {type(tool)}")
                 continue
@@ -148,7 +165,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             return {}
         return {"tools": list(self._execution_tools.values())}
 
-    def add_tool(self, tool: FastMCPTool, *, replace: bool = True) -> None:
+    def add_tool(self, tool: FunctionTool, *, replace: bool = True) -> None:
         """Register a new execution tool and expose it to the LLM."""
         name = tool.name
         if not replace and name in self._execution_tools:
@@ -163,6 +180,26 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 inputSchema=tool.parameters,
             )
         )
+
+    def _tool_display_metadata(self, tool_name: str) -> dict[str, Any] | None:
+        tool = self._execution_tools.get(tool_name)
+        if tool is None or not isinstance(tool.meta, Mapping):
+            return None
+        metadata = dict(tool.meta)
+        return metadata or None
+
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        return self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+
+    @staticmethod
+    def _jsonable_tool_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not metadata:
+            return None
+        try:
+            json.dumps(metadata)
+        except TypeError:
+            return None
+        return dict(metadata)
 
     @property
     def has_external_hooks(self) -> bool:
@@ -334,7 +371,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 except Exception as exc:
                     logger.warning(f"Failed to merge tool clone usage for {child.name}: {exc}")
 
-        fast_tool = FastMCPTool.from_function(
+        fast_tool = build_default_function_tool(
             call_agent,
             name=tool_name,
             description=tool_description,
@@ -507,6 +544,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
 
         tool_results: dict[str, CallToolResult] = {}
         tool_timings: dict[str, ToolTimingInfo] = {}
+        tool_metadata: dict[str, dict[str, Any]] = {}
         tool_loop_error: str | None = None
         tool_schemas = (await self.list_tools()).tools
         available_tools = [t.name for t in tool_schemas]
@@ -546,11 +584,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
 
         if should_parallel and planned_calls:
             for correlation_id, tool_name, tool_args in planned_calls:
-                highlight_index = None
-                try:
-                    highlight_index = available_tools.index(tool_name)
-                except ValueError:
-                    pass
+                highlight_index = resolve_highlight_index(available_tools, tool_name)
+                metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+                if metadata:
+                    tool_metadata[correlation_id] = metadata
 
                 self.display.show_tool_call(
                     name=self.name,
@@ -559,6 +596,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                     tool_name=tool_name,
                     highlight_index=highlight_index,
                     max_item_length=12,
+                    metadata=metadata,
                     tool_call_id=correlation_id,
                     show_hook_indicator=self.has_before_tool_call_hook,
                 )
@@ -601,17 +639,18 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 )
 
             return self._finalize_tool_results(
-                tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+                tool_results,
+                tool_timings=tool_timings,
+                tool_metadata=tool_metadata,
+                tool_loop_error=tool_loop_error,
             )
 
         for correlation_id, tool_name, tool_args in planned_calls:
             # Find the index of the current tool in available_tools for highlighting
-            highlight_index = None
-            try:
-                highlight_index = available_tools.index(tool_name)
-            except ValueError:
-                # Tool not found in list, no highlighting
-                pass
+            highlight_index = resolve_highlight_index(available_tools, tool_name)
+            metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+            if metadata:
+                tool_metadata[correlation_id] = metadata
 
             self.display.show_tool_call(
                 name=self.name,
@@ -620,6 +659,7 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 tool_name=tool_name,
                 highlight_index=highlight_index,
                 max_item_length=12,
+                metadata=metadata,
                 show_hook_indicator=self.has_before_tool_call_hook,
             )
 
@@ -646,7 +686,10 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             )
 
         return self._finalize_tool_results(
-            tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+            tool_loop_error=tool_loop_error,
         )
 
     def _mark_tool_loop_error(
@@ -675,10 +718,9 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         tool_results: dict[str, CallToolResult],
         *,
         tool_timings: dict[str, ToolTimingInfo] | None = None,
+        tool_metadata: dict[str, dict[str, Any]] | None = None,
         tool_loop_error: str | None = None,
     ) -> PromptMessageExtended:
-        import json
-
         from mcp.types import TextContent
 
         from fast_agent.constants import (
@@ -701,6 +743,13 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 channels = {}
             channels[FAST_AGENT_TOOL_TIMING] = [
                 TextContent(type="text", text=json.dumps(tool_timings))
+            ]
+
+        if tool_metadata:
+            if channels is None:
+                channels = {}
+            channels[FAST_AGENT_TOOL_METADATA] = [
+                TextContent(type="text", text=json.dumps(tool_metadata))
             ]
 
         deferred_url_elicitations: list[dict[str, object]] = []
@@ -759,11 +808,8 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             token = _tool_progress_context.set((tool_handler, tool_call_id))
 
         try:
-            result = await fast_tool.run(arguments or {}, convert_result=False)
-            tool_result = CallToolResult(
-                content=[text_content(str(result))],
-                isError=False,
-            )
+            native_result = await fast_tool.run(arguments or {})
+            tool_result = self._native_tool_result_to_mcp_result(native_result)
             if tool_handler and tool_call_id:
                 try:
                     await tool_handler.on_tool_complete(
@@ -778,6 +824,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
                 content=[text_content(f"Error: {str(e)}")],
                 isError=True,
             )
+            payload = getattr(e, "_fast_agent_url_elicitation_required", None)
+            if payload is not None:
+                try:
+                    setattr(tool_result, "_fast_agent_url_elicitation_required", payload)
+                except Exception:
+                    pass
             if tool_handler and tool_call_id:
                 try:
                     await tool_handler.on_tool_complete(tool_call_id, False, None, str(e))
@@ -800,3 +852,12 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
             if progress_manager is not None:
                 return progress_manager
         return None
+
+    @staticmethod
+    def _native_tool_result_to_mcp_result(result: ToolResult) -> CallToolResult:
+        return CallToolResult(
+            content=result.content,
+            structuredContent=result.structured_content,
+            meta=result.meta,
+            isError=False,
+        )

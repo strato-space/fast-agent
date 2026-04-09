@@ -91,8 +91,8 @@ def format_internal_resources_for_prompt(resources: Sequence[InternalResource]) 
         return ""
 
     lines: list[str] = [
-        "For detailed fast-agent/AgentCard guidance, call `get_resource` with `internal://fast-agent/smart-agent-cards`.",
-        "Use `list_resources` to discover available resources first.",
+        "For detailed fast-agent guidance, call `get_resource` with `internal://fast-agent/smart-agent-cards` for AgentCards and `internal://fast-agent/model-overlays` for model overlay manifests.",
+        "The bundled internal resources listed below are always available to `get_resource`.",
         "<available_resources>",
     ]
     for resource in resources:

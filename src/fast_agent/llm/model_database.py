@@ -16,6 +16,9 @@ from fast_agent.llm.reasoning_effort import (
     ReasoningEffortSpec,
 )
 from fast_agent.llm.text_verbosity import TextVerbositySpec
+from fast_agent.mcp.mime_utils import DOCUMENT_MIME_TYPES
+
+ResourceSource = Literal["embedded", "link"]
 
 
 class ModelParameters(BaseModel):
@@ -99,9 +102,22 @@ class ModelDatabase:
     _RUNTIME_MODEL_PARAMS: dict[str, ModelParameters] = {}
 
     # Common parameter sets
-    OPENAI_MULTIMODAL = ["text/plain", "image/jpeg", "image/png", "image/webp", "application/pdf"]
+    OPENAI_MULTIMODAL = [
+        "text/plain",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        *DOCUMENT_MIME_TYPES,
+    ]
     OPENAI_VISION = ["text/plain", "image/jpeg", "image/png", "image/webp"]
     ANTHROPIC_MULTIMODAL = [
+        "text/plain",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        *DOCUMENT_MIME_TYPES,
+    ]
+    ANTHROPIC_VERTEX_MULTIMODAL = [
         "text/plain",
         "image/jpeg",
         "image/png",
@@ -150,7 +166,7 @@ class ModelDatabase:
     OPENAI_GPT_51_CLASS_REASONING = ReasoningEffortSpec(
         kind="effort",
         allowed_efforts=["none", "low", "medium", "high", "xhigh"],
-        default=ReasoningEffortSetting(kind="effort", value="medium"),
+        default=ReasoningEffortSetting(kind="effort", value="none"),
     )
 
     OPENAI_GPT_5_CODEX_CLASS_REASONING = ReasoningEffortSpec(
@@ -193,11 +209,20 @@ class ModelDatabase:
         default=ReasoningEffortSetting(kind="effort", value=AUTO_REASONING),
     )
 
+    GOOGLE_THINKING_EFFORT_SPEC = ReasoningEffortSpec(
+        kind="effort",
+        allowed_efforts=["minimal", "low", "medium", "high"],
+        allow_toggle_disable=True,
+        allow_auto=True,
+        default=ReasoningEffortSetting(kind="effort", value=AUTO_REASONING),
+    )
+
     ANTHROPIC_WEB_SEARCH_LEGACY = "web_search_20250305"
     ANTHROPIC_WEB_FETCH_LEGACY = "web_fetch_20250910"
     ANTHROPIC_WEB_SEARCH_46 = "web_search_20260209"
     ANTHROPIC_WEB_FETCH_46 = "web_fetch_20260209"
     ANTHROPIC_WEB_TOOLS_BETA_46 = "code-execution-web-tools-2026-02-09"
+    ANTHROPIC_LONG_CONTEXT_WINDOW = 1_000_000
 
     # Common parameter configurations
     OPENAI_STANDARD = ModelParameters(
@@ -353,6 +378,19 @@ class ModelDatabase:
         default_provider=Provider.RESPONSES,
     )
 
+    OPENAI_GPT_54_SMALL = ModelParameters(
+        context_window=400000,
+        max_output_tokens=128000,
+        tokenizes=OPENAI_VISION,
+        reasoning="openai",
+        reasoning_effort_spec=OPENAI_GPT_51_CLASS_REASONING,
+        text_verbosity_spec=OPENAI_TEXT_VERBOSITY_SPEC,
+        response_transports=("sse", "websocket"),
+        response_websocket_providers=(Provider.RESPONSES, Provider.CODEX_RESPONSES),
+        response_service_tiers=("fast", "flex"),
+        default_provider=Provider.RESPONSES,
+    )
+
     OPENAI_GPT_CODEX_SPARK = ModelParameters(
         context_window=128000,
         max_output_tokens=128000,
@@ -387,7 +425,7 @@ class ModelDatabase:
         default_provider=Provider.ANTHROPIC,
     )
     ANTHROPIC_OPUS_46 = ModelParameters(
-        context_window=200000,
+        context_window=ANTHROPIC_LONG_CONTEXT_WINDOW,
         max_output_tokens=128000,
         tokenizes=ANTHROPIC_MULTIMODAL,
         reasoning="anthropic_thinking",
@@ -422,7 +460,7 @@ class ModelDatabase:
         default_provider=Provider.ANTHROPIC,
     )
     ANTHROPIC_SONNET_46 = ModelParameters(
-        context_window=200000,
+        context_window=ANTHROPIC_LONG_CONTEXT_WINDOW,
         max_output_tokens=64000,
         tokenizes=ANTHROPIC_MULTIMODAL,
         reasoning="anthropic_thinking",
@@ -492,6 +530,8 @@ class ModelDatabase:
         context_window=1_048_576,
         max_output_tokens=65_536,
         tokenizes=GOOGLE_MULTIMODAL,
+        reasoning="google_thinking",
+        reasoning_effort_spec=GOOGLE_THINKING_EFFORT_SPEC,
         default_provider=Provider.GOOGLE,
     )
 
@@ -627,8 +667,6 @@ class ModelDatabase:
         default_provider=Provider.ALIYUN,
     )
 
-    ANTHROPIC_LONG_CONTEXT_WINDOW = 1_000_000
-
     # Model configuration database
     # KEEP ALL LOWER CASE KEYS
     MODELS: dict[str, ModelParameters] = {
@@ -676,14 +714,16 @@ class ModelDatabase:
         "gpt-5-nano": _with_fast(OPENAI_GPT_5),
         "gpt-5-nano-2025-08-07": _with_fast(OPENAI_GPT_5),
         "gpt-5.1": OPENAI_GPT_5_2,
-        "gpt-5.1-codex": OPENAI_GPT_CODEX.model_copy(
-            update={"response_service_tiers": ("fast",)}
-        ),
+        "gpt-5.1-codex": OPENAI_GPT_CODEX.model_copy(update={"response_service_tiers": ("fast",)}),
         "gpt-5.2-codex": OPENAI_GPT_CODEX,
-        "gpt-5.3-codex": OPENAI_GPT_CODEX.model_copy(
-            update={"response_service_tiers": ("fast",)}
+        "gpt-5.3-codex": OPENAI_GPT_CODEX.model_copy(update={"response_service_tiers": ("fast",)}),
+        "gpt-5.4": OPENAI_GPT_CODEX.model_copy(
+            update={"reasoning_effort_spec": OPENAI_GPT_51_CLASS_REASONING}
         ),
-        "gpt-5.4": OPENAI_GPT_CODEX,
+        "gpt-5.4-mini": OPENAI_GPT_54_SMALL,
+        "gpt-5.4-nano": OPENAI_GPT_54_SMALL.model_copy(
+            update={"response_websocket_providers": (Provider.RESPONSES,)}
+        ),
         "gpt-5.3-codex-spark": _with_fast(OPENAI_GPT_CODEX_SPARK),
         "gpt-5.2": OPENAI_GPT_5_2.model_copy(
             update={
@@ -722,11 +762,11 @@ class ModelDatabase:
         "claude-sonnet-4-5-20250929": _with_long_context(
             ANTHROPIC_SONNET_4_VERSIONED, ANTHROPIC_LONG_CONTEXT_WINDOW
         ),
-        "claude-sonnet-4-6": _with_long_context(ANTHROPIC_SONNET_46, ANTHROPIC_LONG_CONTEXT_WINDOW),
+        "claude-sonnet-4-6": ANTHROPIC_SONNET_46,
         "claude-opus-4-0": ANTHROPIC_OPUS_4_LEGACY,
         "claude-opus-4-1": ANTHROPIC_OPUS_4_VERSIONED,
         "claude-opus-4-5": ANTHROPIC_OPUS_4_VERSIONED,
-        "claude-opus-4-6": _with_long_context(ANTHROPIC_OPUS_46, ANTHROPIC_LONG_CONTEXT_WINDOW),
+        "claude-opus-4-6": ANTHROPIC_OPUS_46,
         "claude-opus-4-20250514": ANTHROPIC_OPUS_4_LEGACY,
         "claude-haiku-4-5-20251001": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-haiku-4-5": _with_fast(ANTHROPIC_SONNET_4_VERSIONED),
@@ -777,14 +817,26 @@ class ModelDatabase:
         # aliyun modern
         "qwen3-max": ALIYUN_QWEN3_MODERN,
     }
+    _PROVIDER_MODEL_OVERRIDES: dict[tuple[Provider, str], ModelParameters] = {}
+    _PROVIDER_WIRE_MODEL_NAMES: dict[tuple[Provider, str], str] = {}
 
     @classmethod
-    def get_model_params(cls, model: str) -> ModelParameters | None:
+    def get_model_params(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> ModelParameters | None:
         """Get model parameters for a given model name"""
         if not model:
             return None
 
+        effective_provider = provider or cls.get_default_provider(model)
         normalized = cls.normalize_model_name(model)
+        if effective_provider is not None:
+            provider_override = cls._PROVIDER_MODEL_OVERRIDES.get((effective_provider, normalized))
+            if provider_override is not None:
+                return provider_override
         params = cls.MODELS.get(normalized)
         if params is not None:
             return params
@@ -813,10 +865,10 @@ class ModelDatabase:
         if direct_key in cls.MODELS:
             return direct_key
 
-        # Apply aliases first (case-insensitive).
-        aliased = ModelFactory.MODEL_ALIASES.get(model_spec)
+        # Apply built-in model presets first (case-insensitive).
+        aliased = ModelFactory.MODEL_PRESETS.get(model_spec)
         if not aliased:
-            aliased = ModelFactory.MODEL_ALIASES.get(model_spec.lower())
+            aliased = ModelFactory.MODEL_PRESETS.get(model_spec.lower())
         if aliased:
             model_spec = aliased
             direct_key = model_spec.strip().lower()
@@ -845,25 +897,32 @@ class ModelDatabase:
         return model_spec.strip().lower()
 
     @classmethod
-    def get_context_window(cls, model: str) -> int | None:
+    def get_context_window(cls, model: str, *, provider: Provider | None = None) -> int | None:
         """Get context window size for a model"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.context_window if params else None
 
     @classmethod
-    def get_max_output_tokens(cls, model: str) -> int | None:
+    def get_max_output_tokens(cls, model: str, *, provider: Provider | None = None) -> int | None:
         """Get maximum output tokens for a model"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.max_output_tokens if params else None
 
     @classmethod
-    def get_tokenizes(cls, model: str) -> list[str] | None:
+    def get_tokenizes(cls, model: str, *, provider: Provider | None = None) -> list[str] | None:
         """Get supported tokenization types for a model"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.tokenizes if params else None
 
     @classmethod
-    def supports_mime(cls, model: str, mime_type: str) -> bool:
+    def supports_mime(
+        cls,
+        model: str,
+        mime_type: str,
+        *,
+        provider: Provider | None = None,
+        resource_source: ResourceSource | None = None,
+    ) -> bool:
         """
         Return True if the given model supports the provided MIME type.
 
@@ -872,7 +931,7 @@ class ModelDatabase:
         """
         from fast_agent.mcp.mime_utils import normalize_mime_type
 
-        tokenizes = cls.get_tokenizes(model) or []
+        tokenizes = cls.get_tokenizes(model, provider=provider) or []
 
         # Normalize the candidate and the database entries to lowercase
         normalized_supported = [t.lower() for t in tokenizes]
@@ -887,76 +946,129 @@ class ModelDatabase:
         if not normalized:
             return False
 
+        if (
+            resource_source == "link"
+            and provider in {Provider.ANTHROPIC, Provider.ANTHROPIC_VERTEX}
+            and normalized in DOCUMENT_MIME_TYPES
+            and normalized != "application/pdf"
+        ):
+            return False
+
         return normalized.lower() in normalized_supported
 
     @classmethod
-    def supports_any_mime(cls, model: str, mime_types: list[str]) -> bool:
+    def supports_any_mime(
+        cls,
+        model: str,
+        mime_types: list[str],
+        *,
+        provider: Provider | None = None,
+        resource_source: ResourceSource | None = None,
+    ) -> bool:
         """Return True if the model supports any of the provided MIME types."""
-        return any(cls.supports_mime(model, m) for m in mime_types)
+        return any(
+            cls.supports_mime(
+                model,
+                m,
+                provider=provider,
+                resource_source=resource_source,
+            )
+            for m in mime_types
+        )
 
     @classmethod
-    def get_json_mode(cls, model: str) -> str | None:
+    def get_json_mode(cls, model: str, *, provider: Provider | None = None) -> str | None:
         """Get supported json mode (structured output) for a model"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.json_mode if params else None
 
     @classmethod
-    def get_reasoning(cls, model: str) -> str | None:
+    def get_reasoning(cls, model: str, *, provider: Provider | None = None) -> str | None:
         """Get supported reasoning output style for a model"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.reasoning if params else None
 
     @classmethod
-    def get_reasoning_effort_spec(cls, model: str) -> ReasoningEffortSpec | None:
+    def get_reasoning_effort_spec(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> ReasoningEffortSpec | None:
         """Get reasoning effort capabilities for a model, if defined."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.reasoning_effort_spec if params else None
 
     @classmethod
-    def get_text_verbosity_spec(cls, model: str) -> TextVerbositySpec | None:
+    def get_text_verbosity_spec(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> TextVerbositySpec | None:
         """Get text verbosity capabilities for a model, if defined."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.text_verbosity_spec if params else None
 
     @classmethod
-    def get_stream_mode(cls, model: str | None) -> Literal["openai", "manual"]:
+    def get_stream_mode(
+        cls,
+        model: str | None,
+        *,
+        provider: Provider | None = None,
+    ) -> Literal["openai", "manual"]:
         """Return preferred streaming accumulation strategy for a model."""
         if not model:
             return "openai"
 
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.stream_mode if params else "openai"
 
     @classmethod
-    def get_default_max_tokens(cls, model: str) -> int:
+    def get_default_max_tokens(cls, model: str, *, provider: Provider | None = None) -> int:
         """Get default max_tokens for RequestParams based on model"""
         if not model:
             return 2048  # Fallback when no model specified
 
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         if params:
             return params.max_output_tokens
         return 2048  # Fallback for unknown models
 
     @classmethod
-    def get_default_temperature(cls, model: str | None) -> float | None:
+    def get_default_temperature(
+        cls,
+        model: str | None,
+        *,
+        provider: Provider | None = None,
+    ) -> float | None:
         """Get default temperature for RequestParams based on model metadata."""
         if not model:
             return None
 
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.default_temperature if params else None
 
     @classmethod
-    def get_cache_ttl(cls, model: str) -> Literal["5m", "1h"] | None:
+    def get_cache_ttl(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> Literal["5m", "1h"] | None:
         """Get cache TTL for a model, or None if not supported"""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.cache_ttl if params else None
 
     @classmethod
-    def get_long_context_window(cls, model: str) -> int | None:
+    def get_long_context_window(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> int | None:
         """Get optional long-context override window for a model."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.long_context_window if params else None
 
     @classmethod
@@ -1012,22 +1124,42 @@ class ModelDatabase:
         return provider in providers
 
     @classmethod
-    def get_anthropic_web_search_version(cls, model: str) -> str | None:
+    def get_anthropic_web_search_version(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> str | None:
         """Get Anthropic web_search tool version for a model, if available."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.anthropic_web_search_version if params else None
 
     @classmethod
-    def get_anthropic_web_fetch_version(cls, model: str) -> str | None:
+    def get_anthropic_web_fetch_version(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> str | None:
         """Get Anthropic web_fetch tool version for a model, if available."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.anthropic_web_fetch_version if params else None
 
     @classmethod
-    def get_anthropic_required_betas(cls, model: str) -> tuple[str, ...] | None:
+    def get_anthropic_required_betas(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> tuple[str, ...] | None:
         """Get Anthropic beta headers required for model-specific capabilities."""
-        params = cls.get_model_params(model)
+        params = cls.get_model_params(model, provider=provider)
         return params.anthropic_required_betas if params else None
+
+    @classmethod
+    def resolve_wire_model_name(cls, *, provider: Provider, model_name: str) -> str:
+        normalized = cls.normalize_model_name(model_name)
+        return cls._PROVIDER_WIRE_MODEL_NAMES.get((provider, normalized), model_name.strip())
 
     @classmethod
     def list_long_context_models(cls) -> list[str]:
@@ -1090,14 +1222,6 @@ class ModelDatabase:
         return params.default_provider if params else None
 
     @classmethod
-    def register_runtime_default_provider(cls, model: str, provider: Provider) -> None:
-        """Register or override a runtime default provider for a model name."""
-        model_key = cls._normalize_provider_lookup_name(model)
-        if not model_key:
-            return
-        cls._RUNTIME_MODEL_DEFAULT_PROVIDERS[model_key] = provider
-
-    @classmethod
     def register_runtime_model_params(cls, model: str, params: ModelParameters) -> None:
         """Register runtime model parameters for dynamic providers."""
         model_key = cls.normalize_model_name(model)
@@ -1147,14 +1271,6 @@ class ModelDatabase:
         )
 
     @classmethod
-    def unregister_runtime_default_provider(cls, model: str) -> None:
-        """Remove a runtime default provider override for a model name."""
-        model_key = cls._normalize_provider_lookup_name(model)
-        if not model_key:
-            return
-        cls._RUNTIME_MODEL_DEFAULT_PROVIDERS.pop(model_key, None)
-
-    @classmethod
     def is_fast_model(cls, model: str) -> bool:
         """Return True when model metadata marks the model as fast."""
         params = cls.get_model_params(model)
@@ -1164,3 +1280,17 @@ class ModelDatabase:
     def list_fast_models(cls) -> list[str]:
         """List model names marked as fast in metadata."""
         return sorted(name for name, params in cls.MODELS.items() if params.fast)
+
+
+ModelDatabase._PROVIDER_MODEL_OVERRIDES.update(
+    {
+        (Provider.ANTHROPIC_VERTEX, model_name): params.model_copy(
+            update={
+                "tokenizes": ModelDatabase.ANTHROPIC_VERTEX_MULTIMODAL,
+                "anthropic_web_fetch_version": None,
+            }
+        )
+        for model_name, params in ModelDatabase.MODELS.items()
+        if params.default_provider == Provider.ANTHROPIC
+    }
+)

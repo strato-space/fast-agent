@@ -19,7 +19,13 @@ from fast_agent.constants import (
 )
 from fast_agent.paths import resolve_environment_paths
 
-from .run_request import AgentRunRequest, StdioServerConfig, UrlServerConfig
+from .run_request import (
+    AgentRunRequest,
+    ExecutionMode,
+    StdioServerConfig,
+    UrlServerConfig,
+    resolve_execution_mode,
+)
 
 CARD_EXTENSIONS: Final[frozenset[str]] = frozenset({".md", ".markdown", ".yaml", ".yml"})
 
@@ -118,6 +124,23 @@ def validate_noenv_conflicts(
 
     if resume is not None:
         raise typer.BadParameter("Cannot combine --noenv with --resume.")
+
+
+def validate_execution_mode_inputs(
+    *,
+    message: str | None,
+    prompt_file: str | None,
+) -> ExecutionMode:
+    try:
+        return resolve_execution_mode(
+            message=message,
+            prompt_file=prompt_file,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(
+            str(exc),
+            param_hint="--message/--prompt-file",
+        ) from exc
 
 
 def validate_multi_model_card_conflicts(
@@ -332,6 +355,10 @@ def build_agent_run_request(
         environment_dir=environment_dir,
         resume=resume,
     )
+    execution_mode = validate_execution_mode_inputs(
+        message=message,
+        prompt_file=prompt_file,
+    )
 
     server_list = servers.split(",") if servers else None
 
@@ -405,84 +432,19 @@ def build_agent_run_request(
         permissions_enabled=effective_permissions_enabled,
         reload=reload,
         watch=watch,
+        execution_mode=execution_mode,
         quiet=quiet,
         missing_shell_cwd_policy=missing_shell_cwd_policy,
     )
 
 
 def build_run_agent_kwargs(
-    *,
-    name: str,
-    instruction: str,
-    config_path: str | None,
-    servers: str | None,
-    urls: str | None,
-    auth: str | None,
-    client_metadata_url: str | None,
-    agent_cards: list[str] | None,
-    card_tools: list[str] | None,
-    model: str | None,
-    message: str | None,
-    prompt_file: str | None,
-    result_file: str | None,
-    resume: str | None,
-    stdio_commands: list[str] | None,
-    agent_name: str | None,
-    target_agent_name: str | None,
-    skills_directory: Path | None,
-    environment_dir: Path | None,
-    shell_enabled: bool,
-    mode: Literal["interactive", "serve"],
-    transport: str,
-    host: str,
-    port: int,
-    tool_description: str | None,
-    tool_name_template: str | None,
-    instance_scope: str,
-    permissions_enabled: bool,
-    reload: bool,
-    watch: bool,
-    quiet: bool = False,
-    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None,
-    force_smart: bool = False,
-    noenv: bool = False,
+    request: AgentRunRequest | None = None,
+    /,
+    **request_kwargs: Any,
 ) -> dict[str, Any]:
-    request = build_agent_run_request(
-        name=name,
-        instruction=instruction,
-        config_path=config_path,
-        servers=servers,
-        urls=urls,
-        auth=auth,
-        client_metadata_url=client_metadata_url,
-        agent_cards=agent_cards,
-        card_tools=card_tools,
-        model=model,
-        message=message,
-        prompt_file=prompt_file,
-        result_file=result_file,
-        resume=resume,
-        stdio_commands=stdio_commands,
-        agent_name=agent_name,
-        target_agent_name=target_agent_name,
-        skills_directory=skills_directory,
-        environment_dir=environment_dir,
-        noenv=noenv,
-        force_smart=force_smart,
-        shell_enabled=shell_enabled,
-        mode=mode,
-        transport=transport,
-        host=host,
-        port=port,
-        tool_description=tool_description,
-        tool_name_template=tool_name_template,
-        instance_scope=instance_scope,
-        permissions_enabled=permissions_enabled,
-        reload=reload,
-        watch=watch,
-        quiet=quiet,
-        missing_shell_cwd_policy=missing_shell_cwd_policy,
-    )
+    if request is None:
+        request = build_agent_run_request(**request_kwargs)
     return request.to_agent_setup_kwargs()
 
 

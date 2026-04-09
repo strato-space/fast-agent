@@ -8,9 +8,14 @@ from typing import TYPE_CHECKING, Any
 from openai.types.responses import ResponseReasoningSummaryTextDeltaEvent, ResponseTextDeltaEvent
 
 from fast_agent.event_progress import ProgressAction
-from fast_agent.llm.provider.openai.streaming_utils import finalize_stream_response
+from fast_agent.llm.provider.openai.streaming_utils import fetch_and_finalize_stream_response
 from fast_agent.llm.provider.openai.tool_notifications import OpenAIToolNotificationMixin
+from fast_agent.llm.provider.openai.tool_stream_state import (
+    OpenAIToolStreamEntry,
+    OpenAIToolStreamState,
+)
 from fast_agent.llm.stream_types import StreamChunk
+from fast_agent.utils.reasoning_chunk_join import normalize_reasoning_delta
 
 if TYPE_CHECKING:
     from openai.types.responses import (
@@ -20,7 +25,7 @@ else:
     try:  # OpenAI SDK versions may not include reasoning delta events yet.
         from openai.types.responses import ResponseReasoningDeltaStreamingEvent
     except Exception:  # pragma: no cover - fallback for older SDKs
-        class ResponseReasoningDeltaStreamingEvent:  # type: ignore[no-redef]
+        class ResponseReasoningDeltaStreamingEvent:
             pass
 
 
@@ -75,6 +80,14 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
             self, chunk: str, model: str, current_total: int
         ) -> int: ...
 
+        def _emit_stream_text_delta(
+            self,
+            *,
+            text: str,
+            model: str,
+            estimated_tokens: int,
+        ) -> int: ...
+
         def chat_turn(self) -> int: ...
 
         async def _emit_streaming_progress(
@@ -105,69 +118,24 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
     def _tool_use_id_from_item(self, item: Any) -> str | None:
         return getattr(item, "call_id", None) or getattr(item, "id", None)
 
-    def _tool_name_from_event_type(self, event_type: str | None) -> str | None:
-        if not event_type:
-            return None
-        if not event_type.startswith("response."):
-            return None
-        suffix = event_type[len("response.") :]
-        tool_slug = suffix.split(".", 1)[0]
-        return tool_slug or None
-
-    def _build_tool_info(
+    def _tool_payload(
         self,
+        info: OpenAIToolStreamEntry,
         *,
-        item: Any | None = None,
-        index: int | None = None,
-        event_type: str | None = None,
-        item_id: str | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
-        tool_type = getattr(item, "type", None) if item is not None else None
-        tool_name = self._tool_name_from_item(item) if item is not None else None
-        tool_use_id = self._tool_use_id_from_item(item) if item is not None else None
-        if not tool_name:
-            tool_name = self._tool_name_from_event_type(event_type) or "tool"
-        if not tool_use_id:
-            tool_use_id = item_id
-        if not tool_use_id and index is not None:
-            tool_use_id = f"tool-{index}"
-        return {
-            "tool_name": tool_name,
-            "tool_use_id": tool_use_id,
-            "item_id": item_id or getattr(item, "id", None),
-            "index": index,
-            "type": tool_type,
-            "notified": False,
-        }
-
-    def _tool_payload(self, info: dict[str, Any], *, status: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "tool_name": info.get("tool_name"),
-            "tool_use_id": info.get("tool_use_id"),
-            "index": info.get("index"),
+            "tool_name": info.tool_name,
+            "tool_use_id": info.tool_use_id,
+            "index": info.index,
         }
-        if info.get("item_id"):
-            payload["item_id"] = info.get("item_id")
-        if info.get("type"):
-            payload["tool_type"] = info.get("type")
+        if info.item_id:
+            payload["item_id"] = info.item_id
+        if info.item_type:
+            payload["tool_type"] = info.item_type
         if status:
             payload["status"] = status
         return payload
-
-    def _lookup_tool_info(
-        self,
-        *,
-        tool_streams: dict[int, dict[str, Any]],
-        tool_streams_by_id: dict[str, dict[str, Any]],
-        index: int | None,
-        item_id: str | None,
-        event_type: str | None,
-    ) -> dict[str, Any]:
-        if index is not None and index in tool_streams:
-            return tool_streams[index]
-        if item_id and item_id in tool_streams_by_id:
-            return tool_streams_by_id[item_id]
-        return self._build_tool_info(index=index, event_type=event_type, item_id=item_id)
 
     async def _process_stream(
         self, stream: Any, model: str, capture_filename: Any
@@ -175,10 +143,42 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
         estimated_tokens = 0
         reasoning_chars = 0
         reasoning_segments: list[str] = []
-        tool_streams: dict[int, dict[str, Any]] = {}
-        tool_streams_by_id: dict[str, dict[str, Any]] = {}
+        tool_state = OpenAIToolStreamState()
         notified_tool_indices: set[int] = set()
+        notified_tool_use_ids: set[str] = set()
         final_response: Any | None = None
+        anonymous_tool_counter = 0
+
+        def mark_tool_notified(
+            *,
+            tool_use_id: str | None,
+            index: int | None,
+        ) -> None:
+            if tool_use_id:
+                notified_tool_use_ids.add(tool_use_id)
+            if index is not None:
+                notified_tool_indices.add(index)
+
+        def tool_use_id_for_event(*, event: Any, item: Any, index: int | None) -> str:
+            nonlocal anonymous_tool_counter
+
+            tool_use_id = self._tool_use_id_from_item(item)
+            if isinstance(tool_use_id, str) and tool_use_id:
+                return tool_use_id
+
+            item_id = getattr(event, "item_id", None) or getattr(item, "id", None)
+            if isinstance(item_id, str) and item_id:
+                return item_id
+
+            if index is not None:
+                return f"tool-{index}"
+
+            sequence_number = getattr(event, "sequence_number", None)
+            if isinstance(sequence_number, int):
+                return f"tool-seq-{sequence_number}"
+
+            anonymous_tool_counter += 1
+            return f"tool-unknown-{anonymous_tool_counter}"
 
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -201,11 +201,19 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     part_type = getattr(part, "type", None)
                     part_text = getattr(part, "text", None)
                     if part_type in {"reasoning", "reasoning_text"} and part_text:
-                        reasoning_segments.append(part_text)
-                        self._notify_stream_listeners(
-                            StreamChunk(text=part_text, is_reasoning=True)
+                        last_char = (
+                            reasoning_segments[-1][-1]
+                            if reasoning_segments and reasoning_segments[-1]
+                            else None
                         )
-                        reasoning_chars += len(part_text)
+                        normalized_delta = normalize_reasoning_delta(last_char, part_text)
+                        if not normalized_delta:
+                            continue
+                        reasoning_segments.append(normalized_delta)
+                        self._notify_stream_listeners(
+                            StreamChunk(text=normalized_delta, is_reasoning=True)
+                        )
+                        reasoning_chars += len(normalized_delta)
                         await self._emit_streaming_progress(
                             model=f"{model} (reasoning)",
                             new_total=reasoning_chars,
@@ -218,11 +226,19 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     "response.reasoning_summary.delta",
                 }:
                     if delta:
-                        reasoning_segments.append(delta)
-                        self._notify_stream_listeners(
-                            StreamChunk(text=delta, is_reasoning=True)
+                        last_char = (
+                            reasoning_segments[-1][-1]
+                            if reasoning_segments and reasoning_segments[-1]
+                            else None
                         )
-                        reasoning_chars += len(delta)
+                        normalized_delta = normalize_reasoning_delta(last_char, delta)
+                        if not normalized_delta:
+                            continue
+                        reasoning_segments.append(normalized_delta)
+                        self._notify_stream_listeners(
+                            StreamChunk(text=normalized_delta, is_reasoning=True)
+                        )
+                        reasoning_chars += len(normalized_delta)
                         await self._emit_streaming_progress(
                             model=f"{model} (summary)",
                             new_total=reasoning_chars,
@@ -235,11 +251,19 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     "response.reasoning_text.delta",
                 }:
                     if delta:
-                        reasoning_segments.append(delta)
-                        self._notify_stream_listeners(
-                            StreamChunk(text=delta, is_reasoning=True)
+                        last_char = (
+                            reasoning_segments[-1][-1]
+                            if reasoning_segments and reasoning_segments[-1]
+                            else None
                         )
-                        reasoning_chars += len(delta)
+                        normalized_delta = normalize_reasoning_delta(last_char, delta)
+                        if not normalized_delta:
+                            continue
+                        reasoning_segments.append(normalized_delta)
+                        self._notify_stream_listeners(
+                            StreamChunk(text=normalized_delta, is_reasoning=True)
+                        )
+                        reasoning_chars += len(normalized_delta)
                         await self._emit_streaming_progress(
                             model=f"{model} (reasoning)",
                             new_total=reasoning_chars,
@@ -252,13 +276,11 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     "response.text.delta",
                 }:
                     if delta:
-                        self._notify_stream_listeners(
-                            StreamChunk(text=delta, is_reasoning=False)
+                        estimated_tokens = self._emit_stream_text_delta(
+                            text=delta,
+                            model=model,
+                            estimated_tokens=estimated_tokens,
                         )
-                        estimated_tokens = self._update_streaming_progress(
-                            delta, model, estimated_tokens
-                        )
-                        self._notify_tool_stream_listeners("text", {"chunk": delta})
                     continue
 
                 if event_type in {"response.completed", "response.incomplete"}:
@@ -270,15 +292,15 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     if not self._is_tool_item(item):
                         continue
                     index = getattr(event, "output_index", None)
-                    if index is None:
-                        continue
-                    tool_info = self._build_tool_info(
-                        item=item, index=index, item_id=getattr(event, "item_id", None)
+                    item_id = getattr(event, "item_id", None) or getattr(item, "id", None)
+                    tool_info = tool_state.register(
+                        tool_use_id=tool_use_id_for_event(event=event, item=item, index=index),
+                        name=self._tool_name_from_item(item),
+                        index=index,
+                        item_id=item_id,
+                        item_type=getattr(item, "type", None),
                     )
-                    tool_streams[index] = tool_info
-                    if tool_info.get("item_id"):
-                        tool_streams_by_id[tool_info["item_id"]] = tool_info
-                    if tool_info["tool_name"] and tool_info["tool_use_id"]:
+                    if tool_info.tool_name and tool_info.tool_use_id and not tool_info.start_notified:
                         payload = self._tool_payload(tool_info)
                         self._notify_tool_stream_listeners("start", payload)
                         self.logger.info(
@@ -292,8 +314,12 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                                 "tool_event": "start",
                             },
                         )
-                        tool_info["notified"] = True
-                        notified_tool_indices.add(index)
+                        tool_info.start_notified = True
+                    if tool_info.start_notified:
+                        mark_tool_notified(
+                            tool_use_id=tool_info.tool_use_id,
+                            index=index,
+                        )
                     continue
 
                 if event_type and event_type.endswith(".delta") and (
@@ -303,14 +329,13 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                 ):
                     index = getattr(event, "output_index", None)
                     item_id = getattr(event, "item_id", None)
-                    tool_info = self._lookup_tool_info(
-                        tool_streams=tool_streams,
-                        tool_streams_by_id=tool_streams_by_id,
+                    tool_info = tool_state.resolve_open(
                         index=index,
                         item_id=item_id,
-                        event_type=event_type,
                     )
                     if delta:
+                        if tool_info is None:
+                            continue
                         payload = self._tool_payload(tool_info)
                         payload["chunk"] = delta
                         self._notify_tool_stream_listeners("delta", payload)
@@ -321,21 +346,29 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                     if not self._is_tool_item(item):
                         continue
                     index = getattr(event, "output_index", None)
-                    tool_info = tool_streams.pop(index, {}) if index is not None else {}
-                    if tool_info.get("item_id") in tool_streams_by_id:
-                        tool_streams_by_id.pop(tool_info["item_id"], None)
+                    item_id = getattr(event, "item_id", None) or getattr(item, "id", None)
+                    tool_use_id = self._tool_use_id_from_item(item)
+                    tool_info = tool_state.close(index=index, tool_use_id=tool_use_id, item_id=item_id)
+                    if tool_info is None and tool_state.is_completed(
+                        index=index,
+                        tool_use_id=tool_use_id,
+                        item_id=item_id,
+                    ):
+                        continue
+                    if tool_info is None:
+                        continue
                     if index is None:
-                        index = tool_info.get("index") or -1
+                        index = tool_info.index if tool_info and tool_info.index is not None else -1
                     tool_name = self._tool_name_from_item(item)
                     tool_use_id = (
-                        self._tool_use_id_from_item(item) or tool_info.get("tool_use_id")
+                        tool_use_id or (tool_info.tool_use_id if tool_info is not None else None)
                     )
                     payload = {
                         "tool_name": tool_name,
                         "tool_use_id": tool_use_id,
                         "index": index,
                     }
-                    if not tool_info.get("stopped_notified"):
+                    if not (tool_info.stop_notified if tool_info is not None else False):
                         self._notify_tool_stream_listeners("stop", payload)
                         self.logger.info(
                             "Model finished streaming tool call",
@@ -348,6 +381,12 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                                 "tool_event": "stop",
                             },
                         )
+                        mark_tool_notified(
+                            tool_use_id=tool_use_id,
+                            index=index,
+                        )
+                        if tool_info is not None:
+                            tool_info.stop_notified = True
                     continue
 
                 if event_type:
@@ -356,20 +395,23 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                         status = match.group("status")
                         index = getattr(event, "output_index", None)
                         item_id = getattr(event, "item_id", None)
-                        tool_info = self._lookup_tool_info(
-                            tool_streams=tool_streams,
-                            tool_streams_by_id=tool_streams_by_id,
+                        tool_info = tool_state.resolve_open(
                             index=index,
                             item_id=item_id,
-                            event_type=event_type,
                         )
+                        if tool_info is None:
+                            if tool_state.is_completed(index=index, item_id=item_id):
+                                continue
+                            continue
                         payload = self._tool_payload(tool_info, status=status)
                         self._notify_tool_stream_listeners("status", payload)
-                        if status in _TOOL_START_STATUSES and not tool_info.get("notified"):
+                        if status in _TOOL_START_STATUSES and not tool_info.start_notified:
                             self._notify_tool_stream_listeners("start", payload)
-                            tool_info["notified"] = True
-                            if index is not None:
-                                notified_tool_indices.add(index)
+                            tool_info.start_notified = True
+                            mark_tool_notified(
+                                tool_use_id=tool_info.tool_use_id,
+                                index=tool_info.index,
+                            )
                         if status in _TOOL_STOP_STATUSES:
                             self._notify_tool_stream_listeners("stop", payload)
                             self.logger.info(
@@ -383,29 +425,44 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
                                     "tool_event": "stop",
                                 },
                             )
-                            tool_info["stopped_notified"] = True
+                            mark_tool_notified(
+                                tool_use_id=tool_info.tool_use_id,
+                                index=tool_info.index,
+                            )
+                            tool_info.stop_notified = True
+                            tool_state.close(
+                                index=tool_info.index,
+                                tool_use_id=tool_info.tool_use_id,
+                                item_id=item_id,
+                            )
                         continue
 
-        if final_response is None:
-            try:
-                final_response = await stream.get_final_response()
-            except Exception as exc:
-                self.logger.warning(
-                    "Failed to fetch final Open Responses payload",
-                    data={"error": str(exc)},
-                )
-                raise
+        def emit_tool_fallback(
+            output_items: list[Any],
+            notified_indices: set[int],
+            *,
+            model: str,
+        ) -> None:
+            self._emit_tool_notification_fallback(
+                output_items,
+                notified_indices,
+                model=model,
+                notified_tool_use_ids=notified_tool_use_ids,
+            )
 
-        finalize_stream_response(
+        final_response = await fetch_and_finalize_stream_response(
+            stream=stream,
             final_response=final_response,
+            fetch_failure_message="Failed to fetch final Open Responses payload",
+            use_exc_info_on_fetch_failure=False,
+            incomplete_entries=tool_state.incomplete(),
             model=model,
             agent_name=self.name,
             chat_turn=self.chat_turn,
             logger=self.logger,
             notified_tool_indices=notified_tool_indices,
-            emit_tool_fallback=self._emit_tool_notification_fallback,
+            emit_tool_fallback=emit_tool_fallback,
         )
-
         return final_response, reasoning_segments
 
     def _emit_tool_notification_fallback(
@@ -414,18 +471,20 @@ class OpenResponsesStreamingMixin(OpenAIToolNotificationMixin):
         notified_indices: set[int],
         *,
         model: str,
+        notified_tool_use_ids: set[str] | None = None,
     ) -> None:
         if not output_items:
             return
 
+        deduped_tool_use_ids = notified_tool_use_ids or set()
         for index, item in enumerate(output_items):
-            if index in notified_indices:
-                continue
             if not self._is_tool_item(item):
                 continue
 
             tool_name = self._tool_name_from_item(item)
             tool_use_id = self._tool_use_id_from_item(item) or f"tool-{index}"
+            if index in notified_indices or tool_use_id in deduped_tool_use_ids:
+                continue
 
             self._emit_fallback_tool_notification_event(
                 tool_name=tool_name,

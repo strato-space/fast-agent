@@ -16,6 +16,8 @@ def test_model_database_context_windows():
     """Test that ModelDatabase returns expected context windows"""
     # Test known models
     assert ModelDatabase.get_context_window("claude-sonnet-4-0") == 200000
+    assert ModelDatabase.get_context_window("claude-sonnet-4-6") == 1_000_000
+    assert ModelDatabase.get_context_window("claude-opus-4-6") == 1_000_000
     assert ModelDatabase.get_context_window("gpt-4o") == 128000
     assert ModelDatabase.get_context_window("gemini-2.0-flash") == 1048576
     assert ModelDatabase.get_context_window("Qwen/Qwen3.5-397B-A17B") == 262144
@@ -26,8 +28,9 @@ def test_model_database_context_windows():
 
 def test_model_database_long_context_windows():
     """Explicit long-context capability should be tracked in ModelDatabase."""
-    assert ModelDatabase.get_long_context_window("claude-opus-4-6") == 1_000_000
+    assert ModelDatabase.get_long_context_window("claude-opus-4-6") is None
     assert ModelDatabase.get_long_context_window("claude-sonnet-4-0") == 1_000_000
+    assert ModelDatabase.get_long_context_window("claude-sonnet-4-5") == 1_000_000
     assert ModelDatabase.get_long_context_window("claude-haiku-4-5") is None
     assert ModelDatabase.get_long_context_window("unknown-model") is None
 
@@ -35,11 +38,12 @@ def test_model_database_long_context_windows():
 def test_model_database_long_context_model_listing():
     """Long-context model listing should come from ModelDatabase metadata."""
     models = ModelDatabase.list_long_context_models()
-    assert "claude-opus-4-6" in models
     assert "claude-sonnet-4-5" in models
     assert "claude-sonnet-4-5-20250929" in models
     assert "claude-sonnet-4-0" in models
     assert "claude-sonnet-4-20250514" in models
+    assert "claude-opus-4-6" not in models
+    assert "claude-sonnet-4-6" not in models
     assert "claude-haiku-4-5" not in models
 
 
@@ -100,6 +104,59 @@ def test_model_database_anthropic_web_tool_versions_unknown_model():
     assert ModelDatabase.get_anthropic_required_betas("unknown-model") is None
 
 
+def test_model_database_anthropic_vertex_caps_are_provider_aware() -> None:
+    assert (
+        ModelDatabase.get_anthropic_web_search_version(
+            "claude-sonnet-4-6",
+            provider=Provider.ANTHROPIC_VERTEX,
+        )
+        == "web_search_20260209"
+    )
+    assert (
+        ModelDatabase.get_anthropic_web_fetch_version(
+            "claude-sonnet-4-6",
+            provider=Provider.ANTHROPIC_VERTEX,
+        )
+        is None
+    )
+    assert ModelDatabase.get_anthropic_required_betas(
+        "claude-sonnet-4-6",
+        provider=Provider.ANTHROPIC_VERTEX,
+    ) == ("code-execution-web-tools-2026-02-09",)
+    assert (
+        ModelDatabase.get_long_context_window(
+            "claude-sonnet-4-5",
+            provider=Provider.ANTHROPIC_VERTEX,
+        )
+        == 1_000_000
+    )
+    assert not ModelDatabase.supports_mime(
+        "claude-sonnet-4-6",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        provider=Provider.ANTHROPIC_VERTEX,
+    )
+    assert ModelDatabase.supports_mime(
+        "claude-sonnet-4-6",
+        "application/pdf",
+        provider=Provider.ANTHROPIC_VERTEX,
+    )
+
+
+def test_model_database_anthropic_linked_office_docs_are_not_supported() -> None:
+    assert not ModelDatabase.supports_mime(
+        "claude-sonnet-4-5",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        provider=Provider.ANTHROPIC,
+        resource_source="link",
+    )
+    assert ModelDatabase.supports_mime(
+        "claude-sonnet-4-5",
+        "image/png",
+        provider=Provider.ANTHROPIC,
+        resource_source="link",
+    )
+
+
 def test_model_database_max_tokens():
     """Test that ModelDatabase returns expected max tokens"""
     # Test known models with different max_output_tokens (no cap)
@@ -143,10 +200,22 @@ def test_model_database_supports_mime_basic():
     assert ModelDatabase.supports_mime(
         "claude-sonnet-4-0", "document/pdf"
     )  # alias -> application/pdf
+    assert ModelDatabase.supports_mime(
+        "claude-sonnet-4-0",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    assert ModelDatabase.supports_mime(
+        "gpt-4o",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
 
     # Text-only models should not support images
     assert not ModelDatabase.supports_mime("deepseek-chat", "image/png")
     assert not ModelDatabase.supports_mime("deepseek-chat", "pdf")
+    assert not ModelDatabase.supports_mime(
+        "deepseek-chat",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     # Wildcard checks
     assert ModelDatabase.supports_mime("gpt-4o", "image/*")

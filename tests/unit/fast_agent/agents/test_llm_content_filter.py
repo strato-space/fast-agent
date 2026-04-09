@@ -6,6 +6,7 @@ from mcp.types import (
     CallToolResult,
     EmbeddedResource,
     ImageContent,
+    ResourceLink,
     TextContent,
 )
 from pydantic import AnyUrl
@@ -18,7 +19,10 @@ from fast_agent.constants import (
     FAST_AGENT_REMOVED_METADATA_CHANNEL,
 )
 from fast_agent.interfaces import FastAgentLLMProtocol
+from fast_agent.llm.model_factory import ModelConfig
+from fast_agent.llm.model_info import ModelInfo
 from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.resolved_model import ResolvedModelSpec
 from fast_agent.types import PromptMessageExtended, text_content
 
 
@@ -28,6 +32,14 @@ class RecordingStubLLM(FastAgentLLMProtocol):
     def __init__(self, model_name: str = "passthrough") -> None:
         self._model_name = model_name
         self._provider = Provider.FAST_AGENT
+        self._resolved_model = ResolvedModelSpec(
+            raw_input=model_name,
+            selected_model_name=model_name,
+            source="direct",
+            model_config=ModelConfig(provider=Provider.FAST_AGENT, model_name=model_name),
+            provider=Provider.FAST_AGENT,
+            wire_model_name=model_name,
+        )
         self.generated_messages: list[PromptMessageExtended] | None = None
         self._message_history: list[PromptMessageExtended] = []
 
@@ -40,6 +52,10 @@ class RecordingStubLLM(FastAgentLLMProtocol):
     @property
     def provider(self) -> Provider:
         return self._provider
+
+    @property
+    def resolved_model(self) -> ResolvedModelSpec:
+        return self._resolved_model
 
     async def generate(self, messages, request_params=None, tools=None):
         self.generated_messages = messages
@@ -73,11 +89,62 @@ class RecordingStubLLM(FastAgentLLMProtocol):
         return ModelInfo.from_name(model_name, self.provider)
 
 
+class OverlayVisionStubLLM(RecordingStubLLM):
+    @property
+    def provider(self) -> Provider:
+        return Provider.OPENRESPONSES
+
+    @property
+    def model_info(self):
+        model_name = self.model_name or "overlay-model"
+        return ModelInfo(
+            name=model_name,
+            provider=self.provider,
+            context_window=75264,
+            max_output_tokens=2048,
+            tokenizes=["text/plain", "image/jpeg", "image/png", "image/webp"],
+            json_mode=None,
+            reasoning=None,
+        )
+
+
+class AnthropicStubLLM(RecordingStubLLM):
+    def __init__(self, model_name: str = "claude-sonnet-4-5") -> None:
+        super().__init__(model_name=model_name)
+        self._provider = Provider.ANTHROPIC
+        self._resolved_model = ResolvedModelSpec(
+            raw_input=model_name,
+            selected_model_name=model_name,
+            source="direct",
+            model_config=ModelConfig(provider=Provider.ANTHROPIC, model_name=model_name),
+            provider=Provider.ANTHROPIC,
+            wire_model_name=model_name,
+        )
+
+
 def make_decorator(model_name: str = "passthrough") -> tuple[LlmDecorator, RecordingStubLLM]:
     config = AgentConfig(name="tester", model=model_name)
     decorator = LlmDecorator(config=config)
     stub = RecordingStubLLM(model_name=model_name)
-    decorator._llm = stub  # type: ignore[attr-defined]
+    decorator._llm = stub
+    return decorator, stub
+
+
+def make_overlay_vision_decorator() -> tuple[LlmDecorator, OverlayVisionStubLLM]:
+    model_name = "unsloth/Qwen3.5-9B-GGUF"
+    config = AgentConfig(name="tester", model=model_name)
+    decorator = LlmDecorator(config=config)
+    stub = OverlayVisionStubLLM(model_name=model_name)
+    decorator._llm = stub
+    return decorator, stub
+
+
+def make_anthropic_decorator() -> tuple[LlmDecorator, AnthropicStubLLM]:
+    model_name = "claude-sonnet-4-5"
+    config = AgentConfig(name="tester", model=model_name)
+    decorator = LlmDecorator(config=config)
+    stub = AnthropicStubLLM(model_name=model_name)
+    decorator._llm = stub
     return decorator, stub
 
 
@@ -162,6 +229,25 @@ async def test_sanitizes_image_content_for_text_only_model():
 
 
 @pytest.mark.asyncio
+async def test_overlay_model_info_keeps_supported_image_content():
+    decorator, stub = make_overlay_vision_decorator()
+
+    image_block = ImageContent(type="image", data="AAA", mimeType="image/png")
+    message = PromptMessageExtended(role="user", content=[image_block])
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is None
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    assert len(sent_message.content) == 1
+    assert isinstance(sent_message.content[0], ImageContent)
+    assert sent_message.channels is None or FAST_AGENT_ERROR_CHANNEL not in sent_message.channels
+
+
+@pytest.mark.asyncio
 async def test_removes_unsupported_tool_result_content():
     decorator, stub = make_decorator("passthrough")
 
@@ -207,6 +293,31 @@ async def test_removes_unsupported_tool_result_content():
 
 
 @pytest.mark.asyncio
+async def test_removes_remote_office_document_links_for_anthropic() -> None:
+    decorator, stub = make_anthropic_decorator()
+
+    resource = ResourceLink(
+        type="resource_link",
+        uri=AnyUrl("https://example.com/report.docx"),
+        mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        name="report.docx",
+    )
+    message = PromptMessageExtended(role="user", content=[resource])
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is not None
+    assert "document" in summary.message.lower()
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    assert len(sent_message.content) == 1
+    assert isinstance(sent_message.content[0], TextContent)
+    assert "removed" in sent_message.content[0].text.lower()
+
+
+@pytest.mark.asyncio
 async def test_metadata_clears_when_supported_content_only():
     decorator, stub = make_decorator("passthrough")
 
@@ -241,4 +352,3 @@ async def test_history_persists_alert_channel_but_strips_removed_metadata():
     assert FAST_AGENT_ALERT_CHANNEL in channels
     assert _parse_alert_flags(channels[FAST_AGENT_ALERT_CHANNEL]) == {"V"}
     assert FAST_AGENT_REMOVED_METADATA_CHANNEL not in channels
-

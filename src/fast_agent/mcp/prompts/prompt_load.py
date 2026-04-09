@@ -2,18 +2,13 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from mcp.server.fastmcp.prompts.base import (
-    AssistantMessage,
-    Message,
-    UserMessage,
-)
 from mcp.types import PromptMessage, TextContent
 
 from fast_agent.constants import FAST_AGENT_USAGE
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import AgentProtocol
 from fast_agent.llm.provider_types import Provider
-from fast_agent.llm.usage_tracking import FastAgentUsage, TurnUsage
+from fast_agent.llm.usage_tracking import TurnUsage
 from fast_agent.mcp import mime_utils, resource_utils
 from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.mcp.prompts.prompt_template import (
@@ -91,20 +86,18 @@ def create_content_message(text: str, role: MessageRole) -> PromptMessage:
 
 def create_resource_message(
     resource_path: str, content: str, mime_type: str, is_binary: bool, role: MessageRole
-) -> Message:
+) -> PromptMessage:
     """Create a resource message with the specified content and role"""
-    message_class = UserMessage if role == "user" else AssistantMessage
-
     if mime_utils.is_image_mime_type(mime_type):
         # For images, create an ImageContent
         image_content = resource_utils.create_image_content(data=content, mime_type=mime_type)
-        return message_class(content=image_content)
+        return PromptMessage(role=role, content=image_content)
     else:
         # For other resources, create an EmbeddedResource
         embedded_resource = resource_utils.create_embedded_resource(
             resource_path, content, mime_type, is_binary
         )
-        return message_class(content=embedded_resource)
+        return PromptMessage(role=role, content=embedded_resource)
 
 
 def load_prompt(file: Path | str) -> list[PromptMessageExtended]:
@@ -227,26 +220,14 @@ def _payload_provider(payload: dict[str, Any]) -> Provider | None:
         return None
 
 
-def _coerce_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _turn_usage_from_payload(payload: dict[str, Any]) -> TurnUsage | None:
     turn_data = payload.get("turn")
     if not isinstance(turn_data, dict):
         return None
 
     turn_snapshot = dict(turn_data)
-    input_tokens = _coerce_int(turn_snapshot.get("input_tokens"))
-    output_tokens = _coerce_int(turn_snapshot.get("output_tokens"))
-    turn_snapshot["raw_usage"] = FastAgentUsage(
-        input_chars=input_tokens,
-        output_chars=output_tokens,
-        model_type="rehydrated",
-    )
+    if "raw_usage" in payload:
+        turn_snapshot["raw_usage"] = payload.get("raw_usage")
 
     try:
         return TurnUsage.model_validate(turn_snapshot)

@@ -14,21 +14,21 @@ from fast_agent.ui.prompt.alert_flags import (
 )
 from fast_agent.ui.prompt.completer import AgentCompleter
 from fast_agent.ui.prompt.editor import get_text_from_editor
-from fast_agent.ui.prompt.keybindings import AgentKeyBindings, create_keybindings
-from fast_agent.ui.prompt.parser import parse_special_input
-from fast_agent.ui.prompt.session import (
+from fast_agent.ui.prompt.input import (
     ShellPrefixLexer,
     _display_agent_info_helper,
     get_argument_input,
     get_selection_input,
     show_mcp_status,
 )
-from fast_agent.ui.prompt.session import (
+from fast_agent.ui.prompt.input import (
     get_enhanced_input as _get_enhanced_input,
 )
-from fast_agent.ui.prompt.session import (
+from fast_agent.ui.prompt.input import (
     handle_special_commands as _handle_special_commands,
 )
+from fast_agent.ui.prompt.keybindings import AgentKeyBindings, create_keybindings
+from fast_agent.ui.prompt.parser import parse_special_input
 from fast_agent.ui.prompt.toolbar import (
     _can_fit_shell_path_and_version,
     _fit_shell_identity_for_toolbar,
@@ -58,50 +58,50 @@ _agent_info_shown: set[str] = set()
 _startup_notices: list[object] = []
 
 
-def _sync_to_session() -> None:
-    from fast_agent.ui.prompt import session as _session
+def _sync_to_input_module() -> None:
+    from fast_agent.ui.prompt import input as _input
 
-    _session.agent_histories = agent_histories
-    _session.available_agents = available_agents
-    _session.in_multiline_mode = in_multiline_mode
-    _session._last_copyable_output = _last_copyable_output
-    _session._copy_notice = _copy_notice
-    _session._copy_notice_until = _copy_notice_until
-    _session.help_message_shown = help_message_shown
-    _session._agent_info_shown = _agent_info_shown
-    _session._startup_notices = _startup_notices
+    _input.agent_histories = agent_histories
+    _input.available_agents = available_agents
+    _input.in_multiline_mode = in_multiline_mode
+    _input._last_copyable_output = _last_copyable_output
+    _input._copy_notice = _copy_notice
+    _input._copy_notice_until = _copy_notice_until
+    _input.help_message_shown = help_message_shown
+    _input._agent_info_shown = _agent_info_shown
+    _input._startup_notices = _startup_notices
 
 
-def _sync_from_session() -> None:
+def _sync_from_input_module() -> None:
     global agent_histories, available_agents, in_multiline_mode
     global _last_copyable_output, _copy_notice, _copy_notice_until
     global help_message_shown, _agent_info_shown, _startup_notices
 
-    from fast_agent.ui.prompt import session as _session
+    from fast_agent.ui.prompt import input as _input
 
-    agent_histories = _session.agent_histories
-    available_agents = _session.available_agents
-    in_multiline_mode = _session.in_multiline_mode
-    _last_copyable_output = _session._last_copyable_output
-    _copy_notice = _session._copy_notice
-    _copy_notice_until = _session._copy_notice_until
-    help_message_shown = _session.help_message_shown
-    _agent_info_shown = _session._agent_info_shown
-    _startup_notices = _session._startup_notices
+    agent_histories = _input.agent_histories
+    available_agents = _input.available_agents
+    in_multiline_mode = _input.in_multiline_mode
+    _last_copyable_output = _input._last_copyable_output
+    _copy_notice = _input._copy_notice
+    _copy_notice_until = _input._copy_notice_until
+    help_message_shown = _input.help_message_shown
+    _agent_info_shown = _input._agent_info_shown
+    _startup_notices = _input._startup_notices
 
 
 def set_last_copyable_output(output: str) -> None:
     global _last_copyable_output
     _last_copyable_output = output
-    _sync_to_session()
+    _sync_to_input_module()
 
 
 def queue_startup_notice(notice: object) -> None:
-    from fast_agent.ui.prompt.session import queue_startup_notice as _queue_startup_notice
+    from fast_agent.ui.prompt.input import queue_startup_notice as _queue_startup_notice
 
-    _sync_to_session()
+    _sync_to_input_module()
     _queue_startup_notice(notice)
-    _sync_from_session()
+    _sync_from_input_module()
 
 
 def queue_startup_markdown_notice(
@@ -112,11 +112,11 @@ def queue_startup_markdown_notice(
     right_info: str | None = None,
     agent_name: str | None = None,
 ) -> None:
-    from fast_agent.ui.prompt.session import (
+    from fast_agent.ui.prompt.input import (
         queue_startup_markdown_notice as _queue_startup_markdown_notice,
     )
 
-    _sync_to_session()
+    _sync_to_input_module()
     _queue_startup_markdown_notice(
         text,
         title=title,
@@ -124,22 +124,22 @@ def queue_startup_markdown_notice(
         right_info=right_info,
         agent_name=agent_name,
     )
-    _sync_from_session()
+    _sync_from_input_module()
 
 
 async def get_enhanced_input(*args, **kwargs) -> str | CommandPayload:
-    _sync_to_session()
+    _sync_to_input_module()
     result = await _get_enhanced_input(*args, **kwargs)
-    _sync_from_session()
+    _sync_from_input_module()
     return result
 
 
 async def handle_special_commands(
     command: str | CommandPayload | None, agent_app: "AgentApp | bool | None" = None
 ) -> bool | CommandPayload:
-    _sync_to_session()
+    _sync_to_input_module()
     result = await _handle_special_commands(command, agent_app)
-    _sync_from_session()
+    _sync_from_input_module()
     return result
 
 

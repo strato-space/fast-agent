@@ -19,9 +19,10 @@ class Provider(Enum):
     @property
     def config_name(self) -> str:
         """Return the provider's config name (typed accessor for _value_)."""
-        return self._value_  # type: ignore[return-value]
+        return self._value_
 
     ANTHROPIC = ("anthropic", "Anthropic")
+    ANTHROPIC_VERTEX = ("anthropic-vertex", "Anthropic (Vertex)")
     DEEPSEEK = ("deepseek", "Deepseek")
     FAST_AGENT = ("fast-agent", "fast-agent-internal")
     GENERIC = ("generic", "Generic")

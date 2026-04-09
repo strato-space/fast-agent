@@ -21,6 +21,7 @@ from typing import (
     Sequence,
     TypeVar,
     Union,
+    cast,
     runtime_checkable,
 )
 
@@ -28,6 +29,7 @@ import mcp
 from a2a.types import AgentCard, AgentSkill
 from mcp.types import (
     CallToolResult,
+    ContentBlock,
     EmbeddedResource,
     GetPromptResult,
     ListToolsResult,
@@ -47,12 +49,17 @@ from fast_agent.constants import (
     SHELL_NOTICE_PREFIX,
     should_parallelize_tool_calls,
 )
-from fast_agent.core.exceptions import PromptExitError
+from fast_agent.core.exceptions import AgentConfigError, PromptExitError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.llm.model_database import ModelDatabase
-from fast_agent.llm.terminal_output_limits import calculate_terminal_output_limit_for_model
+from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.terminal_output_limits import (
+    calculate_terminal_output_limit_for_model,
+    calculate_terminal_output_limit_for_resolved_model,
+)
 from fast_agent.mcp.common import (
+    create_namespaced_name,
     get_resource_name,
     get_server_name,
     is_namespaced_name,
@@ -65,6 +72,11 @@ from fast_agent.mcp.mcp_aggregator import (
     MCPDetachResult,
     NamespacedTool,
     ServerStatus,
+)
+from fast_agent.mcp.provider_management import (
+    ProviderManagedMCPState,
+    build_provider_managed_mcp_state,
+    split_managed_server_names,
 )
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest
 from fast_agent.skills.registry import SkillRegistry
@@ -83,6 +95,7 @@ from fast_agent.types import (
     ToolTimingInfo,
 )
 from fast_agent.ui import console
+from fast_agent.ui.message_display_helpers import resolve_highlight_index
 from fast_agent.utils.async_utils import gather_with_cancel
 
 # Define a TypeVar for models
@@ -147,15 +160,35 @@ class McpAgent(ABC, ToolAgent):
             **kwargs,
         )
 
+        configured_servers = tuple(self.config.servers)
+        server_settings_by_name = None
+        if context and context.config and context.config.mcp:
+            server_settings_by_name = context.config.mcp.servers
+        self._provider_managed_mcp_state = ProviderManagedMCPState()
+        client_managed_servers = list(configured_servers)
+        provider_managed_servers: list[str] = []
+        if server_settings_by_name is not None:
+            self._provider_managed_mcp_state = build_provider_managed_mcp_state(
+                agent_config=self.config,
+                server_settings_by_name=server_settings_by_name,
+            )
+            client_managed_servers, provider_managed_servers = split_managed_server_names(
+                configured_servers,
+                server_settings_by_name,
+            )
+        self._configured_server_names = tuple(configured_servers)
+        self._provider_managed_server_names = tuple(provider_managed_servers)
+
         # Create aggregator with composition
         self._aggregator = MCPAggregator(
-            server_names=self.config.servers,
+            server_names=client_managed_servers,
             connection_persistence=connection_persistence,
             name=self.config.name,
             context=context,
             config=self.config,  # Pass the full config for access to elicitation_handler
             **kwargs,
         )
+        self._aggregator.set_supplemental_attached_servers(self._provider_managed_server_names)
 
         # Store the original template - resolved instruction set after build()
         self._instruction_template = self.config.instruction
@@ -170,7 +203,7 @@ class McpAgent(ABC, ToolAgent):
             and context.skill_registry
         ):
             try:
-                manifests = list(context.skill_registry.load_manifests())  # type: ignore[assignment]
+                manifests = list(context.skill_registry.load_manifests())
             except Exception:
                 manifests = []
 
@@ -315,6 +348,8 @@ class McpAgent(ABC, ToolAgent):
         Shutdown the agent and close all MCP server connections.
         NOTE: This method is called automatically when the agent is used as an async context manager.
         """
+        if self._shutdown_complete:
+            return
         await self._run_lifecycle_hook("on_shutdown")
         await self._aggregator.close()
         await self._finalize_shutdown(run_hook=False)
@@ -350,7 +385,45 @@ class McpAgent(ABC, ToolAgent):
         """Expose server status details for UI and diagnostics consumers."""
         if not self._aggregator:
             return {}
-        return await self._aggregator.collect_server_status()
+        status_map = await self._aggregator.collect_server_status()
+
+        server_settings_by_name = None
+        if self._context and self._context.config and self._context.config.mcp:
+            server_settings_by_name = self._context.config.mcp.servers
+
+        if not server_settings_by_name:
+            return status_map
+
+        auto_sampling = True
+        if self._context and getattr(self._context, "config", None):
+            auto_sampling = getattr(self._context.config, "auto_sampling", True)
+
+        for server_name in self._provider_managed_server_names:
+            if server_name in status_map:
+                continue
+            server_cfg = server_settings_by_name.get(server_name)
+            if server_cfg is None:
+                continue
+
+            roots = server_cfg.roots
+            elicitation = server_cfg.elicitation
+            sampling_cfg = server_cfg.sampling
+            status_map[server_name] = ServerStatus(
+                server_name=server_name,
+                transport=server_cfg.transport,
+                is_connected=True,
+                instructions_enabled=server_cfg.include_instructions,
+                roots_configured=bool(roots),
+                roots_count=len(roots) if roots else 0,
+                elicitation_mode=getattr(elicitation, "mode", None) if elicitation else None,
+                sampling_mode=(
+                    "configured"
+                    if sampling_cfg is not None
+                    else ("auto" if auto_sampling else "off")
+                ),
+            )
+
+        return status_map
 
     async def attach_mcp_server(
         self,
@@ -359,6 +432,18 @@ class McpAgent(ABC, ToolAgent):
         server_config: MCPServerSettings | None = None,
         options: MCPAttachOptions | None = None,
     ) -> MCPAttachResult:
+        resolved_server_config = server_config
+        if (
+            resolved_server_config is None
+            and self._context
+            and self._context.config
+            and self._context.config.mcp
+        ):
+            resolved_server_config = self._context.config.mcp.servers.get(server_name)
+        if resolved_server_config is not None and resolved_server_config.management == "provider":
+            raise AgentConfigError(
+                f"Provider-managed MCP server '{server_name}' cannot be attached locally."
+            )
         return await self._aggregator.attach_server(
             server_name=server_name,
             server_config=server_config,
@@ -369,7 +454,12 @@ class McpAgent(ABC, ToolAgent):
         return await self._aggregator.detach_server(server_name)
 
     def list_attached_mcp_servers(self) -> list[str]:
-        return self._aggregator.list_attached_servers()
+        return self._unique_preserving_order(self._aggregator.list_attached_servers())
+
+    async def list_servers(self) -> list[str]:
+        return self._unique_preserving_order(
+            [*self._aggregator.server_names, *self._provider_managed_server_names]
+        )
 
     @property
     def aggregator(self) -> MCPAggregator:
@@ -429,7 +519,11 @@ class McpAgent(ABC, ToolAgent):
         Apply template substitution to the instruction, including server instructions.
         This is called during initialization after servers are connected.
         """
-        from fast_agent.core.instruction_refresh import build_instruction, format_agent_skills
+        from fast_agent.core.instruction_refresh import (
+            build_instruction,
+            format_agent_skills,
+            resolve_instruction_skill_manifests,
+        )
 
         if not self._instruction_template:
             return
@@ -438,7 +532,7 @@ class McpAgent(ABC, ToolAgent):
         new_instruction = await build_instruction(
             self._instruction_template,
             aggregator=self._aggregator,
-            skill_manifests=self._skill_manifests,
+            skill_manifests=resolve_instruction_skill_manifests(self, self._skill_manifests),
             skill_read_tool_name=self.skill_read_tool_name,
             context=self._instruction_context,
             source=self._name,
@@ -667,6 +761,15 @@ class McpAgent(ABC, ToolAgent):
     def _on_llm_attached(self, llm: FastAgentLLMProtocol) -> None:
         super()._on_llm_attached(llm)
 
+        if self._provider_managed_mcp_state.has_servers():
+            if llm.provider not in {Provider.ANTHROPIC, Provider.RESPONSES}:
+                raise AgentConfigError(
+                    "Provider-managed MCP is only supported for Anthropic Messages "
+                    "and the OpenAI Responses provider."
+                )
+            if hasattr(llm, "set_provider_managed_mcp_state"):
+                cast("Any", llm).set_provider_managed_mcp_state(self._provider_managed_mcp_state)
+
         if isinstance(self._filesystem_runtime, LocalFilesystemRuntime):
             self._filesystem_runtime.set_enabled_tools(
                 enable_read=self._shell_read_text_file_enabled(),
@@ -679,9 +782,12 @@ class McpAgent(ABC, ToolAgent):
         if self._shell_output_limit_overridden():
             return
 
-        self._shell_runtime.set_output_byte_limit(
-            calculate_terminal_output_limit_for_model(llm.model_name)
-        )
+        resolved_model = getattr(llm, "resolved_model", None)
+        if resolved_model is not None:
+            output_byte_limit = calculate_terminal_output_limit_for_resolved_model(resolved_model)
+        else:
+            output_byte_limit = calculate_terminal_output_limit_for_model(llm.model_name)
+        self._shell_runtime.set_output_byte_limit(output_byte_limit)
 
     def _activate_shell_runtime(
         self,
@@ -959,7 +1065,9 @@ class McpAgent(ABC, ToolAgent):
                     if name == "read_text_file":
                         return await self._filesystem_runtime.read_text_file(arguments, tool_use_id)
                     if name == "write_text_file":
-                        return await self._filesystem_runtime.write_text_file(arguments, tool_use_id)
+                        return await self._filesystem_runtime.write_text_file(
+                            arguments, tool_use_id
+                        )
                     if is_apply_patch_tool_name(name):
                         return await self._filesystem_runtime.apply_patch(arguments, tool_use_id)
 
@@ -1223,7 +1331,7 @@ class McpAgent(ABC, ToolAgent):
         prompt: PromptMessageExtended
         if isinstance(prompt_content, str):
             # Create a new prompt with the text and resources
-            content = [TextContent(type="text", text=prompt_content)]
+            content: list[ContentBlock] = [TextContent(type="text", text=prompt_content)]
             content.extend(embedded_resources)
             prompt = PromptMessageExtended(role="user", content=content)
         elif isinstance(prompt_content, PromptMessage):
@@ -1255,6 +1363,7 @@ class McpAgent(ABC, ToolAgent):
 
         tool_results: dict[str, CallToolResult] = {}
         tool_timings: dict[str, ToolTimingInfo] = {}
+        tool_metadata: dict[str, dict[str, Any]] = {}
         tool_loop_error: str | None = None
 
         # Cache available tool names exactly as advertised to the LLM for display/highlighting
@@ -1392,6 +1501,8 @@ class McpAgent(ABC, ToolAgent):
                 and not route_to_namespaced_candidate
             ):
                 metadata = self._filesystem_runtime.metadata()
+            elif local_tool is not None:
+                metadata = self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
 
             display_tool_name, bottom_items, highlight_index = self._prepare_tool_display(
                 tool_name=tool_name,
@@ -1413,6 +1524,8 @@ class McpAgent(ABC, ToolAgent):
                     tool_call_id=correlation_id if should_parallel else None,
                     show_hook_indicator=self.has_before_tool_call_hook,
                 )
+            if metadata:
+                tool_metadata[correlation_id] = metadata
 
             planned_calls.append(
                 {
@@ -1519,7 +1632,10 @@ class McpAgent(ABC, ToolAgent):
                     )
 
             return self._finalize_tool_results(
-                tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+                tool_results,
+                tool_timings=tool_timings,
+                tool_metadata=tool_metadata,
+                tool_loop_error=tool_loop_error,
             )
 
         for call in planned_calls:
@@ -1585,7 +1701,10 @@ class McpAgent(ABC, ToolAgent):
                 )
 
         return self._finalize_tool_results(
-            tool_results, tool_timings=tool_timings, tool_loop_error=tool_loop_error
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+            tool_loop_error=tool_loop_error,
         )
 
     def _prepare_tool_display(
@@ -1626,24 +1745,37 @@ class McpAgent(ABC, ToolAgent):
             bottom_items = [HUMAN_INPUT_TOOL_NAME]
             highlight_target = HUMAN_INPUT_TOOL_NAME
 
-        highlight_index: int | None = None
-        if bottom_items and highlight_target:
-            try:
-                highlight_index = bottom_items.index(highlight_target)
-            except ValueError:
-                highlight_index = None
+        highlight_index = resolve_highlight_index(bottom_items, highlight_target)
 
         if bottom_items is None and fallback_order:
             bottom_items = fallback_order
             fallback_target = display_tool_name if display_tool_name in bottom_items else tool_name
-            try:
-                highlight_index = bottom_items.index(fallback_target)
-            except ValueError:
-                highlight_index = None
+            highlight_index = resolve_highlight_index(bottom_items, fallback_target)
 
         if bottom_items is not None:
             bottom_items = [TOOL_DISPLAY_NAMES.get(name, name) for name in bottom_items]
         return display_tool_name, bottom_items, highlight_index
+
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        metadata = super().resolve_stream_tool_metadata(tool_name)
+        if metadata:
+            return metadata
+
+        lookup_name = tool_name.strip()
+        if not lookup_name:
+            return None
+
+        if not is_namespaced_name(lookup_name) and "/" in lookup_name:
+            server_name, base_tool_name = lookup_name.split("/", 1)
+            if server_name and base_tool_name:
+                lookup_name = create_namespaced_name(server_name, base_tool_name)
+
+        namespaced_tool = self._aggregator._namespaced_tool_map.get(lookup_name)
+        if namespaced_tool is None or not isinstance(namespaced_tool.tool.meta, Mapping):
+            return None
+
+        metadata = dict(namespaced_tool.tool.meta)
+        return self._jsonable_tool_metadata(metadata)
 
     @staticmethod
     def _is_read_text_file_tool_name(tool_name: str) -> bool:
@@ -1919,10 +2051,7 @@ class McpAgent(ABC, ToolAgent):
         """
         # Get the list of MCP servers (if not provided)
         if bottom_items is None:
-            if self._aggregator and self._aggregator.server_names:
-                server_names = list(self._aggregator.server_names)
-            else:
-                server_names = []
+            server_names = list(self.list_attached_mcp_servers())
         else:
             server_names = list(bottom_items)
 

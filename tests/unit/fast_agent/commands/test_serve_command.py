@@ -28,7 +28,7 @@ def test_run_async_agent_passes_serve_mode() -> None:
         environment_dir=None,
         shell_enabled=False,
         mode="serve",
-        transport="sse",
+        transport="http",
         host="127.0.0.1",
         port=9123,
         tool_description="Send requests to {agent}",
@@ -40,7 +40,7 @@ def test_run_async_agent_passes_serve_mode() -> None:
     )
 
     assert run_kwargs["mode"] == "serve"
-    assert run_kwargs["transport"] == "sse"
+    assert run_kwargs["transport"] == "http"
     assert run_kwargs["host"] == "127.0.0.1"
     assert run_kwargs["port"] == 9123
     assert run_kwargs["tool_description"] == "Send requests to {agent}"
@@ -168,3 +168,29 @@ def test_serve_command_builds_request_with_missing_shell_cwd_override() -> None:
     )
 
     assert request.missing_shell_cwd_policy == "error"
+
+
+def test_resolve_instance_scope_defaults_acp_to_connection() -> None:
+    ctx = typer.Context(click.Command("serve"))
+    ctx.set_parameter_source("instance_scope", click.core.ParameterSource.DEFAULT)
+
+    resolved = serve_command._resolve_instance_scope(
+        ctx,
+        transport=serve_command.ServeTransport.ACP,
+        instance_scope=serve_command.InstanceScope.SHARED,
+    )
+
+    assert resolved == serve_command.InstanceScope.CONNECTION
+
+
+def test_resolve_instance_scope_preserves_explicit_flag_for_acp() -> None:
+    ctx = typer.Context(click.Command("serve"))
+    ctx.set_parameter_source("instance_scope", click.core.ParameterSource.COMMANDLINE)
+
+    resolved = serve_command._resolve_instance_scope(
+        ctx,
+        transport=serve_command.ServeTransport.ACP,
+        instance_scope=serve_command.InstanceScope.SHARED,
+    )
+
+    assert resolved == serve_command.InstanceScope.SHARED

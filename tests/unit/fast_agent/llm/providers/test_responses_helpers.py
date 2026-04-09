@@ -1,13 +1,23 @@
 import base64
 import json
+import os
 from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
-from mcp.types import CallToolRequest, CallToolRequestParams, ImageContent, TextContent
+from mcp.types import (
+    BlobResourceContents,
+    CallToolRequest,
+    CallToolRequestParams,
+    EmbeddedResource,
+    ImageContent,
+    ResourceLink,
+    TextContent,
+    TextResourceContents,
+)
 from openai import AsyncOpenAI
 from openai.types.responses import ResponseFunctionToolCall
-from pydantic import ValidationError
+from pydantic import AnyUrl, ValidationError
 
 from fast_agent.config import (
     CodexResponsesSettings,
@@ -23,7 +33,10 @@ from fast_agent.core.exceptions import ModelConfigError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.event_progress import ProgressAction
 from fast_agent.llm.provider.openai.codex_responses import CodexResponsesLLM
-from fast_agent.llm.provider.openai.openresponses import OpenResponsesLLM
+from fast_agent.llm.provider.openai.openresponses import (
+    OpenResponsesLLM,
+    _OpenResponsesRawStream,
+)
 from fast_agent.llm.provider.openai.responses import (
     RESPONSE_INCLUDE_WEB_SEARCH_SOURCES,
     ResponsesLLM,
@@ -35,8 +48,12 @@ from fast_agent.llm.provider.openai.responses_streaming import ResponsesStreamin
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.request_params import RequestParams
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.provider_management import (
+    ProviderManagedMCPAttachment,
+    ProviderManagedMCPState,
+)
 from fast_agent.tools.apply_patch_tool import build_apply_patch_tool
-from fast_agent.types import AssistantMessagePhase
+from fast_agent.types import COMMENTARY_PHASE
 
 
 class _ContentHarness(ResponsesContentMixin):
@@ -79,6 +96,101 @@ class _StreamingHarness(ResponsesStreamingMixin):
         return self._events
 
 
+class _FakeAcloseResponse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeRawResponsesSequence:
+    def __init__(self, events: list[Any]) -> None:
+        self._events = list(events)
+        self.response = _FakeAcloseResponse()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
+
+
+class _FakeOpenResponsesApi:
+    def __init__(self, raw_stream: _FakeRawResponsesSequence) -> None:
+        self.raw_stream = raw_stream
+        self.create_calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeRawResponsesSequence:
+        self.create_calls.append(kwargs)
+        return self.raw_stream
+
+    def stream(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        raise AssertionError("OpenResponses should not use the SDK accumulator stream path")
+
+
+class _FakeOpenResponsesClient:
+    def __init__(self, responses_api: _FakeOpenResponsesApi) -> None:
+        self.responses = responses_api
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+
+
+class _OpenResponsesCompletionHarness(OpenResponsesLLM):
+    def __init__(self, client: _FakeOpenResponsesClient) -> None:
+        settings = Settings(openresponses=OpenResponsesSettings(api_key="test-key"))
+        super().__init__(
+            context=Context(config=settings),
+            model="openai/gpt-oss-120b",
+            name="openresponses-raw-stream-test",
+        )
+        self._client = client
+        self.seen_stream: Any | None = None
+
+    def _responses_client(self) -> Any:
+        return self._client
+
+    async def _normalize_input_files(
+        self,
+        client: Any,
+        input_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        del client
+        return input_items
+
+    def _build_response_args(
+        self,
+        input_items: list[dict[str, Any]],
+        request_params: RequestParams,
+        tools: list[Any] | None,
+    ) -> dict[str, Any]:
+        del request_params, tools
+        return {
+            "input": input_items,
+            "model": "openai/gpt-oss-120b",
+        }
+
+    async def _process_stream(
+        self,
+        stream: Any,
+        model: str,
+        capture_filename: Any,
+    ) -> tuple[Any, list[str]]:
+        del model, capture_filename
+        self.seen_stream = stream
+        async for _event in stream:
+            pass
+        return await stream.get_final_response(), []
+
+
 class _OutputHarness(ResponsesOutputMixin):
     def __init__(self, provider: Provider = Provider.RESPONSES) -> None:
         self.logger = get_logger("test.responses.output")
@@ -118,8 +230,6 @@ class _LoggerSpy:
         self.warning_calls.append((message, data))
 
 
-
-
 def test_convert_tool_calls_serializes_apply_patch_as_custom_tool_call() -> None:
     harness = _ContentHarness()
     harness._tool_kind_map["call_patch"] = "custom"
@@ -132,10 +242,7 @@ def test_convert_tool_calls_serializes_apply_patch_as_custom_tool_call() -> None
                     name="apply_patch",
                     arguments={
                         "input": (
-                            "*** Begin Patch\n"
-                            "*** Add File: hello.txt\n"
-                            "+hello\n"
-                            "*** End Patch\n"
+                            "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"
                         )
                     },
                 ),
@@ -148,12 +255,7 @@ def test_convert_tool_calls_serializes_apply_patch_as_custom_tool_call() -> None
             "type": "custom_tool_call",
             "call_id": "call_patch",
             "name": "apply_patch",
-            "input": (
-                "*** Begin Patch\n"
-                "*** Add File: hello.txt\n"
-                "+hello\n"
-                "*** End Patch"
-            ),
+            "input": ("*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"),
         }
     ]
 
@@ -257,12 +359,7 @@ def test_extract_custom_tool_call_maps_apply_patch_input() -> None:
                 id="ctc_123",
                 call_id="call_patch",
                 name="apply_patch",
-                input=(
-                    "*** Begin Patch\n"
-                    "*** Add File: hello.txt\n"
-                    "+hello\n"
-                    "*** End Patch\n"
-                ),
+                input=("*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"),
             )
         ]
     )
@@ -272,12 +369,7 @@ def test_extract_custom_tool_call_maps_apply_patch_input() -> None:
     request = tool_calls["call_patch"]
     assert request.params.name == "apply_patch"
     assert request.params.arguments == {
-        "input": (
-            "*** Begin Patch\n"
-            "*** Add File: hello.txt\n"
-            "+hello\n"
-            "*** End Patch\n"
-        )
+        "input": ("*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n")
     }
 
 
@@ -432,6 +524,129 @@ def _build_responses_family_llm(
     return llm_class(context=context, model=model, name=f"{provider.value}-service-tier-test")
 
 
+def test_responses_provider_defaults_to_websocket_preferred_transport() -> None:
+    llm = _build_responses_family_llm(Provider.RESPONSES, model_name="gpt-5.4")
+
+    assert llm.configured_transport == "auto"
+
+
+def test_codexresponses_provider_defaults_to_websocket_preferred_transport() -> None:
+    llm = _build_responses_family_llm(Provider.CODEX_RESPONSES, model_name="gpt-5.3-codex")
+
+    assert llm.configured_transport == "auto"
+
+
+def test_openresponses_provider_keeps_sse_transport_default() -> None:
+    llm = _build_responses_family_llm(Provider.OPENRESPONSES, model_name="gpt-5-mini")
+
+    assert llm.configured_transport == "sse"
+
+
+@pytest.mark.asyncio
+async def test_openresponses_raw_stream_tracks_final_response() -> None:
+    final_response = SimpleNamespace(id="resp_final")
+    raw_stream = _FakeRawResponsesSequence(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ]
+    )
+    wrapped_stream = _OpenResponsesRawStream(raw_stream)
+
+    seen_event_types: list[str] = []
+    async for event in wrapped_stream:
+        seen_event_types.append(event.type)
+
+    assert seen_event_types == ["response.created", "response.completed"]
+    assert await wrapped_stream.get_final_response() is final_response
+
+
+@pytest.mark.asyncio
+async def test_openresponses_sse_completion_uses_raw_create_stream() -> None:
+    final_response = SimpleNamespace(id="resp_final")
+    raw_stream = _FakeRawResponsesSequence(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ]
+    )
+    responses_api = _FakeOpenResponsesApi(raw_stream)
+    llm = _OpenResponsesCompletionHarness(_FakeOpenResponsesClient(responses_api))
+
+    response, streamed_summary, normalized_input = await llm._responses_completion_sse(
+        input_items=[{"type": "message", "role": "user", "content": []}],
+        request_params=RequestParams(),
+        tools=None,
+        model_name="openai/gpt-oss-120b",
+    )
+
+    assert response is final_response
+    assert streamed_summary == []
+    assert normalized_input == [{"type": "message", "role": "user", "content": []}]
+    assert llm.seen_stream is not None
+    assert responses_api.stream_calls == []
+    assert len(responses_api.create_calls) == 1
+    assert responses_api.create_calls[0]["stream"] is True
+
+
+def test_openresponses_client_allows_missing_api_key() -> None:
+    original = os.getenv("OPENRESPONSES_API_KEY")
+    try:
+        if "OPENRESPONSES_API_KEY" in os.environ:
+            del os.environ["OPENRESPONSES_API_KEY"]
+
+        llm = OpenResponsesLLM(context=Context(config=Settings()), model="openai/gpt-oss-120b")
+
+        assert llm._api_key() == ""
+        assert isinstance(llm._responses_client(), AsyncOpenAI)
+    finally:
+        if original is None:
+            if "OPENRESPONSES_API_KEY" in os.environ:
+                del os.environ["OPENRESPONSES_API_KEY"]
+        else:
+            os.environ["OPENRESPONSES_API_KEY"] = original
+
+
+def test_openresponses_client_preserves_explicit_empty_api_key() -> None:
+    llm = OpenResponsesLLM(
+        context=Context(config=Settings()),
+        model="openai/gpt-oss-120b",
+        api_key="",
+    )
+
+    assert llm._api_key() == ""
+    assert isinstance(llm._responses_client(), AsyncOpenAI)
+
+
+def test_openresponses_sampling_overrides_route_non_responses_fields_to_extra_body() -> None:
+    llm = OpenResponsesLLM(
+        context=Context(config=Settings()),
+        model="openai/gpt-oss-120b",
+    )
+
+    args = llm._build_response_args(
+        [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        RequestParams(top_k=40, min_p=0.05),
+        None,
+    )
+
+    assert "top_k" not in args
+    assert "min_p" not in args
+    extra_body = args.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["top_k"] == 40
+    assert extra_body["min_p"] == 0.05
+
+
+def test_explicit_responses_transport_override_is_preserved() -> None:
+    settings = Settings(responses=OpenAISettings(api_key="test-key", transport="sse"))
+    context = Context(config=settings)
+
+    llm = ResponsesLLM(context=context, model="gpt-5.4", name="responses-explicit-sse")
+
+    assert llm.configured_transport == "sse"
+
+
 def test_openai_web_search_domain_allowlist_limit() -> None:
     domains = [f"domain-{index}.example.com" for index in range(101)]
     with pytest.raises(ValidationError):
@@ -453,6 +668,73 @@ def test_convert_content_parts_text_and_image():
     assert parts[0] == {"type": "input_text", "text": "Hello"}
     assert parts[1]["type"] == "input_image"
     assert parts[1]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_convert_content_parts_embedded_text_resource_inlines_as_input_text():
+    harness = _ContentHarness()
+    resource = EmbeddedResource(
+        type="resource",
+        resource=TextResourceContents(
+            uri=AnyUrl("file:///tmp/example.py"),
+            mimeType="text/x-python",
+            text="print('hello')",
+        ),
+    )
+
+    parts = harness._convert_content_parts([resource], role="user")
+
+    assert parts == [
+        {
+            "type": "input_text",
+            "text": (
+                '<fastagent:file title="example.py" mimetype="text/x-python">\n'
+                "print('hello')\n"
+                "</fastagent:file>"
+            ),
+        }
+    ]
+
+
+def test_convert_content_parts_office_resource_stays_as_input_file():
+    harness = _ContentHarness()
+    docx_data = base64.b64encode(b"PK\x03\x04docx-bytes").decode("ascii")
+    resource = EmbeddedResource(
+        type="resource",
+        resource=BlobResourceContents(
+            uri=AnyUrl("file:///tmp/example.docx"),
+            mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            blob=docx_data,
+        ),
+    )
+
+    parts = harness._convert_content_parts([resource], role="user")
+
+    assert parts == [
+        {
+            "type": "input_file",
+            "file_data": docx_data,
+            "filename": "example.docx",
+        }
+    ]
+
+
+def test_convert_content_parts_image_resource_link_uses_remote_input_image():
+    harness = _ContentHarness()
+    resource = ResourceLink(
+        type="resource_link",
+        uri=AnyUrl("https://example.com/image.png"),
+        mimeType="image/png",
+        name="image.png",
+    )
+
+    parts = harness._convert_content_parts([resource], role="user")
+
+    assert parts == [
+        {
+            "type": "input_image",
+            "image_url": "https://example.com/image.png",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -518,8 +800,6 @@ def test_tool_fallback_notifications():
     assert events[0][1]["tool_name"] == "weather"
 
 
-
-
 def test_tool_fallback_notifications_for_custom_tool_call() -> None:
     harness = _StreamingHarness()
     tool_call = SimpleNamespace(
@@ -534,6 +814,7 @@ def test_tool_fallback_notifications_for_custom_tool_call() -> None:
     assert [event for event, _payload in events] == ["start", "stop"]
     assert events[0][1]["tool_use_id"] == "call_patch"
     assert events[0][1]["tool_name"] == "apply_patch"
+
 
 def test_dedupes_duplicate_reasoning_ids():
     harness = _ContentHarness()
@@ -561,16 +842,14 @@ def test_extract_raw_assistant_message_items_preserves_phase_metadata() -> None:
                 role="assistant",
                 status="completed",
                 phase="commentary",
-                content=[
-                    SimpleNamespace(type="output_text", text="Let me inspect that first.")
-                ],
+                content=[SimpleNamespace(type="output_text", text="Let me inspect that first.")],
             )
         ]
     )
 
     raw_items, message_phase = harness._extract_raw_assistant_message_items(response)
 
-    assert message_phase == AssistantMessagePhase.COMMENTARY
+    assert message_phase == COMMENTARY_PHASE
     assert len(raw_items) == 1
     assert isinstance(raw_items[0], TextContent)
     payload = json.loads(raw_items[0].text)
@@ -584,7 +863,7 @@ def test_convert_extended_messages_to_provider_includes_assistant_phase() -> Non
     message = PromptMessageExtended(
         role="assistant",
         content=[TextContent(type="text", text="Working through the plan")],
-        phase=AssistantMessagePhase.COMMENTARY,
+        phase=COMMENTARY_PHASE,
     )
 
     items = harness._convert_extended_messages_to_provider([message])
@@ -613,9 +892,7 @@ def test_convert_extended_messages_to_provider_uses_raw_assistant_items_channel(
         role="assistant",
         content=[TextContent(type="text", text="Final answer")],
         channels={
-            OPENAI_ASSISTANT_MESSAGE_ITEMS: [
-                TextContent(type="text", text=json.dumps(raw_item))
-            ]
+            OPENAI_ASSISTANT_MESSAGE_ITEMS: [TextContent(type="text", text=json.dumps(raw_item))]
         },
     )
 
@@ -834,6 +1111,51 @@ def test_build_response_args_includes_openai_web_search_tool() -> None:
     assert RESPONSE_INCLUDE_WEB_SEARCH_SOURCES in include_payload
 
 
+def test_build_response_args_includes_provider_managed_mcp_tools() -> None:
+    llm = _build_responses_family_llm(Provider.RESPONSES, model_name="gpt-5.4")
+    llm.set_provider_managed_mcp_state(
+        ProviderManagedMCPState(
+            attachments=(
+                ProviderManagedMCPAttachment(
+                    server_name="stripe",
+                    server_description="Stripe official MCP",
+                    server_url="https://mcp.stripe.com",
+                    access_token="token-123",
+                    defer_loading=True,
+                ),
+            ),
+            tool_allowlists={"stripe": ("create_payment_link",)},
+        )
+    )
+
+    args = llm._build_response_args(
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "create a payment link"}],
+            }
+        ],
+        request_params=RequestParams(model="gpt-5.4"),
+        tools=None,
+    )
+
+    tools_payload = args.get("tools")
+    assert isinstance(tools_payload, list)
+    assert tools_payload == [
+        {
+            "type": "mcp",
+            "server_label": "stripe",
+            "server_description": "Stripe official MCP",
+            "server_url": "https://mcp.stripe.com",
+            "require_approval": "never",
+            "authorization": "token-123",
+            "allowed_tools": ["create_payment_link"],
+            "defer_loading": True,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("service_tier", "wire_value"),
     [("fast", "priority"), ("flex", "flex")],
@@ -886,7 +1208,6 @@ def test_codexresponses_settings_reject_flex_service_tier() -> None:
     ("provider", "expected_tiers"),
     [
         (Provider.RESPONSES, ("fast", "flex")),
-        (Provider.OPENRESPONSES, ("fast", "flex")),
         (Provider.CODEX_RESPONSES, ("fast",)),
     ],
 )
@@ -898,6 +1219,17 @@ def test_responses_family_llms_report_service_tier_support(
 
     assert llm.service_tier_supported is True
     assert llm.available_service_tiers == expected_tiers
+    assert llm.service_tier is None
+
+
+def test_openresponses_llm_hides_interactive_provider_controls() -> None:
+    llm = _build_responses_family_llm(
+        Provider.OPENRESPONSES,
+        model_name="unsloth/Qwen3.5-9B-GGUF",
+    )
+
+    assert llm.service_tier_supported is False
+    assert llm.web_search_supported is False
     assert llm.service_tier is None
 
 
@@ -1008,6 +1340,7 @@ def test_codexresponses_request_service_tier_rejects_flex() -> None:
             tools=None,
         )
 
+
 def test_responses_chatgpt_request_service_tier_rejects_flex() -> None:
     llm = _build_responses_family_llm(
         Provider.RESPONSES,
@@ -1057,6 +1390,131 @@ def test_web_search_override_disables_configured_web_search_tool() -> None:
 def test_responses_web_search_enabled_property_tracks_config() -> None:
     llm = _build_responses_llm_with_web_search(OpenAIWebSearchSettings(enabled=True))
     assert llm.web_search_enabled is True
+
+
+def test_openresponses_web_search_does_not_inherit_openai_settings() -> None:
+    settings = Settings(
+        openai=OpenAISettings(
+            api_key="test-key",
+            web_search=OpenAIWebSearchSettings(enabled=True),
+        )
+    )
+    llm = OpenResponsesLLM(
+        context=Context(config=settings),
+        model="unsloth/Qwen3.5-9B-GGUF",
+        name="openresponses-web-search-test",
+    )
+
+    assert llm.web_search_enabled is False
+
+    args = llm._build_response_args(
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "latest news"}],
+            }
+        ],
+        request_params=RequestParams(model="unsloth/Qwen3.5-9B-GGUF"),
+        tools=None,
+    )
+
+    assert "tools" not in args
+
+
+def test_openresponses_web_search_uses_own_provider_settings() -> None:
+    settings = Settings(
+        openresponses=OpenResponsesSettings(
+            api_key="test-key",
+            web_search=OpenAIWebSearchSettings(enabled=True),
+        )
+    )
+    llm = OpenResponsesLLM(
+        context=Context(config=settings),
+        model="unsloth/Qwen3.5-9B-GGUF",
+        name="openresponses-web-search-test",
+    )
+
+    assert llm.web_search_enabled is True
+
+    args = llm._build_response_args(
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "latest news"}],
+            }
+        ],
+        request_params=RequestParams(model="unsloth/Qwen3.5-9B-GGUF"),
+        tools=None,
+    )
+
+    tools_payload = args.get("tools")
+    assert isinstance(tools_payload, list)
+    assert len(tools_payload) == 1
+    assert tools_payload[0]["type"] == "web_search"
+
+
+def test_openresponses_rejects_provider_managed_mcp_tools() -> None:
+    llm = _build_responses_family_llm(
+        Provider.OPENRESPONSES,
+        model_name="openai/gpt-oss-120b",
+    )
+    llm.set_provider_managed_mcp_state(
+        ProviderManagedMCPState(
+            attachments=(
+                ProviderManagedMCPAttachment(
+                    server_name="stripe",
+                    server_description="Stripe official MCP",
+                    server_url="https://mcp.stripe.com",
+                ),
+            )
+        )
+    )
+
+    with pytest.raises(ModelConfigError, match="Provider-managed MCP is not supported"):
+        llm._build_response_args(
+            input_items=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                }
+            ],
+            request_params=RequestParams(model="openai/gpt-oss-120b"),
+            tools=None,
+        )
+
+
+def test_codexresponses_rejects_provider_managed_mcp_tools() -> None:
+    llm = _build_responses_family_llm(
+        Provider.CODEX_RESPONSES,
+        model_name="gpt-5.4",
+    )
+    llm.set_provider_managed_mcp_state(
+        ProviderManagedMCPState(
+            attachments=(
+                ProviderManagedMCPAttachment(
+                    server_name="stripe",
+                    server_description="Stripe official MCP",
+                    server_url="https://mcp.stripe.com/mcp",
+                ),
+            )
+        )
+    )
+
+    with pytest.raises(ModelConfigError, match="Provider-managed MCP is not supported"):
+        llm._build_response_args(
+            input_items=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                }
+            ],
+            request_params=RequestParams(model="gpt-5.4"),
+            tools=None,
+        )
 
 
 def test_codex_web_search_defaults_disabled() -> None:
@@ -1171,6 +1629,55 @@ def test_extract_web_search_metadata_captures_tool_and_citations() -> None:
     assert "https://openai.com/blog" in citation_urls
 
 
+def test_extract_provider_mcp_metadata_captures_remote_activity() -> None:
+    harness = _OutputHarness()
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="mcp_list_tools",
+                id="mcp_list_123",
+                server_label="stripe",
+                status="completed",
+            ),
+            SimpleNamespace(
+                type="mcp_call",
+                id="mcp_call_123",
+                server_label="stripe",
+                name="create_payment_link",
+                status="completed",
+                arguments='{"amount": 42, "currency": "usd"}',
+            ),
+        ]
+    )
+
+    payloads = harness._extract_provider_mcp_metadata(response)
+
+    assert len(payloads) == 2
+    assert isinstance(payloads[0], TextContent)
+    list_payload = json.loads(payloads[0].text)
+    assert list_payload["type"] == "mcp_tool_use"
+    assert list_payload["provider_tool_type"] == "mcp_list_tools"
+    assert list_payload["server_name"] == "stripe"
+
+    assert isinstance(payloads[1], TextContent)
+    call_payload = json.loads(payloads[1].text)
+    assert call_payload["type"] == "mcp_tool_use"
+    assert call_payload["provider_tool_type"] == "mcp_call"
+    assert call_payload["name"] == "create_payment_link"
+    assert call_payload["server_name"] == "stripe"
+    assert call_payload["input"] == {"amount": 42, "currency": "usd"}
+
+
+def test_extract_provider_mcp_metadata_rejects_approval_requests() -> None:
+    harness = _OutputHarness()
+    response = SimpleNamespace(
+        output=[SimpleNamespace(type="mcp_approval_request", id="approval_123")]
+    )
+
+    with pytest.raises(RuntimeError, match="approval requests are not supported"):
+        harness._extract_provider_mcp_metadata(response)
+
+
 def test_tool_fallback_notifications_support_web_search_call() -> None:
     harness = _StreamingHarness()
     web_search_call = SimpleNamespace(
@@ -1224,10 +1731,49 @@ async def test_stream_process_emits_web_search_status_events() -> None:
     assert event_types.count("stop") >= 1
 
     first_start_payload = next(
-        payload
-        for event_type, payload in harness.events
-        if event_type == "start"
+        payload for event_type, payload in harness.events if event_type == "start"
     )
     assert first_start_payload["tool_name"] == "web_search"
     assert first_start_payload["tool_display_name"] == "Searching the web"
     assert first_start_payload["chunk"] == "starting search..."
+
+
+@pytest.mark.asyncio
+async def test_stream_process_emits_mcp_status_events_with_mcp_copy() -> None:
+    harness = _StreamingHarness()
+    final_response = SimpleNamespace(
+        output=[SimpleNamespace(type="mcp_list_tools", id="mcp_123")],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item=SimpleNamespace(type="mcp_list_tools", id="mcp_123"),
+                item_id="mcp_123",
+            ),
+            SimpleNamespace(
+                type="response.mcp_list_tools.in_progress",
+                output_index=0,
+                item_id="mcp_123",
+            ),
+            SimpleNamespace(
+                type="response.mcp_list_tools.completed",
+                output_index=0,
+                item_id="mcp_123",
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    status_payloads = [
+        payload for event_type, payload in harness.events if event_type == "status"
+    ]
+    assert status_payloads
+    assert status_payloads[0]["tool_display_name"] == "Loading MCP tools"
+    assert status_payloads[0]["chunk"] == "loading remote tool definitions..."
+    assert status_payloads[-1]["chunk"] == "remote tool definitions loaded"

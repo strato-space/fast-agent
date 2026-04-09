@@ -47,8 +47,36 @@ class DummyAgent:
         return DummyResult(self._text)
 
 
+class StatefulAgent:
+    """Minimal stateful agent used to verify ACP session isolation."""
+
+    def __init__(self) -> None:
+        self.name = "default"
+        self.instruction = "Test agent."
+        self.turn_count = 0
+        self.usage_accumulator = None
+
+    async def generate(self, prompt_message: Any, request_params: Any = None) -> DummyResult:
+        self.turn_count += 1
+        return DummyResult(f"turn {self.turn_count}")
+
+
 class DummyApp:
     """Placeholder for AgentInstance.app (unused by AgentACPServer.prompt path)."""
+
+
+class CapturingConnection:
+    def __init__(self) -> None:
+        self.notifications: list[dict[str, Any]] = []
+
+    async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        self.notifications.append(
+            {
+                "session_id": session_id,
+                "update": update,
+                "kwargs": kwargs,
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -170,3 +198,103 @@ async def test_cancelled_prompt_does_not_poison_next_acp_turn() -> None:
     proceed2.set()
     next_response = await asyncio.wait_for(next_task, timeout=1.0)
     assert next_response.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_prompt_message_id_is_acknowledged_in_response_without_user_echo() -> None:
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+    proceed.set()
+
+    agent = DummyAgent(started_evt=started, proceed_evt=proceed, text="first")
+    agents: dict[str, "AgentProtocol"] = {"default": cast("AgentProtocol", agent)}
+    instance = AgentInstance(app=AgentApp(agents), agents=agents, registry_version=0)
+
+    async def create_instance() -> AgentInstance:
+        return instance
+
+    async def dispose_instance(_instance: AgentInstance) -> None:
+        return None
+
+    server = AgentACPServer(
+        primary_instance=instance,
+        create_instance=create_instance,
+        dispose_instance=dispose_instance,
+        instance_scope="shared",
+        server_name="test",
+        permissions_enabled=False,
+    )
+    connection = CapturingConnection()
+    server.on_connect(cast("Any", connection))
+
+    session_id = "s-3"
+    message_id = "0f7c7a2c-7db0-4b16-a4df-b8f4a98055a8"
+    server.sessions[session_id] = instance
+    server._session_state[session_id] = ACPSessionState(session_id=session_id, instance=instance)
+
+    response = await server.prompt(
+        prompt=[TextContentBlock(type="text", text="p1")],
+        session_id=session_id,
+        message_id=message_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert response.user_message_id == message_id
+
+    assert len(connection.notifications) == 1
+    agent_update = connection.notifications[0]["update"]
+    assert agent_update.session_update == "agent_message_chunk"
+    assert agent_update.content.text == "first"
+
+
+@pytest.mark.asyncio
+async def test_connection_scope_isolates_history_per_acp_session() -> None:
+    created_agents: list[StatefulAgent] = []
+
+    async def create_instance() -> AgentInstance:
+        agent = StatefulAgent()
+        created_agents.append(agent)
+        agents: dict[str, "AgentProtocol"] = {"default": cast("AgentProtocol", agent)}
+        return AgentInstance(app=AgentApp(agents), agents=agents, registry_version=0)
+
+    async def dispose_instance(_instance: AgentInstance) -> None:
+        return None
+
+    primary_instance = await create_instance()
+    server = AgentACPServer(
+        primary_instance=primary_instance,
+        create_instance=create_instance,
+        dispose_instance=dispose_instance,
+        instance_scope="connection",
+        server_name="test",
+        permissions_enabled=False,
+    )
+    connection = CapturingConnection()
+    server.on_connect(cast("Any", connection))
+
+    session_one = await server.new_session(cwd="/tmp", mcp_servers=[])
+    session_one_id = session_one.session_id
+
+    await server.prompt(
+        prompt=[TextContentBlock(type="text", text="first")],
+        session_id=session_one_id,
+    )
+    await server.prompt(
+        prompt=[TextContentBlock(type="text", text="second")],
+        session_id=session_one_id,
+    )
+
+    session_two = await server.new_session(cwd="/tmp", mcp_servers=[])
+    session_two_id = session_two.session_id
+    await server.prompt(
+        prompt=[TextContentBlock(type="text", text="fresh")],
+        session_id=session_two_id,
+    )
+
+    agent_texts = [
+        note["update"].content.text
+        for note in connection.notifications
+        if getattr(note["update"], "session_update", None) == "agent_message_chunk"
+    ]
+    assert agent_texts == ["turn 1", "turn 2", "turn 1"]
+    assert server.sessions[session_one_id] is not server.sessions[session_two_id]

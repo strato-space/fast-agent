@@ -10,7 +10,7 @@ Goals:
 # Re-export ResourceLink from MCP for convenience
 from mcp.types import ResourceLink
 
-from fast_agent.llm.request_params import RequestParams
+from fast_agent.llm.request_params import RequestParams, ResponseMode, ToolResultMode
 
 # Content helpers commonly used by users to build messages
 from fast_agent.mcp.helpers.content_helpers import (
@@ -27,7 +27,11 @@ from fast_agent.mcp.helpers.content_helpers import (
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 
 # Stop reason enum - imported directly to avoid circular dependency
-from .assistant_message_phase import AssistantMessagePhase
+from .assistant_message_phase import (
+    COMMENTARY_PHASE,
+    FINAL_ANSWER_PHASE,
+    AssistantMessagePhase,
+)
 
 # Conversation analysis utilities
 from .conversation_summary import ConversationSummary, split_into_turns
@@ -42,10 +46,14 @@ from .tool_timing import ToolTimingInfo, ToolTimings
 __all__ = [
     # Enums / types
     "AssistantMessagePhase",
+    "COMMENTARY_PHASE",
+    "FINAL_ANSWER_PHASE",
     "LlmStopReason",
     "PromptMessageExtended",
     "RequestParams",
+    "ResponseMode",
     "ResourceLink",
+    "ToolResultMode",
     # Content helpers
     "text_content",
     "resource_link",

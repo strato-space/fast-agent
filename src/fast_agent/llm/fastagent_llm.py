@@ -5,6 +5,7 @@ import os
 import time
 import traceback
 from abc import abstractmethod
+from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
@@ -23,7 +24,6 @@ from mcp import Tool
 from mcp.types import (
     GetPromptResult,
     PromptMessage,
-    TextContent,
 )
 from openai import NotGiven
 from openai.lib._parsing import type_to_response_format_param as _type_to_response_format
@@ -32,14 +32,10 @@ from rich import print as rich_print
 
 from fast_agent.constants import (
     CONTROL_MESSAGE_SAVE_HISTORY,
-    DEFAULT_MAX_ITERATIONS,
-    FAST_AGENT_TIMING,
-    FAST_AGENT_USAGE,
 )
 from fast_agent.context_dependent import ContextDependent
 from fast_agent.core.exceptions import AgentConfigError, ProviderKeyError, ServerConfigError
 from fast_agent.core.logging.logger import get_logger
-from fast_agent.core.model_resolution import get_context_model_aliases, resolve_model_alias
 from fast_agent.core.prompt import Prompt
 from fast_agent.event_progress import ProgressAction
 from fast_agent.interfaces import (
@@ -47,12 +43,26 @@ from fast_agent.interfaces import (
     ModelT,
 )
 from fast_agent.llm.memory import Memory, SimpleMemory
-from fast_agent.llm.model_database import ModelDatabase
+from fast_agent.llm.model_database import ModelDatabase, ModelParameters
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import (
     ReasoningEffortSetting,
     ReasoningEffortSpec,
     validate_reasoning_setting,
+)
+from fast_agent.llm.request_param_resolution import (
+    get_provider_config,
+    initialize_base_default_params,
+    merge_request_params,
+    normalize_model_name,
+    resolve_config_default_model,
+    resolve_model_references,
+)
+from fast_agent.llm.response_telemetry import (
+    RequestTimingCapture,
+    add_timing_channel,
+    append_usage_channel,
+    start_request_timing_capture,
 )
 from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.text_verbosity import (
@@ -62,6 +72,7 @@ from fast_agent.llm.text_verbosity import (
 )
 from fast_agent.llm.usage_tracking import TurnUsage, UsageAccumulator
 from fast_agent.mcp.helpers.content_helpers import get_text
+from fast_agent.mcp.provider_management import ProviderManagedMCPState
 from fast_agent.types import PromptMessageExtended, RequestParams
 
 # Define type variables locally
@@ -71,33 +82,11 @@ MessageT = TypeVar("MessageT")
 # Forward reference for type annotations
 if TYPE_CHECKING:
     from fast_agent.context import Context
+    from fast_agent.llm.resolved_model import ResolvedModelSpec
 
 
 # Context variable for storing MCP metadata
 _mcp_metadata_var: ContextVar[dict[str, Any] | None] = ContextVar("mcp_metadata", default=None)
-
-
-def deep_merge(dict1: dict[Any, Any], dict2: dict[Any, Any]) -> dict[Any, Any]:
-    """
-    Recursively merges `dict2` into `dict1` in place.
-
-    If a key exists in both dictionaries and their values are dictionaries,
-    the function merges them recursively. Otherwise, the value from `dict2`
-    overwrites or is added to `dict1`.
-
-    Args:
-        dict1 (Dict): The dictionary to be updated.
-        dict2 (Dict): The dictionary to merge into `dict1`.
-
-    Returns:
-        Dict: The updated `dict1`.
-    """
-    for key in dict2:
-        if key in dict1 and isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
-            deep_merge(dict1[key], dict2[key])
-        else:
-            dict1[key] = dict2[key]
-    return dict1
 
 
 class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT, MessageT]):
@@ -115,7 +104,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
     PARAM_MCP_METADATA = "mcp_metadata"
     PARAM_TOOL_HANDLER = "tool_execution_handler"
     PARAM_LOOP_PROGRESS = "emit_loop_progress"
-    PARAM_TOOL_RESULT_PASSTHROUGH = "tool_result_passthrough"
+    PARAM_TOOL_RESULT_MODE = "tool_result_mode"
     PARAM_STREAMING_TIMEOUT = "streaming_timeout"
     PARAM_SERVICE_TIER = "service_tier"
 
@@ -124,7 +113,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         PARAM_METADATA,
         PARAM_TOOL_HANDLER,
         PARAM_LOOP_PROGRESS,
-        PARAM_TOOL_RESULT_PASSTHROUGH,
+        PARAM_TOOL_RESULT_MODE,
         PARAM_STREAMING_TIMEOUT,
         PARAM_SERVICE_TIER,
     }
@@ -158,6 +147,20 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         """
         # Extract request_params before super() call
         self._init_request_params = request_params
+        raw_resolved_model_spec = kwargs.pop("resolved_model_spec", None)
+        self._resolved_model_spec = raw_resolved_model_spec
+        self._init_base_url = kwargs.pop("base_url", None)
+        raw_default_headers = kwargs.pop("default_headers", None)
+        normalized_default_headers: dict[str, str] | None = None
+        if raw_default_headers is not None:
+            if not isinstance(raw_default_headers, Mapping):
+                raise TypeError("default_headers must be a mapping[str, str] when provided")
+            normalized_default_headers = {}
+            for key, value in raw_default_headers.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise TypeError("default_headers must contain only string keys and values")
+                normalized_default_headers[key] = value
+        self._init_default_headers = normalized_default_headers
         # Pop long_context before passing kwargs to ContextDependent;
         # subclasses (e.g. AnthropicLLM) may pop it first for their own handling.
         long_context_requested = kwargs.pop("long_context", False)
@@ -193,25 +196,44 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         # Cache effective model name for type-safe access
         self._model_name: str | None = self.default_request_params.model
+        if self._resolved_model_spec is None:
+            from fast_agent.llm.model_factory import ModelConfig
+            from fast_agent.llm.resolved_model import ResolvedModelSpec, resolve_base_model_params
+
+            fallback_model_name = self._model_name or ""
+            fallback_model_config = ModelConfig(
+                provider=provider,
+                model_name=fallback_model_name,
+            )
+            self._resolved_model_spec = ResolvedModelSpec(
+                raw_input=fallback_model_name,
+                selected_model_name=fallback_model_name,
+                source="direct",
+                model_config=fallback_model_config,
+                provider=provider,
+                wire_model_name=fallback_model_name,
+                model_params=resolve_base_model_params(
+                    provider=provider,
+                    model_name=fallback_model_name,
+                )
+                if fallback_model_name
+                else None,
+            )
 
         # Reasoning effort configuration (provider-neutral)
         self._reasoning_effort: ReasoningEffortSetting | None = None
         self._reasoning_effort_spec: ReasoningEffortSpec | None = (
-            ModelDatabase.get_reasoning_effort_spec(self._model_name or "")
-            if self._model_name
-            else None
+            self._resolved_model_spec.reasoning_effort_spec
         )
 
         # Text verbosity configuration (provider-neutral)
         self._text_verbosity: TextVerbosityLevel | None = None
         self._text_verbosity_spec: TextVerbositySpec | None = (
-            ModelDatabase.get_text_verbosity_spec(self._model_name or "")
-            if self._model_name
-            else None
+            self._resolved_model_spec.text_verbosity_spec
         )
 
-        # Context window override — set by providers that support extended context
-        # (e.g., Anthropic 1M beta). Defaults to None (use ModelDatabase value).
+        # Context window override — set by providers that support explicit
+        # extended-context opt-ins. Defaults to None (use ModelDatabase value).
         self._context_window_override: int | None = None
 
         # Warn if long_context was requested but this provider didn't handle it
@@ -225,10 +247,103 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         # Initialize usage tracking
         self._usage_accumulator = UsageAccumulator()
+        effective_context_window = self._context_window_override
+        if effective_context_window is None and self._resolved_model_matches(self._model_name):
+            effective_context_window = self._resolved_model_spec.context_window
+        if effective_context_window is not None:
+            self._usage_accumulator.set_context_window_size(effective_context_window)
         self._stream_listeners: set[Callable[[StreamChunk], None]] = set()
         self._tool_stream_listeners: set[Callable[[str, dict[str, Any] | None], None]] = set()
         self.retry_count = self._resolve_retry_count()
         self.retry_backoff_seconds: float = 10.0
+        self._provider_managed_mcp_state = ProviderManagedMCPState()
+
+    def _resolved_model_matches(self, model_name: str | None) -> bool:
+        if not model_name:
+            return False
+
+        resolved_key = ModelDatabase.normalize_model_name(self._resolved_model_spec.wire_model_name)
+        model_key = ModelDatabase.normalize_model_name(model_name)
+        return bool(resolved_key and model_key and resolved_key == model_key)
+
+    def _get_model_params(self, model_name: str | None) -> ModelParameters | None:
+        if not model_name:
+            return None
+
+        resolved_params = self._resolved_model_spec.model_params
+        if resolved_params is not None and self._resolved_model_matches(model_name):
+            return resolved_params
+
+        return ModelDatabase.get_model_params(model_name)
+
+    def _get_model_reasoning(self, model_name: str | None) -> str | None:
+        params = self._get_model_params(model_name)
+        return params.reasoning if params is not None else None
+
+    def _get_model_reasoning_effort_spec(
+        self, model_name: str | None
+    ) -> ReasoningEffortSpec | None:
+        params = self._get_model_params(model_name)
+        return params.reasoning_effort_spec if params is not None else None
+
+    def _get_model_text_verbosity_spec(self, model_name: str | None) -> TextVerbositySpec | None:
+        params = self._get_model_params(model_name)
+        return params.text_verbosity_spec if params is not None else None
+
+    def _get_model_json_mode(self, model_name: str | None) -> str | None:
+        params = self._get_model_params(model_name)
+        return params.json_mode if params is not None else None
+
+    def _get_model_context_window(self, model_name: str | None) -> int | None:
+        params = self._get_model_params(model_name)
+        return params.context_window if params is not None else None
+
+    def _get_model_long_context_window(self, model_name: str | None) -> int | None:
+        params = self._get_model_params(model_name)
+        return params.long_context_window if params is not None else None
+
+    def _get_model_stream_mode(self, model_name: str | None) -> Literal["openai", "manual"]:
+        params = self._get_model_params(model_name)
+        return params.stream_mode if params is not None else "openai"
+
+    def _get_model_cache_ttl(self, model_name: str | None) -> Literal["5m", "1h"] | None:
+        params = self._get_model_params(model_name)
+        return params.cache_ttl if params is not None else None
+
+    def _get_model_response_transports(
+        self,
+        model_name: str | None,
+    ) -> tuple[Literal["sse", "websocket"], ...] | None:
+        params = self._get_model_params(model_name)
+        return params.response_transports if params is not None else None
+
+    def _get_model_response_websocket_providers(
+        self,
+        model_name: str | None,
+    ) -> tuple[Provider, ...] | None:
+        params = self._get_model_params(model_name)
+        return params.response_websocket_providers if params is not None else None
+
+    def _get_model_response_service_tiers(
+        self,
+        model_name: str | None,
+    ) -> tuple[Literal["fast", "flex"], ...] | None:
+        params = self._get_model_params(model_name)
+        return params.response_service_tiers if params is not None else None
+
+    def _get_model_anthropic_web_search_version(self, model_name: str | None) -> str | None:
+        params = self._get_model_params(model_name)
+        return params.anthropic_web_search_version if params is not None else None
+
+    def _get_model_anthropic_web_fetch_version(self, model_name: str | None) -> str | None:
+        params = self._get_model_params(model_name)
+        return params.anthropic_web_fetch_version if params is not None else None
+
+    def _get_model_anthropic_required_betas(
+        self, model_name: str | None
+    ) -> tuple[str, ...] | None:
+        params = self._get_model_params(model_name)
+        return params.anthropic_required_betas if params is not None else None
 
     def set_reasoning_effort(self, setting: ReasoningEffortSetting | None) -> None:
         if setting is None:
@@ -314,27 +429,12 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def _get_provider_config(self) -> Any | None:
         """Return provider-specific config section when available."""
-        context_config = getattr(self.context, "config", None)
-        if context_config is None:
-            return None
-
-        checked_sections: set[str] = set()
-        for section_name in (
-            *self._provider_config_sections(),
-            *self._provider_config_fallback_sections(),
-        ):
-            if not section_name or section_name in checked_sections:
-                continue
-            checked_sections.add(section_name)
-
-            if not hasattr(context_config, section_name):
-                continue
-
-            provider_config = getattr(context_config, section_name)
-            if provider_config is not None:
-                return provider_config
-
-        return None
+        return get_provider_config(
+            context_config=getattr(self.context, "config", None),
+            provider_value=getattr(self.provider, "value", None),
+            config_section=getattr(self, "config_section", None),
+            fallback_sections=self._provider_config_fallback_sections(),
+        )
 
     def _provider_config_sections(self) -> tuple[str, ...]:
         section_name = getattr(self, "config_section", None) or getattr(self.provider, "value", None)
@@ -345,28 +445,19 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def _resolve_config_default_model(self) -> str | None:
         """Resolve optional provider-level default model from config."""
-        provider_config = self._get_provider_config()
-        if provider_config is None:
-            return None
-
-        value = getattr(provider_config, "default_model", None)
-        if not isinstance(value, str):
-            return None
-
-        normalized = value.strip()
-        return normalized or None
+        return resolve_config_default_model(
+            context_config=getattr(self.context, "config", None),
+            provider_value=getattr(self.provider, "value", None),
+            config_section=getattr(self, "config_section", None),
+            fallback_sections=self._provider_config_fallback_sections(),
+        )
 
     @staticmethod
     def _normalize_model_name(value: str | None) -> str | None:
-        if not isinstance(value, str):
-            return None
+        return normalize_model_name(value)
 
-        normalized = value.strip()
-        return normalized or None
-
-    def _resolve_model_aliases(self, value: str) -> str:
-        aliases = get_context_model_aliases(self.context)
-        return resolve_model_alias(value, aliases)
+    def _resolve_model_references(self, value: str) -> str:
+        return resolve_model_references(context=self.context, value=value)
 
     def _resolve_default_model_name(
         self,
@@ -376,17 +467,17 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         """Resolve model name using explicit value, then provider config, then fallback."""
         normalized_requested = self._normalize_model_name(requested_model)
         if normalized_requested:
-            return self._resolve_model_aliases(normalized_requested)
+            return self._resolve_model_references(normalized_requested)
 
         config_default = self._resolve_config_default_model()
         if config_default:
-            return self._resolve_model_aliases(config_default)
+            return self._resolve_model_references(config_default)
 
         normalized_fallback = self._normalize_model_name(hardcoded_default)
         if not normalized_fallback:
             return None
 
-        return self._resolve_model_aliases(normalized_fallback)
+        return self._resolve_model_references(normalized_fallback)
 
     def _initialize_default_params_with_model_fallback(
         self,
@@ -410,17 +501,10 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def _initialize_base_default_params(self, kwargs: dict[str, Any]) -> RequestParams:
         """Provider-agnostic default request params."""
-        # Get model-aware default max tokens
-        model = kwargs.get("model")
-        max_tokens = ModelDatabase.get_default_max_tokens(model) if model else 16384
-
-        return RequestParams(
-            model=model,
-            maxTokens=max_tokens,
-            systemPrompt=self.instruction,
-            parallel_tool_calls=True,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
-            use_history=True,
+        return initialize_base_default_params(
+            instruction=self.instruction,
+            kwargs=kwargs,
+            resolved_model_spec=self._resolved_model_spec,
         )
 
     async def _execute_with_retry(
@@ -582,13 +666,21 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         # The caller supplies the full conversation to send
         full_history = messages
 
-        # Track timing for this generation
-        start_time = time.perf_counter()
-        assistant_response: PromptMessageExtended = await self._execute_with_retry(
-            self._apply_prompt_provider_specific, full_history, request_params, tools
-        )
+        timing_capture, cleanup_timing_capture = self._start_request_timing_capture()
+        try:
+            assistant_response = await self._execute_with_retry(
+                self._apply_prompt_provider_specific, full_history, request_params, tools
+            )
+        finally:
+            cleanup_timing_capture()
         end_time = time.perf_counter()
-        self._add_timing_channel(assistant_response, start_time, end_time)
+        self._add_timing_channel(
+            assistant_response,
+            timing_capture.start_time,
+            end_time,
+            ttft_ms=timing_capture.ttft_ms,
+            time_to_response_ms=timing_capture.time_to_response_ms,
+        )
 
         self.usage_accumulator.count_tools(len(assistant_response.tool_calls or {}))
         self._append_usage_channel(assistant_response)
@@ -596,67 +688,41 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         return assistant_response
 
     def _append_usage_channel(self, response: PromptMessageExtended) -> None:
-        usage_payload = self._build_usage_payload()
-        if not usage_payload:
-            return
-
-        channels = dict(response.channels or {})
-        if FAST_AGENT_USAGE in channels:
-            return
-
-        channels[FAST_AGENT_USAGE] = [
-            TextContent(type="text", text=json.dumps(usage_payload))
-        ]
-        response.channels = channels
-
+        append_usage_channel(response, self.usage_accumulator)
 
     def _add_timing_channel(
         self,
         response: PromptMessageExtended,
         start_time: float,
         end_time: float,
+        *,
+        ttft_ms: float | None = None,
+        time_to_response_ms: float | None = None,
     ) -> None:
         """Add timing data to response channels if not already present.
 
         Preserves original timing when loading saved history.
         """
-        duration_ms = round((end_time - start_time) * 1000, 2)
-        channels = dict(response.channels or {})
-        if FAST_AGENT_TIMING not in channels:
-            timing_data = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration_ms": duration_ms,
-            }
-            channels[FAST_AGENT_TIMING] = [TextContent(type="text", text=json.dumps(timing_data))]
-            response.channels = channels
+        add_timing_channel(
+            response,
+            start_time,
+            end_time,
+            ttft_ms=ttft_ms,
+            time_to_response_ms=time_to_response_ms,
+        )
+
+    def _start_request_timing_capture(self) -> tuple[RequestTimingCapture, Callable[[], None]]:
+        return start_request_timing_capture(self)
 
     def _build_usage_payload(self) -> dict[str, Any] | None:
-        if not self.usage_accumulator or not self.usage_accumulator.turns:
-            return None
+        from fast_agent.llm.response_telemetry import build_usage_payload
 
-        turn_usage = self.usage_accumulator.turns[-1]
-        return {
-            "turn": turn_usage.model_dump(mode="json", exclude={"raw_usage"}),
-            "raw_usage": self._serialize_raw_usage(turn_usage.raw_usage),
-            "summary": self.usage_accumulator.get_summary(),
-        }
+        return build_usage_payload(self.usage_accumulator)
 
-    def _serialize_raw_usage(self, raw_usage: object) -> object:
-        for attr in ("model_dump", "dict"):
-            method = getattr(raw_usage, attr, None)
-            if callable(method):
-                try:
-                    return method()
-                except Exception:
-                    continue
-        raw_dict = getattr(raw_usage, "__dict__", None)
-        if isinstance(raw_dict, dict):
-            try:
-                return dict(raw_dict)
-            except Exception:
-                pass
-        return str(raw_usage)
+    def _serialize_raw_usage(self, raw_usage: object | None) -> object:
+        from fast_agent.llm.response_telemetry import serialize_raw_usage
+
+        return serialize_raw_usage(raw_usage)
 
     @abstractmethod
     async def _apply_prompt_provider_specific(
@@ -713,21 +779,29 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         full_history = messages
 
-        # Track timing for this structured generation
-        start_time = time.perf_counter()
-        result_or_response = await self._execute_with_retry(
-            self._apply_prompt_provider_specific_structured,
-            full_history,
-            model,
-            request_params,
-            on_final_error=self._handle_retry_failure,
-        )
+        timing_capture, cleanup_timing_capture = self._start_request_timing_capture()
+        try:
+            result_or_response = await self._execute_with_retry(
+                self._apply_prompt_provider_specific_structured,
+                full_history,
+                model,
+                request_params,
+                on_final_error=self._handle_retry_failure,
+            )
+        finally:
+            cleanup_timing_capture()
         if isinstance(result_or_response, PromptMessageExtended):
             result, assistant_response = self._structured_from_multipart(result_or_response, model)
         else:
             result, assistant_response = result_or_response
         end_time = time.perf_counter()
-        self._add_timing_channel(assistant_response, start_time, end_time)
+        self._add_timing_channel(
+            assistant_response,
+            timing_capture.start_time,
+            end_time,
+            ttft_ms=timing_capture.ttft_ms,
+            time_to_response_ms=timing_capture.time_to_response_ms,
+        )
 
         self.usage_accumulator.count_tools(len(assistant_response.tool_calls or {}))
         self._append_usage_channel(assistant_response)
@@ -765,7 +839,6 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         Returns:
             Schema as a string, or empty string if conversion fails
         """
-        import json
 
         try:
             schema = model.model_json_schema()
@@ -875,14 +948,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self, default_params: RequestParams, provided_params: RequestParams
     ) -> RequestParams:
         """Merge default and provided request parameters"""
-
-        merged = deep_merge(
-            default_params.model_dump(),
-            provided_params.model_dump(exclude_unset=True),
-        )
-        final_params = RequestParams(**merged)
-
-        return final_params
+        return merge_request_params(default_params, provided_params)
 
     def get_request_params(
         self,
@@ -960,6 +1026,22 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         }
         self.logger.info("Streaming progress", data=data)
 
+        return new_total
+
+    def _emit_stream_text_delta(
+        self,
+        *,
+        text: str,
+        model: str,
+        estimated_tokens: int,
+    ) -> int:
+        """Emit a plain assistant text delta to listeners and progress tracking."""
+        if not text:
+            return estimated_tokens
+
+        self._notify_stream_listeners(StreamChunk(text=text, is_reasoning=False))
+        new_total = self._update_streaming_progress(text, model, estimated_tokens)
+        self._notify_tool_stream_listeners("text", {"chunk": text})
         return new_total
 
     def add_stream_listener(self, listener: Callable[[StreamChunk], None]) -> Callable[[], None]:
@@ -1171,13 +1253,34 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self.history.clear(clear_prompts=clear_prompts)
 
     def _api_key(self):
-        if self._init_api_key:
+        if self._init_api_key is not None:
             return self._init_api_key
 
+        return self._provider_api_key()
+
+    def _provider_api_key(self):
         from fast_agent.llm.provider_key_manager import ProviderKeyManager
 
         assert self.provider
-        return ProviderKeyManager.get_api_key(self.provider.value, self.context.config)
+        return ProviderKeyManager.get_api_key(self.provider.config_name, self.context.config)
+
+    def _base_url(self) -> str | None:
+        if self._init_base_url is not None:
+            return self._init_base_url
+
+        return self._provider_base_url()
+
+    def _provider_base_url(self) -> str | None:
+        return None
+
+    def _default_headers(self) -> dict[str, str] | None:
+        if self._init_default_headers is not None:
+            return dict(self._init_default_headers)
+
+        return self._provider_default_headers()
+
+    def _provider_default_headers(self) -> dict[str, str] | None:
+        return None
 
     @property
     def usage_accumulator(self):
@@ -1208,9 +1311,20 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         return self._provider
 
     @property
+    def provider_managed_mcp_state(self) -> ProviderManagedMCPState:
+        return self._provider_managed_mcp_state
+
+    def set_provider_managed_mcp_state(self, state: ProviderManagedMCPState) -> None:
+        self._provider_managed_mcp_state = state
+
+    @property
     def model_name(self) -> str | None:
         """Return the effective model name, if set."""
-        return self._model_name
+        return self._resolved_model_spec.wire_model_name or self._model_name
+
+    @property
+    def resolved_model(self) -> "ResolvedModelSpec":
+        return self._resolved_model_spec
 
     @property
     def model_info(self):
@@ -1220,13 +1334,6 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         text/document/vision flags, context window, etc.
         Applies context_window_override when set (e.g., Anthropic 1M beta).
         """
-        from dataclasses import replace
-
-        from fast_agent.llm.model_info import ModelInfo
-
-        if not self._model_name:
-            return None
-        info = ModelInfo.from_name(self._model_name, self._provider)
-        if info and self._context_window_override is not None:
-            info = replace(info, context_window=self._context_window_override)
-        return info
+        return self._resolved_model_spec.build_model_info(
+            context_window_override=self._context_window_override
+        )

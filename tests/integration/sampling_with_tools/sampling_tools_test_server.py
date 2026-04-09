@@ -7,9 +7,11 @@ This server provides tools that test the sampling with tools functionality.
 import logging
 import sys
 
-from mcp.server.fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
 from mcp.types import (
-    CallToolResult,
+    AudioContent,
+    ImageContent,
     SamplingMessage,
     TextContent,
     Tool,
@@ -25,7 +27,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sampling_tools_test_server")
 
-mcp = FastMCP("Sampling Tools Test Server", log_level="DEBUG")
+type SamplingMessageContentBlock = (
+    TextContent | ImageContent | AudioContent | ToolUseContent | ToolResultContent
+)
+
+
+def _sampling_content(*blocks: SamplingMessageContentBlock) -> list[SamplingMessageContentBlock]:
+    """Build list-valued sampling content with the full supported block union."""
+    return list(blocks)
+
+
+mcp = FastMCP("Sampling Tools Test Server")
 
 # Simple test tool definitions
 TEST_TOOLS = [
@@ -44,7 +56,7 @@ TEST_TOOLS = [
 
 
 @mcp.tool()
-async def test_sampling_with_tools(ctx: Context, message: str) -> CallToolResult:
+async def test_sampling_with_tools(ctx: Context, message: str) -> ToolResult:
     """
     Test sampling with tools - sends a request with tools and checks the response.
 
@@ -71,13 +83,13 @@ async def test_sampling_with_tools(ctx: Context, message: str) -> CallToolResult
 
     # Return info about what we received
     info = f"stopReason={result.stopReason}, model={result.model}"
-    return CallToolResult(
+    return ToolResult(
         content=[TextContent(type="text", text=f"Sampling completed: {info}")]
     )
 
 
 @mcp.tool()
-async def test_sampling_without_tools(ctx: Context, message: str) -> CallToolResult:
+async def test_sampling_without_tools(ctx: Context, message: str) -> ToolResult:
     """
     Test sampling without tools - verifies backward compatibility.
     """
@@ -105,13 +117,13 @@ async def test_sampling_without_tools(ctx: Context, message: str) -> CallToolRes
     else:
         response_text = str(result.content)
 
-    return CallToolResult(
+    return ToolResult(
         content=[TextContent(type="text", text=f"Response: {response_text}")]
     )
 
 
 @mcp.tool()
-async def test_tool_result_handling(ctx: Context) -> CallToolResult:
+async def test_tool_result_handling(ctx: Context) -> ToolResult:
     """
     Test a multi-turn tool conversation.
 
@@ -147,14 +159,16 @@ async def test_tool_result_handling(ctx: Context) -> CallToolResult:
 
         if tool_uses:
             # Send follow-up with tool results
-            tool_results = [
-                ToolResultContent(
-                    type="tool_result",
-                    toolUseId=tu.id,
-                    content=[TextContent(type="text", text="echo: hello")],
+            tool_results = _sampling_content(
+                *(
+                    ToolResultContent(
+                        type="tool_result",
+                        toolUseId=tu.id,
+                        content=[TextContent(type="text", text="echo: hello")],
+                    )
+                    for tu in tool_uses
                 )
-                for tu in tool_uses
-            ]
+            )
 
             # Second request with tool results
             final_result = await ctx.session.create_message(
@@ -172,7 +186,7 @@ async def test_tool_result_handling(ctx: Context) -> CallToolResult:
                 tools=TEST_TOOLS,
             )
 
-            return CallToolResult(
+            return ToolResult(
                 content=[
                     TextContent(
                         type="text",
@@ -182,7 +196,7 @@ async def test_tool_result_handling(ctx: Context) -> CallToolResult:
             )
 
     # Single turn response
-    return CallToolResult(
+    return ToolResult(
         content=[
             TextContent(type="text", text=f"Single turn: stopReason={result.stopReason}")
         ]

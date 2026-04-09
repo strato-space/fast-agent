@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 from mcp.types import Completion as MCPCompletion
-from mcp.types import ResourceTemplate
-from prompt_toolkit.completion import CompleteEvent
+from mcp.types import ResourceTemplate, TextContent
+from prompt_toolkit.completion import CompleteEvent, Completion
 from prompt_toolkit.document import Document
 
 import fast_agent.config as config_module
@@ -24,10 +24,13 @@ from fast_agent.config import (
     get_settings,
     update_global_settings,
 )
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.session import get_session_manager, reset_session_manager
-from fast_agent.skills.manager import (
+from fast_agent.skills.models import (
     DEFAULT_SKILL_REGISTRIES,
     InstalledSkillSource,
+)
+from fast_agent.skills.provenance import (
     write_installed_skill_source,
 )
 from fast_agent.ui.enhanced_prompt import AgentCompleter
@@ -158,6 +161,24 @@ class _MentionFilteredAgentStub(_MentionAgentStub):
         self.aggregator = _MentionFilteredAggregatorStub()
 
 
+class _HistoryAgentStub:
+    def __init__(self, turn_count: int) -> None:
+        self.message_history = [
+            message
+            for turn_index in range(1, turn_count + 1)
+            for message in (
+                PromptMessageExtended(
+                    role="user",
+                    content=[TextContent(type="text", text=f"user turn {turn_index}")],
+                ),
+                PromptMessageExtended(
+                    role="assistant",
+                    content=[TextContent(type="text", text=f"assistant turn {turn_index}")],
+                ),
+            )
+        ]
+
+
 def test_complete_history_files_finds_json_and_md():
     """Test that _complete_history_files finds .json and .md files."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -207,6 +228,26 @@ def test_complete_history_files_includes_directories():
             assert "subdir/" in names
         finally:
             os.chdir(original_cwd)
+
+
+def test_configured_mcp_server_target_uses_provider_base_url_only_for_provider_servers() -> None:
+    completer = AgentCompleter(agents=["agent1"])
+
+    provider_target = completer._configured_mcp_server_target(
+        {
+            "management": "provider",
+            "url": "https://example.com/api/mcp",
+        }
+    )
+    client_target = completer._configured_mcp_server_target(
+        {
+            "management": "client",
+            "url": "https://example.com/api/mcp",
+        }
+    )
+
+    assert provider_target == "https://example.com/api"
+    assert client_target == "https://example.com/api/mcp"
 
 
 def test_complete_history_files_filters_by_prefix():
@@ -327,10 +368,27 @@ def test_get_completions_for_history_subcommands():
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
 
+    assert "detail" in names
     assert "show" in names
     assert "save" in names
     assert "load" in names
     assert "webclear" not in names
+
+
+def test_get_completions_for_history_detail_turns_not_limited_to_summary_window() -> None:
+    completer = AgentCompleter(
+        agents=["agent1"],
+        current_agent="agent1",
+        agent_provider=cast("AgentApp", _ProviderStub(_HistoryAgentStub(turn_count=14))),
+    )
+
+    doc = Document("/history detail ", cursor_position=len("/history detail "))
+    completions = list(completer.get_completions(doc, None))
+    names = [completion.text for completion in completions]
+
+    assert len(names) == 14
+    assert "14" in names
+    assert "1" in names
 
 
 def test_get_completions_for_history_subcommands_includes_webclear_when_enabled() -> None:
@@ -694,18 +752,21 @@ def test_get_completions_for_cards_subcommands() -> None:
     assert "registry" in names
 
 
-def test_get_completions_for_models_subcommands() -> None:
+def test_get_completions_for_model_subcommands() -> None:
     completer = AgentCompleter(agents=["agent1"])
 
-    doc = Document("/models ", cursor_position=len("/models "))
+    doc = Document("/model ", cursor_position=len("/model "))
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
 
     assert "doctor" in names
-    assert "aliases" in names
+    assert "references" in names
     assert "catalog" in names
+    assert "switch" in names
+    switch_completion = next(completion for completion in completions if completion.text == "switch")
+    assert switch_completion.display_meta_text == "Switch model (starts new session)"
 
-    doc = Document("/models aliases ", cursor_position=len("/models aliases "))
+    doc = Document("/model references ", cursor_position=len("/model references "))
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
     assert "list" in names
@@ -713,26 +774,26 @@ def test_get_completions_for_models_subcommands() -> None:
     assert "unset" in names
 
 
-def test_get_completions_for_models_catalog_provider_and_flag() -> None:
+def test_get_completions_for_model_catalog_provider_and_flag() -> None:
     completer = AgentCompleter(agents=["agent1"])
 
-    doc = Document("/models catalog a", cursor_position=len("/models catalog a"))
+    doc = Document("/model catalog a", cursor_position=len("/model catalog a"))
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
     assert "anthropic" in names
 
-    doc = Document("/models catalog anthropic --", cursor_position=len("/models catalog anthropic --"))
+    doc = Document("/model catalog anthropic --", cursor_position=len("/model catalog anthropic --"))
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
     assert "--all" in names
 
 
-def test_get_completions_for_models_aliases_flags_and_target_values() -> None:
+def test_get_completions_for_model_references_flags_and_target_values() -> None:
     completer = AgentCompleter(agents=["agent1"])
 
     doc = Document(
-        "/models aliases set $system.fast claude-haiku-4-5 --",
-        cursor_position=len("/models aliases set $system.fast claude-haiku-4-5 --"),
+        "/model references set $system.fast claude-haiku-4-5 --",
+        cursor_position=len("/model references set $system.fast claude-haiku-4-5 --"),
     )
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
@@ -740,8 +801,8 @@ def test_get_completions_for_models_aliases_flags_and_target_values() -> None:
     assert "--target" in names
 
     doc = Document(
-        "/models aliases unset $system.fast --target ",
-        cursor_position=len("/models aliases unset $system.fast --target "),
+        "/model references unset $system.fast --target ",
+        cursor_position=len("/model references unset $system.fast --target "),
     )
     completions = list(completer.get_completions(doc, None))
     names = [c.text for c in completions]
@@ -952,7 +1013,7 @@ def test_get_completions_for_mcp_connect_configured_url_server_shows_url(monkeyp
     docs_completion = next((c for c in completions if c.text == "docs"), None)
 
     assert docs_completion is not None
-    assert docs_completion.display_meta_text == "https://example.test/mcp/docs"
+    assert docs_completion.display_meta_text == "https://example.test/mcp/docs/mcp"
 
 
 def test_get_completions_for_mcp_connect_shows_target_hint_first(monkeypatch) -> None:
@@ -971,8 +1032,8 @@ def test_get_completions_for_mcp_connect_shows_target_hint_first(monkeypatch) ->
     completions = list(completer.get_completions(doc, None))
 
     assert completions
-    assert completions[0].display_text == "[url|npx|uvx]"
-    assert completions[0].display_meta_text == "enter url or npx/uvx cmd"
+    assert completions[0].display_text == "[url|npx|uvx|stdio]"
+    assert completions[0].display_meta_text == "enter url, npx/uvx, or stdio cmd"
 
 
 def test_get_completions_for_connect_alias_shows_target_hint_and_servers(monkeypatch) -> None:
@@ -991,8 +1052,8 @@ def test_get_completions_for_connect_alias_shows_target_hint_and_servers(monkeyp
     completions = list(completer.get_completions(doc, None))
 
     assert completions
-    assert completions[0].display_text == "[url|npx|uvx]"
-    assert completions[0].display_meta_text == "enter url or npx/uvx cmd"
+    assert completions[0].display_text == "[url|npx|uvx|stdio]"
+    assert completions[0].display_meta_text == "enter url, npx/uvx, or stdio cmd"
     assert any(completion.text == "docs" for completion in completions)
 
 
@@ -1046,7 +1107,7 @@ def test_get_completions_for_skills_registry(monkeypatch):
     assert "2" in names
 
 
-def test_get_completions_for_skills_registry_keeps_distinct_active_source() -> None:
+def test_get_completions_for_skills_registry_dedupes_equivalent_active_source() -> None:
     old_settings = get_settings()
     override = old_settings.model_copy(
         update={
@@ -1065,8 +1126,8 @@ def test_get_completions_for_skills_registry_keeps_distinct_active_source() -> N
         names = [completion.text for completion in completions]
         display_meta = [completion.display_meta_text for completion in completions]
 
-        assert names == ["1", "2", "3", "4"]
-        assert display_meta.count("https://github.com/huggingface/skills") == 2
+        assert names == ["1", "2", "3"]
+        assert display_meta == list(DEFAULT_SKILL_REGISTRIES)
     finally:
         update_global_settings(old_settings)
 
@@ -1180,7 +1241,7 @@ def test_get_completions_for_cards_registry() -> None:
         update_global_settings(old_settings)
 
 
-def test_get_completions_for_cards_registry_keeps_distinct_active_source() -> None:
+def test_get_completions_for_cards_registry_dedupes_equivalent_active_source() -> None:
     old_settings = get_settings()
     override = old_settings.model_copy(
         update={
@@ -1199,11 +1260,8 @@ def test_get_completions_for_cards_registry_keeps_distinct_active_source() -> No
         names = [completion.text for completion in completions]
         display_meta = [completion.display_meta_text for completion in completions]
 
-        assert names == ["1", "2"]
-        assert display_meta == [
-            "https://github.com/fast-agent-ai/card-packs",
-            "https://github.com/fast-agent-ai/card-packs",
-        ]
+        assert names == ["1"]
+        assert display_meta == ["https://github.com/fast-agent-ai/card-packs"]
     finally:
         update_global_settings(old_settings)
 
@@ -1397,8 +1455,26 @@ def test_resource_mention_server_completion_filters_connected_resource_servers()
     names = [c.text for c in completions]
 
     assert "demo:" in names
+    assert "file:" in names
+    assert "url:" in names
     assert "offline:" not in names
     assert "nores:" not in names
+
+
+def test_resource_mention_builtin_attachment_server_completion_meta() -> None:
+    completer = AgentCompleter(
+        agents=["agent1"],
+        current_agent="agent1",
+        agent_provider=cast("AgentApp", _ProviderStub(_MentionFilteredAgentStub())),
+    )
+
+    doc = Document("^", cursor_position=1)
+    completions = list(completer.get_completions(doc, None))
+    meta_by_text = {completion.text: completion.display_meta_text for completion in completions}
+
+    assert meta_by_text["file:"] == "local file attachment"
+    assert meta_by_text["url:"] == "remote URL attachment"
+    assert meta_by_text["demo:"] == "connected mcp server (resources)"
 
 
 def test_resource_mention_resource_and_template_completion() -> None:
@@ -1414,6 +1490,129 @@ def test_resource_mention_resource_and_template_completion() -> None:
 
     assert "repo://items/123" in names
     assert "repo://items/{id}{" in names
+
+
+def test_resource_mention_local_file_completion_encodes_spaces() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        (base / "two words.txt").write_text("hi", encoding="utf-8")
+
+        completer = AgentCompleter(agents=["agent1"])
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            doc = Document("^file:./two", cursor_position=len("^file:./two"))
+            completions = list(completer.get_completions(doc, None))
+        finally:
+            os.chdir(original_cwd)
+
+    assert any(completion.text == "./two%20words.txt" for completion in completions)
+
+
+def test_resource_mention_local_file_completion_uses_completer_cwd() -> None:
+    with tempfile.TemporaryDirectory() as shell_dir, tempfile.TemporaryDirectory() as process_dir:
+        shell_base = Path(shell_dir)
+        process_base = Path(process_dir)
+        (shell_base / "shell note.txt").write_text("shell", encoding="utf-8")
+        (process_base / "process note.txt").write_text("process", encoding="utf-8")
+
+        completer = AgentCompleter(agents=["agent1"], cwd=shell_base)
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(process_base)
+            doc = Document("^file:./shell", cursor_position=len("^file:./shell"))
+            completions = list(completer.get_completions(doc, None))
+        finally:
+            os.chdir(original_cwd)
+
+    names = [completion.text for completion in completions]
+    assert "./shell%20note.txt" in names
+    assert "./process%20note.txt" not in names
+
+
+def test_resource_mention_url_completion_offers_http_schemes() -> None:
+    completer = AgentCompleter(agents=["agent1"])
+
+    doc = Document("^url:h", cursor_position=len("^url:h"))
+    completions = list(completer.get_completions(doc, None))
+
+    names = [completion.text for completion in completions]
+    assert "https://" in names
+    assert "http://" in names
+
+
+def test_attach_command_completion_offers_clear_and_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        (base / "report.pdf").write_bytes(b"%PDF-1.4")
+        (base / "two words.pdf").write_bytes(b"%PDF-1.4")
+
+        completer = AgentCompleter(agents=["agent1"])
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            doc = Document("/attach t", cursor_position=len("/attach t"))
+            completions = list(completer.get_completions(doc, None))
+        finally:
+            os.chdir(original_cwd)
+
+    names = [completion.text for completion in completions]
+    assert "'two words.pdf'" in names
+
+
+def test_attach_command_completion_uses_completer_cwd() -> None:
+    with tempfile.TemporaryDirectory() as shell_dir, tempfile.TemporaryDirectory() as process_dir:
+        shell_base = Path(shell_dir)
+        process_base = Path(process_dir)
+        (shell_base / "two words.pdf").write_bytes(b"%PDF-1.4")
+        (process_base / "temp.pdf").write_bytes(b"%PDF-1.4")
+
+        completer = AgentCompleter(agents=["agent1"], cwd=shell_base)
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(process_base)
+            doc = Document("/attach t", cursor_position=len("/attach t"))
+            completions = list(completer.get_completions(doc, None))
+        finally:
+            os.chdir(original_cwd)
+
+    names = [completion.text for completion in completions]
+    assert "'two words.pdf'" in names
+    assert "temp.pdf" not in names
+
+
+def test_attach_command_completion_offers_https_hint() -> None:
+    completer = AgentCompleter(agents=["agent1"])
+
+    doc = Document("/attach h", cursor_position=len("/attach h"))
+    completions = list(completer.get_completions(doc, None))
+
+    names = [completion.text for completion in completions]
+    assert "https://" in names
+
+
+def test_attach_command_completion_quotes_windows_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("fast_agent.utils.commandline.os.name", "nt")
+
+    completer = AgentCompleter(agents=["agent1"])
+    completion = Completion(
+        r"C:\Program Files\Tool\tool.exe",
+        start_position=0,
+        display=r"C:\Program Files\Tool\tool.exe",
+        display_meta="path",
+    )
+
+    def _complete_shell_paths(partial: str, delete_len: int, max_results: int = 100) -> list[Completion]:
+        del partial, delete_len, max_results
+        return [completion]
+
+    monkeypatch.setattr(completer, "_complete_shell_paths", _complete_shell_paths)
+
+    doc = Document("/attach C:\\Pro", cursor_position=len("/attach C:\\Pro"))
+    completions = list(completer.get_completions(doc, None))
+
+    names = [item.text for item in completions]
+    assert '"C:\\Program Files\\Tool\\tool.exe"' in names
 
 
 def test_resource_mention_argument_value_completion() -> None:

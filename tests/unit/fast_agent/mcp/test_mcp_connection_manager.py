@@ -2,17 +2,20 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 import pytest
 
 from fast_agent.config import MCPServerSettings
+from fast_agent.core.exceptions import ServerInitializationError
 from fast_agent.mcp.mcp_connection_manager import (
     MCPConnectionManager,
     ServerConnection,
     _format_oauth_registration_404_details,
     _is_oauth_registration_404_message,
     _is_oauth_timeout_message,
+    _managed_http_transport_context,
     _prepare_headers_and_auth,
     _server_lifecycle_task,
     _wait_for_initialized_with_startup_budget,
@@ -92,6 +95,50 @@ def test_prepare_headers_invokes_oauth_when_no_auth_headers(monkeypatch):
     assert auth is sentinel
     assert user_keys == set()
     assert calls == [config]
+
+
+@pytest.mark.asyncio
+async def test_managed_http_transport_context_closes_client_after_transport() -> None:
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            self.exited = True
+            return False
+
+    class _FakeTransportContext:
+        def __init__(self) -> None:
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return object(), object(), None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            self.exited = True
+            return None
+
+    client = cast("Any", _FakeClient())
+    transport_context = _FakeTransportContext()
+
+    async with _managed_http_transport_context(client, transport_context) as streams:
+        assert streams[2] is None
+        assert transport_context.entered is True
+        assert transport_context.exited is False
+        assert client.entered is True
+        assert client.exited is False
+
+    assert transport_context.exited is True
+    assert client.exited is True
 
 
 @pytest.mark.asyncio
@@ -224,6 +271,14 @@ class _DummyRegistry:
         return MCPServerSettings(name="demo", url="http://example.com/mcp")
 
 
+class _DummyStdioRegistry:
+    def __init__(self, config: MCPServerSettings) -> None:
+        self._config = config
+
+    def get_server_config(self, _server_name: str):
+        return self._config
+
+
 @pytest.mark.asyncio
 async def test_get_server_cancellation_cleans_up_pending_connection() -> None:
     manager = MCPConnectionManager(server_registry=cast("Any", _DummyRegistry()))
@@ -254,6 +309,199 @@ async def test_get_server_cancellation_cleans_up_pending_connection() -> None:
     assert server_conn._oauth_abort_event.is_set()
 
 
+@pytest.mark.asyncio
+async def test_get_server_formats_stdio_missing_executable_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def _failing_stdio_client(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory")
+        yield
+
+    monkeypatch.setattr(
+        "fast_agent.mcp.mcp_connection_manager.tracking_stdio_client",
+        _failing_stdio_client,
+    )
+
+    manager = MCPConnectionManager(
+        server_registry=cast(
+            "Any",
+            _DummyStdioRegistry(
+                MCPServerSettings(
+                    name="demo",
+                    transport="stdio",
+                    command="missing-mcp-server",
+                    args=["serve"],
+                )
+            ),
+        )
+    )
+
+    async with manager:
+        with pytest.raises(ServerInitializationError) as exc_info:
+            await manager.get_server(
+                "demo",
+                client_session_factory=lambda *_args, **_kwargs: object(),
+                startup_timeout_seconds=1.0,
+            )
+
+    assert exc_info.value.message == "MCP Server: 'demo': Failed to start stdio server."
+    details = exc_info.value.details
+    assert "Failed to start stdio MCP server command: missing-mcp-server serve." in details
+    assert "Executable not found on PATH: missing-mcp-server" in details
+    assert "Traceback" not in details
+
+
+@pytest.mark.asyncio
+async def test_get_server_formats_stdio_missing_cwd_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    @asynccontextmanager
+    async def _failing_stdio_client(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory")
+        yield
+
+    missing_cwd = str(tmp_path / "missing-dir")
+
+    monkeypatch.setattr(
+        "fast_agent.mcp.mcp_connection_manager.tracking_stdio_client",
+        _failing_stdio_client,
+    )
+
+    manager = MCPConnectionManager(
+        server_registry=cast(
+            "Any",
+            _DummyStdioRegistry(
+                MCPServerSettings(
+                    name="demo",
+                    transport="stdio",
+                    command="python",
+                    args=["-m", "demo_server"],
+                    cwd=missing_cwd,
+                )
+            ),
+        )
+    )
+
+    async with manager:
+        with pytest.raises(ServerInitializationError) as exc_info:
+            await manager.get_server(
+                "demo",
+                client_session_factory=lambda *_args, **_kwargs: object(),
+                startup_timeout_seconds=1.0,
+            )
+
+    assert exc_info.value.message == "MCP Server: 'demo': Failed to start stdio server."
+    details = exc_info.value.details
+    assert "Working directory not found" in details
+    assert missing_cwd in details
+    assert "Traceback" not in details
+
+
+@pytest.mark.asyncio
+async def test_get_server_stdio_timeout_includes_recent_stderr() -> None:
+    config = MCPServerSettings(
+        name="demo",
+        transport="stdio",
+        command="npx",
+        args=["-y", "@wonderwhy-er/desktop-commander@latest"],
+    )
+    manager = MCPConnectionManager(server_registry=cast("Any", _DummyStdioRegistry(config)))
+    server_conn = ServerConnection(
+        server_name="demo",
+        server_config=config,
+        transport_context_factory=lambda: cast("Any", object()),
+        client_session_factory=lambda *_args, **_kwargs: object(),
+    )
+    server_conn.record_stdio_stderr("npm notice downloading desktop-commander")
+    server_conn.record_stdio_stderr("npm warn request took longer than expected")
+
+    async def _fake_launch_server(*_args, **_kwargs):
+        manager.running_servers["demo"] = server_conn
+        return server_conn
+
+    manager.launch_server = _fake_launch_server  # type: ignore[method-assign]
+
+    with pytest.raises(ServerInitializationError) as exc_info:
+        await manager.get_server(
+            "demo",
+            client_session_factory=lambda *_args, **_kwargs: object(),
+            startup_timeout_seconds=0.01,
+        )
+
+    details = exc_info.value.details
+    assert "Try increasing --timeout or verify server/network startup." in details
+    assert "Recent stderr from stdio server:" in details
+    assert "npm notice downloading desktop-commander" in details
+    assert "npm warn request took longer than expected" in details
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_exit_skips_grace_sleep_without_running_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTaskGroup:
+        def __init__(self) -> None:
+            self.exited = False
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+            self.exited = True
+
+    manager = MCPConnectionManager(server_registry=cast("Any", _DummyRegistry()))
+    fake_task_group = _FakeTaskGroup()
+    manager._task_group_active = True
+    manager._task_group = fake_task_group
+    manager._tg = fake_task_group
+
+    async def _fake_disconnect_all() -> bool:
+        return False
+
+    async def _unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("shutdown grace sleep should be skipped")
+
+    manager.disconnect_all = _fake_disconnect_all  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _unexpected_sleep)
+
+    await manager.__aexit__(None, None, None)
+
+    assert fake_task_group.exited is True
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_exit_waits_briefly_after_requesting_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTaskGroup:
+        def __init__(self) -> None:
+            self.exited = False
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+            self.exited = True
+
+    manager = MCPConnectionManager(server_registry=cast("Any", _DummyRegistry()))
+    fake_task_group = _FakeTaskGroup()
+    manager._task_group_active = True
+    manager._task_group = fake_task_group
+    manager._tg = fake_task_group
+    sleep_calls: list[float] = []
+
+    async def _fake_disconnect_all() -> bool:
+        return True
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    manager.disconnect_all = _fake_disconnect_all  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    await manager.__aexit__(None, None, None)
+
+    assert sleep_calls == [0.5]
+    assert fake_task_group.exited is True
+
+
 def test_is_oauth_timeout_message_requires_real_timeout_markers() -> None:
     assert _is_oauth_timeout_message("OAuth authorization timed out") is True
     assert _is_oauth_timeout_message("OAuth authorization was not completed in time.") is True
@@ -263,6 +511,15 @@ def test_is_oauth_timeout_message_requires_real_timeout_markers() -> None:
     assert (
         _is_oauth_timeout_message(
             "RuntimeError: OAuth local callback server unavailable and paste fallback is disabled"
+        )
+        is False
+    )
+
+    # Guard against traceback text that mentions oauth variable names and timeout kwargs
+    # without any real OAuth timeout happening.
+    assert (
+        _is_oauth_timeout_message(
+            "ImportError: Using SOCKS proxy, but the 'socksio' package is not installed. auth=oauth_auth timeout=10"
         )
         is False
     )
@@ -302,6 +559,7 @@ def test_oauth_traceback_filter_suppresses_non_debug_oauth_flow_errors() -> None
         added_filters = oauth_logger.filters[initial_filter_count:]
         assert added_filters
         oauth_filter = added_filters[-1]
+        assert isinstance(oauth_filter, logging.Filter)
 
         record = logging.LogRecord(
             name="mcp.client.auth.oauth2",

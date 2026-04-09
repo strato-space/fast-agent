@@ -27,6 +27,7 @@ FAST_AGENT_ALERT_CHANNEL = "fast-agent-alert"
 FAST_AGENT_REMOVED_METADATA_CHANNEL = "fast-agent-removed-meta"
 FAST_AGENT_URL_ELICITATION_CHANNEL = "fast-agent-url-elicitation"
 FAST_AGENT_TIMING = "fast-agent-timing"
+FAST_AGENT_TOOL_METADATA = "fast-agent-tool-metadata"
 FAST_AGENT_TOOL_TIMING = "fast-agent-tool-timing"
 FAST_AGENT_USAGE = "fast-agent-usage"
 FAST_AGENT_SYNTHETIC_FINAL_CHANNEL = "fast-agent-synthetic-final"
@@ -45,7 +46,7 @@ DEFAULT_MAX_ITERATIONS = 99
 """Maximum number of User/Assistant turns to take"""
 
 DEFAULT_STREAMING_TIMEOUT = 300.0
-"""Default streaming timeout in seconds for provider streaming responses."""
+"""Default idle timeout in seconds between provider streaming events."""
 
 DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT = 8192
 """Baseline byte limit for ACP terminal output when no model info exists."""

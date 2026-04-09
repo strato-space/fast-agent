@@ -49,8 +49,18 @@ class _App:
     def _agent(self, _name: str):
         return _Agent()
 
-    def agent_names(self):
+    def visible_agent_names(self, *, force_include: str | None = None):
+        del force_include
         return ["main"]
+
+    def registered_agent_names(self):
+        return ["main"]
+
+    def registered_agents(self):
+        return {"main": _Agent()}
+
+    def resolve_target_agent_name(self, agent_name: str | None = None):
+        return agent_name or "main"
 
     async def list_prompts(self, namespace: str | None, agent_name: str | None = None):
         del namespace, agent_name
@@ -58,7 +68,7 @@ class _App:
 
 
 @pytest.mark.asyncio
-async def test_slash_command_models_catalog() -> None:
+async def test_slash_command_model_catalog() -> None:
     app = _App()
     instance = AgentInstance(
         app=cast("AgentApp", app),
@@ -71,14 +81,14 @@ async def test_slash_command_models_catalog() -> None:
         primary_agent_name="main",
     )
 
-    output = await handler.execute_command("models", "catalog anthropic")
+    output = await handler.execute_command("model", "catalog anthropic")
 
-    assert "# models catalog" in output
+    assert "# model.catalog" in output
     assert "Provider: Anthropic" in output
 
 
 @pytest.mark.asyncio
-async def test_slash_command_models_registered_in_available_commands(tmp_path: Path) -> None:
+async def test_slash_command_models_not_registered_in_available_commands(tmp_path: Path) -> None:
     app = _App()
     instance = AgentInstance(
         app=cast("AgentApp", app),
@@ -99,8 +109,54 @@ async def test_slash_command_models_registered_in_available_commands(tmp_path: P
     finally:
         os.chdir(previous_cwd)
 
-    assert "models" in command_names
+    assert "models" not in command_names
     assert "commands" in command_names
+    assert "model" in command_names
+
+
+@pytest.mark.asyncio
+async def test_slash_command_models_is_unknown_in_acp_interface() -> None:
+    app = _App()
+    instance = AgentInstance(
+        app=cast("AgentApp", app),
+        agents={"main": cast("AgentProtocol", _Agent())},
+        registry_version=0,
+    )
+    handler = SlashCommandHandler(
+        session_id="s1",
+        instance=instance,
+        primary_agent_name="main",
+    )
+
+    output = await handler.execute_command("models", "doctor")
+
+    assert "Unknown command: /models" in output
+
+
+@pytest.mark.asyncio
+async def test_slash_command_model_doctor_renders_markdown_table(tmp_path: Path) -> None:
+    app = _App()
+    instance = AgentInstance(
+        app=cast("AgentApp", app),
+        agents={"main": cast("AgentProtocol", _Agent())},
+        registry_version=0,
+    )
+    handler = SlashCommandHandler(
+        session_id="s1",
+        instance=instance,
+        primary_agent_name="main",
+    )
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        output = await handler.execute_command("model", "doctor")
+    finally:
+        os.chdir(previous_cwd)
+
+    assert "# model.doctor" in output
+    assert "| Agent | Specified | Resolved | Status |" in output
+    assert "## Agent model resolution" in output
 
 
 @pytest.mark.asyncio
@@ -204,7 +260,7 @@ async def test_slash_command_hints_use_catalog_actions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_slash_command_models_aliases_set_dry_run(tmp_path: Path) -> None:
+async def test_slash_command_model_references_set_dry_run(tmp_path: Path) -> None:
     app = _App()
     instance = AgentInstance(
         app=cast("AgentApp", app),
@@ -221,12 +277,12 @@ async def test_slash_command_models_aliases_set_dry_run(tmp_path: Path) -> None:
     try:
         os.chdir(tmp_path)
         output = await handler.execute_command(
-            "models",
-            "aliases set $system.fast claude-haiku-4-5 --dry-run",
+            "model",
+            "references set $system.fast claude-haiku-4-5 --dry-run",
         )
     finally:
         os.chdir(previous_cwd)
 
-    assert "# models aliases" in output
+    assert "# model.references" in output
     assert "Mode: dry-run" in output
-    assert "model_aliases.system.fast" in output
+    assert "model_references.system.fast" in output

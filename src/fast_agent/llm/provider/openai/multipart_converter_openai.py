@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterable, Mapping
 from typing import Any, Union
 
 from mcp.types import (
@@ -15,6 +16,9 @@ from openai.types.chat import (
     ChatCompletionToolMessageParam,
     ChatCompletionUserMessageParam,
 )
+from openai.types.chat.chat_completion_assistant_message_param import ContentArrayOfContentPart
+from openai.types.chat.chat_completion_tool_message_param import ChatCompletionContentPartTextParam
+from openai.types.chat.chat_completion_user_message_param import ChatCompletionContentPartParam
 
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.mcp.helpers.content_helpers import (
@@ -29,6 +33,7 @@ from fast_agent.mcp.helpers.content_helpers import (
 )
 from fast_agent.mcp.mime_utils import (
     guess_mime_type,
+    is_document_mime_type,
     is_image_mime_type,
     is_text_mime_type,
 )
@@ -39,6 +44,10 @@ _logger = get_logger("multipart_converter_openai")
 # Define type aliases for content blocks
 ContentBlock = dict[str, Any]
 OpenAIMessage = dict[str, Any]
+type OpenAITextExtractableBlock = (
+    ChatCompletionContentPartParam | ContentArrayOfContentPart | ChatCompletionContentPartTextParam
+)
+type OpenAITextExtractableContent = str | Iterable[OpenAITextExtractableBlock] | None
 
 
 class OpenAIConverter:
@@ -188,9 +197,24 @@ class OpenAIConverter:
                         content_blocks.append(block)
 
                 elif is_resource_link(item):
-                    text = get_text(item)
-                    if text:
-                        content_blocks.append({"type": "text", "text": text})
+                    uri = getattr(item, "uri", None)
+                    mime_type = getattr(item, "mimeType", None)
+                    if uri and mime_type and OpenAIConverter._is_supported_image_type(mime_type):
+                        content_blocks.append(
+                            {"type": "image_url", "image_url": {"url": str(uri)}}
+                        )
+                    elif (
+                        uri
+                        and mime_type
+                        and is_document_mime_type(mime_type)
+                    ):
+                        content_blocks.append(
+                            OpenAIConverter._convert_resource_link_document(item, str(uri))
+                        )
+                    else:
+                        text = get_text(item)
+                        if text:
+                            content_blocks.append({"type": "text", "text": text})
 
                 else:
                     _logger.warning(f"Unsupported content type: {type(item)}")
@@ -288,7 +312,7 @@ class OpenAIConverter:
         if hasattr(content, "annotations") and content.annotations:
             if hasattr(content.annotations, "detail"):
                 detail = content.annotations.detail
-                if detail in ("auto", "low", "high"):
+                if isinstance(detail, str) and detail in ("auto", "low", "high"):
                     image_url["detail"] = detail
 
         return {"type": "image_url", "image_url": image_url}
@@ -358,11 +382,7 @@ class OpenAIConverter:
         # Handle PDFs
         elif mime_type == "application/pdf":
             if is_url and uri_str:
-                # OpenAI doesn't directly support PDF URLs, explain this limitation
-                return {
-                    "type": "text",
-                    "text": f"[PDF URL: {uri_str}]\nOpenAI requires PDF files to be uploaded or provided as base64 data.",
-                }
+                return OpenAIConverter._build_file_part(title or "document.pdf", file_url=uri_str)
             elif hasattr(resource_content, "blob"):
                 return {
                     "type": "file",
@@ -413,8 +433,39 @@ class OpenAIConverter:
         }
 
     @staticmethod
+    def _build_file_part(
+        filename: str,
+        *,
+        file_data: str | None = None,
+        file_url: str | None = None,
+    ) -> ContentBlock:
+        file_block: dict[str, str] = {"filename": filename}
+        if file_data:
+            file_block["file_data"] = file_data
+        if file_url:
+            file_block["file_url"] = file_url
+        return {"type": "file", "file": file_block}
+
+    @staticmethod
+    def _convert_resource_link_document(
+        resource,
+        uri_str: str,
+    ) -> ContentBlock:
+        from fast_agent.mcp.resource_utils import extract_title_from_uri
+
+        filename = (
+            resource.name
+            or extract_title_from_uri(resource.uri)
+            or "document"
+        )
+        return OpenAIConverter._build_file_part(
+            filename,
+            file_url=uri_str,
+        )
+
+    @staticmethod
     def _extract_text_from_content_blocks(
-        content: Union[str, list[ContentBlock]],
+        content: OpenAITextExtractableContent,
     ) -> str:
         """
         Extract and combine text from content blocks.
@@ -425,17 +476,18 @@ class OpenAIConverter:
         Returns:
             Combined text as a string
         """
+        if content is None:
+            return ""
         if isinstance(content, str):
             return content
 
-        if not content:
-            return ""
-
         # Extract only text blocks
-        text_parts = []
+        text_parts: list[str] = []
         for block in content:
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
+            if isinstance(block, Mapping) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
 
         return " ".join(text_parts) if text_parts else "[Complex content converted to text]"
 

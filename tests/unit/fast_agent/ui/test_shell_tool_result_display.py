@@ -162,3 +162,27 @@ def test_tool_result_prefers_structured_content_when_text_blocks_disagree() -> N
     assert '"status": "escalated"' in rendered
     assert '"status":"closed"' not in rendered
     assert '"status":"pending"' not in rendered
+
+
+def test_structured_tool_result_shows_transport_timing_and_structured_footer() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[TextContent(type="text", text='{"ok": true}')],
+        structuredContent={"ok": True},
+        isError=False,
+    )
+    setattr(result, "transport_channel", "post-json")
+
+    with console.console.capture() as capture:
+        display.show_tool_result(
+            result,
+            name="dev",
+            tool_name="demo_tool",
+            timing_ms=1500,
+        )
+
+    rendered = capture.get()
+    assert '{"ok": true}' in rendered
+    assert "HTTP (JSON-RPC)" in rendered
+    assert "1.50s" in rendered
+    assert "Structured ■" in rendered

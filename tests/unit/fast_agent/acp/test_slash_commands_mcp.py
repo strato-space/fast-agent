@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -89,12 +90,23 @@ class _Agent:
 class _App:
     def __init__(self) -> None:
         self._attached = ["local"]
+        self.attached_configs: list[object | None] = []
 
     def _agent(self, _name: str):
         return _Agent()
 
-    def agent_names(self):
+    def visible_agent_names(self, *, force_include: str | None = None):
+        del force_include
         return ["main"]
+
+    def registered_agent_names(self):
+        return ["main"]
+
+    def registered_agents(self):
+        return {"main": _Agent()}
+
+    def resolve_target_agent_name(self, agent_name: str | None = None):
+        return agent_name or "main"
 
     async def list_prompts(self, namespace: str | None, agent_name: str | None = None):
         del namespace, agent_name
@@ -107,7 +119,7 @@ class _App:
         return ["docs"]
 
     async def attach_mcp_server(self, _agent_name, server_name, server_config=None, options=None):
-        del server_config
+        self.attached_configs.append(server_config)
         if options and options.oauth_event_handler is not None:
             await options.oauth_event_handler(
                 OAuthEvent(
@@ -240,6 +252,106 @@ async def test_slash_command_mcp_connect_sends_acp_progress_updates() -> None:
         for update in acp_context.updates
     )
     assert any("Connected MCP server 'demo'" in str(update) for update in acp_context.updates)
+
+
+@pytest.mark.asyncio
+async def test_slash_command_mcp_connect_redacts_auth_in_acp_updates() -> None:
+    original_value = os.environ.get("MCP_TOKEN")
+    os.environ["MCP_TOKEN"] = "secret-token-value"
+    app = _App()
+    try:
+        instance = AgentInstance(
+            app=cast("AgentApp", app),
+            agents={"main": cast("AgentProtocol", _Agent())},
+            registry_version=0,
+        )
+        handler = SlashCommandHandler(
+            session_id="s1",
+            instance=instance,
+            primary_agent_name="main",
+            attach_mcp_server_callback=app.attach_mcp_server,
+            detach_mcp_server_callback=app.detach_mcp_server,
+            list_attached_mcp_servers_callback=app.list_attached_mcp_servers,
+            list_configured_detached_mcp_servers_callback=app.list_configured_detached_mcp_servers,
+        )
+        acp_context = _FakeACPContext()
+        handler.set_acp_context(cast("ACPContext", acp_context))
+
+        connected = await handler.execute_command(
+            "mcp",
+            "connect https://example.com/mcp --name demo --auth $MCP_TOKEN",
+        )
+
+        assert "Connected MCP server 'demo'" in connected
+        rendered_updates = "\n".join(str(update) for update in acp_context.updates)
+        assert "secret-token-value" not in rendered_updates
+        assert "--auth" in rendered_updates
+        assert "[REDACTED]" in rendered_updates
+    finally:
+        if original_value is None:
+            os.environ.pop("MCP_TOKEN", None)
+        else:
+            os.environ["MCP_TOKEN"] = original_value
+
+
+@pytest.mark.asyncio
+async def test_slash_command_mcp_connect_preserves_quoted_target_arguments() -> None:
+    app = _App()
+    instance = AgentInstance(
+        app=cast("AgentApp", app),
+        agents={"main": cast("AgentProtocol", _Agent())},
+        registry_version=0,
+    )
+    handler = SlashCommandHandler(
+        session_id="s1",
+        instance=instance,
+        primary_agent_name="main",
+        attach_mcp_server_callback=app.attach_mcp_server,
+        detach_mcp_server_callback=app.detach_mcp_server,
+        list_attached_mcp_servers_callback=app.list_attached_mcp_servers,
+        list_configured_detached_mcp_servers_callback=app.list_configured_detached_mcp_servers,
+    )
+
+    connected = await handler.execute_command(
+        "mcp",
+        'connect demo-server --root "My Folder" --name docs',
+    )
+
+    assert "Connected MCP server 'docs'" in connected
+    assert app.attached_configs
+    server_config = app.attached_configs[-1]
+    assert getattr(server_config, "command", None) == "demo-server"
+    assert getattr(server_config, "args", None) == ["--root", "My Folder"]
+
+
+@pytest.mark.asyncio
+async def test_slash_command_mcp_connect_preserves_quoted_windows_path() -> None:
+    app = _App()
+    instance = AgentInstance(
+        app=cast("AgentApp", app),
+        agents={"main": cast("AgentProtocol", _Agent())},
+        registry_version=0,
+    )
+    handler = SlashCommandHandler(
+        session_id="s1",
+        instance=instance,
+        primary_agent_name="main",
+        attach_mcp_server_callback=app.attach_mcp_server,
+        detach_mcp_server_callback=app.detach_mcp_server,
+        list_attached_mcp_servers_callback=app.list_attached_mcp_servers,
+        list_configured_detached_mcp_servers_callback=app.list_configured_detached_mcp_servers,
+    )
+
+    connected = await handler.execute_command(
+        "mcp",
+        'connect "C:\\Program Files\\Tool\\tool.exe" --flag --name docs',
+    )
+
+    assert "Connected MCP server 'docs'" in connected
+    assert app.attached_configs
+    server_config = app.attached_configs[-1]
+    assert getattr(server_config, "command", None) == "C:\\Program Files\\Tool\\tool.exe"
+    assert getattr(server_config, "args", None) == ["--flag"]
 
 
 @pytest.mark.asyncio

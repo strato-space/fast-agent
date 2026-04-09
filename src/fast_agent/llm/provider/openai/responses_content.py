@@ -20,14 +20,16 @@ from fast_agent.mcp.helpers.content_helpers import (
     is_resource_link,
     is_text_content,
 )
+from fast_agent.mcp.mime_utils import is_image_mime_type, is_text_mime_type
 from fast_agent.tools.apply_patch_tool import (
     extract_apply_patch_input,
 )
-from fast_agent.types.assistant_message_phase import AssistantMessagePhase
+from fast_agent.types.assistant_message_phase import coerce_assistant_message_phase
 
 if TYPE_CHECKING:
     from fast_agent.core.logging.logger import Logger
     from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+    from fast_agent.types.assistant_message_phase import AssistantMessagePhase
 
 
 class ResponsesContentMixin:
@@ -156,15 +158,14 @@ class ResponsesContentMixin:
             payload["role"] = "assistant"
             phase = payload.get("phase")
             if phase is None and msg.phase is not None:
-                payload["phase"] = self._phase_to_wire_value(msg.phase)
+                payload["phase"] = msg.phase
+            normalized_phase = coerce_assistant_message_phase(payload.get("phase"))
+            if normalized_phase is not None:
+                payload["phase"] = normalized_phase
+            else:
+                payload.pop("phase", None)
             items.append(payload)
         return items
-
-    @staticmethod
-    def _phase_to_wire_value(phase: AssistantMessagePhase | str) -> str:
-        if isinstance(phase, AssistantMessagePhase):
-            return phase.value
-        return phase
 
     def _extract_encrypted_reasoning_items(
         self, channels: Mapping[str, Iterable[ContentBlock]] | None
@@ -211,10 +212,6 @@ class ResponsesContentMixin:
         return [{"type": "summary_text", "text": summary_text}]
 
     @staticmethod
-    def _is_image_mime_type(mime_type: str | None) -> bool:
-        return bool(mime_type) and mime_type.lower().startswith("image/")
-
-    @staticmethod
     def _content_mime_type(content: ContentBlock) -> str | None:
         mime_type = getattr(content, "mimeType", None)
         if isinstance(content, EmbeddedResource):
@@ -223,20 +220,42 @@ class ResponsesContentMixin:
 
     @staticmethod
     def _content_filename(content: ContentBlock) -> str | None:
-        if not isinstance(content, EmbeddedResource):
-            return None
-        uri = getattr(content.resource, "uri", None)
+        uri = getattr(content, "uri", None)
+        if isinstance(content, EmbeddedResource):
+            uri = getattr(content.resource, "uri", None)
         if not uri:
             return None
         uri_str = str(uri)
         filename = uri_str.rsplit("/", 1)[-1] if "/" in uri_str else uri_str
         return filename or None
 
+    def _content_to_input_text_part(self, content: ContentBlock) -> dict[str, Any] | None:
+        if not is_resource_content(content):
+            return None
+
+        mime_type = self._content_mime_type(content) or "text/plain"
+        if not is_text_mime_type(mime_type):
+            return None
+
+        text = get_text(content)
+        if text is None:
+            return None
+
+        filename = self._content_filename(content) or "resource"
+        return {
+            "type": "input_text",
+            "text": (
+                f'<fastagent:file title="{filename}" mimetype="{mime_type}">\n'
+                f"{text}\n"
+                f"</fastagent:file>"
+            ),
+        }
+
     def _content_to_input_part(self, content: ContentBlock) -> dict[str, Any] | None:
         mime_type = self._content_mime_type(content)
         data = get_image_data(content)
         if data:
-            if self._is_image_mime_type(mime_type):
+            if mime_type and is_image_mime_type(mime_type):
                 return {"type": "input_image", "image_url": f"data:{mime_type};base64,{data}"}
             if mime_type:
                 input_part: dict[str, Any] = {"type": "input_file", "file_data": data}
@@ -249,9 +268,15 @@ class ResponsesContentMixin:
         if is_resource_content(content):
             resource_uri = get_resource_uri(content)
             if resource_uri:
-                if self._is_image_mime_type(mime_type):
+                if mime_type and is_image_mime_type(mime_type):
                     return {"type": "input_image", "image_url": resource_uri}
                 return {"type": "input_file", "file_url": resource_uri}
+        if is_resource_link(content):
+            resource_uri = getattr(content, "uri", None)
+            if resource_uri:
+                if mime_type and is_image_mime_type(mime_type):
+                    return {"type": "input_image", "image_url": str(resource_uri)}
+                return {"type": "input_file", "file_url": str(resource_uri)}
 
         return None
 
@@ -311,7 +336,7 @@ class ResponsesContentMixin:
             "content": parts,
         }
         if role == "assistant" and phase is not None:
-            item["phase"] = phase.value
+            item["phase"] = phase
         return item
 
     def _convert_content_parts(
@@ -326,7 +351,13 @@ class ResponsesContentMixin:
                 parts.append({"type": text_type, "text": text})
                 continue
 
-            if is_image_content(item) or is_resource_content(item):
+            if is_resource_content(item):
+                text_part = self._content_to_input_text_part(item)
+                if text_part:
+                    parts.append(text_part)
+                    continue
+
+            if is_image_content(item) or is_resource_content(item) or is_resource_link(item):
                 input_part = self._content_to_input_part(item)
                 if input_part:
                     parts.append(input_part)
@@ -351,12 +382,17 @@ class ResponsesContentMixin:
     def _content_to_image_url(self, item: ContentBlock) -> str | None:
         data = get_image_data(item)
         if not data:
+            if is_resource_link(item):
+                mime_type = self._content_mime_type(item)
+                uri = getattr(item, "uri", None)
+                if uri and mime_type and is_image_mime_type(mime_type):
+                    return str(uri)
             return None
         mime_type = getattr(item, "mimeType", None)
         if not mime_type and is_resource_content(item):
             resource = getattr(item, "resource", None)
             mime_type = getattr(resource, "mimeType", None) if resource else None
-        if not self._is_image_mime_type(mime_type):
+        if not mime_type or not is_image_mime_type(mime_type):
             return None
         return f"data:{mime_type};base64,{data}"
 
@@ -459,15 +495,26 @@ class ResponsesContentMixin:
             if text is not None:
                 chunks.append(text)
                 continue
-            if is_image_content(item) or is_resource_content(item):
+            if is_image_content(item) or is_resource_content(item) or is_resource_link(item):
                 image_url = self._content_to_image_url(item)
                 if image_url:
                     chunks.append(f"![Image]({image_url})")
                     continue
+                input_part = self._content_to_input_part(item)
+                if input_part and input_part.get("type") == "input_file":
+                    file_url = input_part.get("file_url")
+                    if isinstance(file_url, str):
+                        chunks.append(f"[Resource]({file_url})")
+                        continue
             resource_uri = get_resource_uri(item)
             if resource_uri:
                 chunks.append(f"[Resource]({resource_uri})")
                 continue
+            if is_resource_link(item):
+                uri = getattr(item, "uri", None)
+                if uri:
+                    chunks.append(f"[Resource]({uri})")
+                    continue
             chunks.append(f"[Unsupported content: {type(item).__name__}]")
         return "\n".join(chunk for chunk in chunks if chunk)
 
@@ -476,7 +523,7 @@ class ResponsesContentMixin:
     ) -> list[dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         for item in contents:
-            if is_image_content(item) or is_resource_content(item):
+            if is_image_content(item) or is_resource_content(item) or is_resource_link(item):
                 input_part = self._content_to_input_part(item)
                 if input_part:
                     parts.append(input_part)

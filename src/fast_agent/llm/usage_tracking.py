@@ -23,10 +23,13 @@ try:
     from openai.types.completion_usage import CompletionUsage as OpenAIUsage
 except Exception:  # pragma: no cover - optional dependency
     OpenAIUsage = object  # type: ignore
-from pydantic import BaseModel, Field, PrivateAttr, computed_field
+from pydantic import BaseModel, Field, PrivateAttr, computed_field, field_validator
 
+from fast_agent.core.logging.json_serializer import JsonValue, snapshot_json_value
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider_types import Provider
+
+_ANTHROPIC_USAGE_PROVIDERS = {Provider.ANTHROPIC, Provider.ANTHROPIC_VERTEX}
 
 
 # Fast-agent specific usage type for synthetic providers
@@ -38,18 +41,6 @@ class FastAgentUsage(BaseModel):
     model_type: str = Field(description="Type of fast-agent model (passthrough/playbook/slow)")
     tool_calls: int = Field(default=0, description="Number of tool calls made")
     delay_seconds: float = Field(default=0.0, description="Artificial delays added")
-
-
-# Union type for raw usage data from any provider
-ProviderUsage = Union[AnthropicUsage, OpenAIUsage, GoogleUsage, FastAgentUsage]
-
-
-class ModelContextWindows:
-    """Context window sizes and cache configurations for various models"""
-
-    @classmethod
-    def get_context_window(cls, model: str) -> int | None:
-        return ModelDatabase.get_context_window(model)
 
 
 class CacheUsage(BaseModel):
@@ -92,8 +83,13 @@ class TurnUsage(BaseModel):
     # Tool call count for this turn
     tool_calls: int = Field(default=0, description="Number of tool calls made in this turn")
 
-    # Raw usage data from provider (preserves all original data)
-    raw_usage: ProviderUsage
+    # JSON-safe raw usage telemetry snapshot captured at ingestion time.
+    raw_usage: JsonValue = None
+
+    @field_validator("raw_usage", mode="before")
+    @classmethod
+    def _snapshot_raw_usage(cls, value: object | None) -> JsonValue:
+        return snapshot_json_value(value)
 
     @computed_field
     @property
@@ -113,7 +109,7 @@ class TurnUsage(BaseModel):
         """Input tokens actually processed (new tokens, not from cache)"""
         # For Anthropic: input_tokens already excludes cached content
         # For other providers: subtract cache hits from input_tokens
-        if self.provider == Provider.ANTHROPIC:
+        if self.provider in _ANTHROPIC_USAGE_PROVIDERS:
             return self.input_tokens
         else:
             return max(0, self.input_tokens - self.cache_usage.cache_hit_tokens)
@@ -123,7 +119,7 @@ class TurnUsage(BaseModel):
     def display_input_tokens(self) -> int:
         """Input tokens to display for 'Last turn' (total submitted tokens)"""
         # For Anthropic: input_tokens excludes cache, so add cache tokens
-        if self.provider == Provider.ANTHROPIC:
+        if self.provider in _ANTHROPIC_USAGE_PROVIDERS:
             return (
                 self.input_tokens
                 + self.cache_usage.cache_read_tokens
@@ -139,7 +135,13 @@ class TurnUsage(BaseModel):
         object.__setattr__(self, "tool_calls", count)
 
     @classmethod
-    def from_anthropic(cls, usage: AnthropicUsage, model: str) -> "TurnUsage":
+    def from_anthropic(
+        cls,
+        usage: AnthropicUsage,
+        model: str,
+        *,
+        provider: Provider = Provider.ANTHROPIC,
+    ) -> "TurnUsage":
         # Extract cache tokens with proper null handling
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
@@ -154,14 +156,14 @@ class TurnUsage(BaseModel):
         thinking_tokens = getattr(usage, "thinking_tokens", 0) or 0
 
         return cls(
-            provider=Provider.ANTHROPIC,
+            provider=provider,
             model=model,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.input_tokens + usage.output_tokens,
             cache_usage=cache_usage,
             reasoning_tokens=thinking_tokens,
-            raw_usage=usage,  # Store the original Anthropic usage object
+            raw_usage=snapshot_json_value(usage),
         )
 
     @classmethod
@@ -182,7 +184,7 @@ class TurnUsage(BaseModel):
             output_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
             cache_usage=cache_usage,
-            raw_usage=usage,  # Store the original OpenAI usage object
+            raw_usage=snapshot_json_value(usage),
         )
 
     @classmethod
@@ -209,7 +211,7 @@ class TurnUsage(BaseModel):
             cache_usage=cache_usage,
             tool_use_tokens=tool_use_tokens,
             reasoning_tokens=thinking_tokens,
-            raw_usage=usage,  # Store the original Google usage object
+            raw_usage=snapshot_json_value(usage),
         )
 
     @classmethod
@@ -230,7 +232,7 @@ class TurnUsage(BaseModel):
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             cache_usage=cache_usage,
-            raw_usage=usage,  # Store the original FastAgentUsage object
+            raw_usage=snapshot_json_value(usage),
         )
 
 
@@ -241,13 +243,12 @@ class UsageAccumulator(BaseModel):
     model: str | None = None
     last_cache_activity_time: float | None = None
 
-    # Provider-set override for the effective context window size.
-    # When set, takes priority over the ModelDatabase lookup (e.g., Anthropic 1M beta).
-    _context_window_override: int | None = PrivateAttr(default=None)
+    # Provider/resolution-set effective context window size for the active model.
+    _context_window_size: int | None = PrivateAttr(default=None)
 
-    def set_context_window_override(self, override: int | None) -> None:
-        """Set an explicit context window size, overriding the ModelDatabase value."""
-        self._context_window_override = override
+    def set_context_window_size(self, value: int | None) -> None:
+        """Set the effective context window size for this accumulator."""
+        self._context_window_size = value
 
     def add_turn(self, turn: TurnUsage) -> None:
         """Add a new turn to the accumulator"""
@@ -353,13 +354,13 @@ class UsageAccumulator(BaseModel):
     def context_window_size(self) -> int | None:
         """Get context window size for current model.
 
-        Returns the provider-set override when present (e.g., Anthropic 1M beta),
-        otherwise falls back to the ModelDatabase value.
+        Returns the explicitly set effective size when present,
+        otherwise falls back to the model database.
         """
-        if self._context_window_override is not None:
-            return self._context_window_override
+        if self._context_window_size is not None:
+            return self._context_window_size
         if self.model:
-            return ModelContextWindows.get_context_window(self.model)
+            return ModelDatabase.get_context_window(self.model)
         return None
 
     @computed_field

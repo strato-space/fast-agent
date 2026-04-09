@@ -8,9 +8,11 @@ from typing import Any, cast
 
 import pytest
 import typer
-from mcp.types import TextContent
+from mcp import CallToolRequest
+from mcp.types import CallToolRequestParams, TextContent
 
 from fast_agent.agents.agent_types import AgentConfig
+from fast_agent.cli.runtime import runner
 from fast_agent.cli.runtime.agent_setup import (
     _apply_shell_cwd_policy_preflight,
     _build_fan_out_result_paths,
@@ -26,6 +28,7 @@ from fast_agent.cli.runtime.runner import _should_convert_keyboard_interrupt_to_
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.mcp.prompt_serialization import load_messages
 from fast_agent.session import ResumeSessionAgentsResult
+from fast_agent.types.llm_stop_reason import LlmStopReason
 
 
 class _DummyAgent:
@@ -57,6 +60,15 @@ class _DummyAgentApp:
         if agent_name is None:
             return self._agents[self._default_agent]
         return self._agents[agent_name]
+
+    def get_agent(self, agent_name: str):
+        return self._agents.get(agent_name)
+
+    def resolve_target_agent_name(self, agent_name: str | None = None) -> str | None:
+        return self._default_agent if agent_name is None else agent_name
+
+    def registered_agents(self):
+        return self._agents
 
     async def interactive(self, agent_name: str | None = None) -> None:
         del agent_name
@@ -118,6 +130,76 @@ def test_should_convert_keyboard_interrupt_to_task_cancel_only_for_interactive_r
     one_shot_request = _make_request(result_file=None, message="hello")
     assert _should_convert_keyboard_interrupt_to_task_cancel(one_shot_request) is False
 
+    prompt_file_request = _make_request(
+        result_file=None,
+        message=None,
+        prompt_file="prompt.txt",
+    )
+    assert _should_convert_keyboard_interrupt_to_task_cancel(prompt_file_request) is False
+
+
+def test_run_request_closes_loop_when_cleanup_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class _FakeLoop:
+        def __init__(self) -> None:
+            self.task = _FakeTask()
+            self.main_gather = object()
+            self.shutdown_marker = object()
+            self.closed = False
+
+        def is_running(self) -> bool:
+            return False
+
+        def create_task(self, coro: Any) -> _FakeTask:
+            coro.close()
+            return self.task
+
+        def run_until_complete(self, awaitable: object) -> None:
+            if awaitable is self.task:
+                raise KeyboardInterrupt()
+            if awaitable is self.main_gather:
+                raise KeyboardInterrupt()
+
+        def shutdown_asyncgens(self) -> object:
+            return self.shutdown_marker
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_loop = _FakeLoop()
+
+    async def _fake_run_agent_request(_request: AgentRunRequest) -> None:
+        return None
+
+    def _fake_gather(*aws: object, return_exceptions: bool = False) -> object:
+        del return_exceptions
+        if aws == (fake_loop.task,):
+            return fake_loop.main_gather
+        return object()
+
+    monkeypatch.setattr(runner, "configure_uvloop", lambda: (False, False))
+    monkeypatch.setattr(runner, "ensure_event_loop", lambda: fake_loop)
+    monkeypatch.setattr(runner, "set_asyncio_exception_handler", lambda _loop: None)
+    monkeypatch.setattr(runner, "run_agent_request", _fake_run_agent_request)
+    monkeypatch.setattr(asyncio, "all_tasks", lambda _loop: set())
+    monkeypatch.setattr(asyncio, "gather", _fake_gather)
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run_request(_make_request(result_file=None, message="hello"))
+
+    assert fake_loop.closed is True
+
 
 def test_sanitize_result_suffix() -> None:
     assert _sanitize_result_suffix("openai/gpt-4o") == "openai_gpt-4o"
@@ -159,6 +241,42 @@ def test_find_last_assistant_text_returns_none_without_assistant_messages() -> N
     assert _find_last_assistant_text(history) is None
 
 
+def test_find_last_assistant_text_falls_back_to_pending_tool_summary() -> None:
+    history = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hello")]),
+        PromptMessageExtended(
+            role="assistant",
+            tool_calls={
+                "call-1": CallToolRequest(
+                    method="tools/call",
+                    params=CallToolRequestParams(name="read_text_file", arguments={}),
+                )
+            },
+            stop_reason=LlmStopReason.TOOL_USE,
+        ),
+    ]
+
+    assert _find_last_assistant_text(history) == "Pending tool call: read_text_file"
+
+
+def test_find_last_assistant_text_prefers_text_over_pending_tool_summary() -> None:
+    history = [
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="partial answer")],
+            tool_calls={
+                "call-1": CallToolRequest(
+                    method="tools/call",
+                    params=CallToolRequestParams(name="read_text_file", arguments={}),
+                )
+            },
+            stop_reason=LlmStopReason.TOOL_USE,
+        )
+    ]
+
+    assert _find_last_assistant_text(history) == "partial answer"
+
+
 @pytest.mark.asyncio
 async def test_run_single_agent_cli_flow_exports_transient_turn_when_history_disabled(
     tmp_path: Path,
@@ -175,6 +293,58 @@ async def test_run_single_agent_cli_flow_exports_transient_turn_when_history_dis
     exported = load_messages(str(output))
     assert [message.role for message in exported] == ["user", "assistant"]
     assert exported[0].first_text() == "hello"
+    assert exported[1].last_text() == "done"
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_single_agent_cli_flow_prompt_file_is_one_shot_and_exports_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _TrackingAgentApp(_DummyAgentApp):
+        def __init__(self) -> None:
+            super().__init__(["agent"])
+            self.interactive_calls = 0
+
+        async def interactive(self, agent_name: str | None = None) -> None:
+            del agent_name
+            self.interactive_calls += 1
+
+    prompt = [
+        PromptMessageExtended(
+            role="user",
+            content=[TextContent(type="text", text="hello from prompt")],
+        )
+    ]
+    prompt_file = tmp_path / "prompt.json"
+    prompt_file.write_text("[]", encoding="utf-8")
+    output = tmp_path / "out.json"
+
+    agent = _NonPersistentMessageAgent("agent", "done")
+    app = _TrackingAgentApp()
+    app._agents["agent"] = agent
+
+    monkeypatch.setattr(
+        "fast_agent.mcp.prompts.prompt_load.load_prompt",
+        lambda _path: prompt,
+    )
+
+    await _run_single_agent_cli_flow(
+        app,
+        _make_request(
+            result_file=str(output),
+            message=None,
+            prompt_file=str(prompt_file),
+        ),
+    )
+
+    assert app.interactive_calls == 0
+    exported = load_messages(str(output))
+    assert [message.role for message in exported] == ["user", "assistant"]
+    assert exported[0].first_text() == "hello from prompt"
     assert exported[1].last_text() == "done"
     captured = capsys.readouterr()
     assert captured.out.strip() == "done"
@@ -339,6 +509,50 @@ async def test_resume_session_interactive_handles_usage_notices_from_result(
     await _resume_session_if_requested(app, request)
 
     assert any("Usage restored" in notice for notice in plain_notices)
+
+
+@pytest.mark.asyncio
+async def test_resume_session_prefers_explicit_target_agent_for_fallback_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_request(
+        result_file=None,
+        target_agent_name="beta",
+        message=None,
+        prompt_file=None,
+    )
+    request.resume = "latest"
+
+    app = _DummyAgentApp(["alpha", "beta"], default_agent="alpha")
+    captured_kwargs: dict[str, object] = {}
+    session = SimpleNamespace(
+        info=SimpleNamespace(
+            name="session-3",
+            last_activity=datetime(2026, 2, 26, 12, 0, 0),
+        )
+    )
+
+    def _resume_session_agents(*args, **kwargs):
+        del args
+        captured_kwargs.update(kwargs)
+        return ResumeSessionAgentsResult(
+            session=cast("Any", session),
+            loaded={"beta": Path("history_beta.json")},
+            missing_agents=[],
+        )
+
+    manager = SimpleNamespace(resume_session_agents=_resume_session_agents)
+
+    monkeypatch.setattr("fast_agent.session.get_session_manager", lambda: manager)
+    monkeypatch.setattr("fast_agent.ui.enhanced_prompt.queue_startup_notice", lambda *_args: None)
+    monkeypatch.setattr(
+        "fast_agent.ui.enhanced_prompt.queue_startup_markdown_notice",
+        lambda *args, **kwargs: None,
+    )
+
+    await _resume_session_if_requested(app, request)
+
+    assert captured_kwargs["fallback_agent_name"] == "beta"
 
 
 @pytest.mark.asyncio

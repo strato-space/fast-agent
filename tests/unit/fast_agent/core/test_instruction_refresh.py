@@ -8,6 +8,7 @@ from fast_agent.core.instruction_refresh import (
     build_instruction,
     format_server_instructions,
     rebuild_agent_instruction,
+    resolve_instruction_skill_manifests,
 )
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ def test_format_server_instructions_empty() -> None:
 
 
 def test_format_server_instructions_with_data() -> None:
-    data = {
+    data: dict[str, tuple[str | None, list[str]]] = {
         "test-server": ("Do helpful things", ["tool1", "tool2"]),
     }
     result = format_server_instructions(data)
@@ -113,7 +114,7 @@ def test_format_server_instructions_with_data() -> None:
 
 
 def test_format_server_instructions_skips_none() -> None:
-    data = {
+    data: dict[str, tuple[str | None, list[str]]] = {
         "server1": ("Instructions", ["tool1"]),
         "server2": (None, ["tool2"]),  # Should be skipped
     }
@@ -147,6 +148,23 @@ def test_build_instruction_with_aggregator() -> None:
     result = asyncio.run(build_instruction(template, aggregator=cast("MCPAggregator", aggregator)))
     assert "my-server" in result
     assert "Be helpful" in result
+
+
+def test_resolve_instruction_skill_manifests_inherits_shared_context_for_default_skills() -> None:
+    agent = StubAgent()
+    agent.set_instruction_context({"agentSkills": "shared skills"})
+
+    assert resolve_instruction_skill_manifests(agent, []) is None
+
+
+def test_resolve_instruction_skill_manifests_blanks_default_skills_without_shared_context() -> None:
+    agent = StubAgent()
+
+    resolved_manifests = resolve_instruction_skill_manifests(agent, [])
+
+    assert resolved_manifests == []
+    result = asyncio.run(build_instruction("Skills:\n{{agentSkills}}", skill_manifests=resolved_manifests))
+    assert "{{agentSkills}}" not in result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -5,9 +5,15 @@ from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fast_agent.config import get_settings
+from fast_agent.constants import DEFAULT_ENVIRONMENT_DIR
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.model_factory import ModelFactory
+from fast_agent.llm.model_overlays import load_model_overlay_registry
 from fast_agent.llm.model_selection import CatalogModelEntry, ModelSelectionCatalog
+from fast_agent.llm.provider.anthropic.vertex_config import (
+    anthropic_vertex_intent,
+    anthropic_vertex_ready,
+)
 from fast_agent.llm.provider_key_manager import ProviderKeyManager
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import available_reasoning_values, format_reasoning_setting
@@ -16,13 +22,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 ModelSource = Literal["curated", "all"]
+ProviderActivationAction = Literal["codex-login"]
 KEEP_VALUE = "__keep__"
 DEFAULT_VALUE = "__default__"
 
 PICKER_PROVIDER_ORDER: tuple[Provider, ...] = (
     Provider.RESPONSES,
+    Provider.OPENRESPONSES,
     Provider.CODEX_RESPONSES,
     Provider.ANTHROPIC,
+    Provider.ANTHROPIC_VERTEX,
     Provider.HUGGINGFACE,
     Provider.OPENAI,
     Provider.GENERIC,
@@ -44,22 +53,43 @@ REFER_TO_DOCS_PROVIDERS: tuple[Provider, ...] = (
 )
 
 GENERIC_CUSTOM_MODEL_SENTINEL = "generic.__custom__"
+CODEX_LOGIN_SENTINEL = "codexresponses.__login__"
+ANTHROPIC_VERTEX_PROVIDER_KEY = "anthropic-vertex"
 
 
 @dataclass(frozen=True)
 class ProviderOption:
-    provider: Provider
+    provider: Provider | None
     active: bool
     curated_entries: tuple[CatalogModelEntry, ...]
+    key: str | None = None
+    display_name: str | None = None
+    overlay_group: bool = False
+    disabled_reason: str | None = None
+
+    @property
+    def option_key(self) -> str:
+        if self.key is not None:
+            return self.key
+        assert self.provider is not None
+        return self.provider.config_name
+
+    @property
+    def option_display_name(self) -> str:
+        if self.display_name is not None:
+            return self.display_name
+        assert self.provider is not None
+        return self.provider.display_name
 
 
 @dataclass(frozen=True)
 class ModelOption:
     spec: str
     label: str
-    alias: str | None = None
+    preset_token: str | None = None
     fast: bool = False
     curated: bool = False
+    activation_action: ProviderActivationAction | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +114,10 @@ class ModelPickerSnapshot:
 
 
 def _provider_is_active(provider: Provider, config_payload: dict[str, Any]) -> bool:
+    if provider == Provider.ANTHROPIC_VERTEX:
+        ready, _ = anthropic_vertex_ready(config_payload)
+        return ready
+
     config_key = ProviderKeyManager.get_config_file_key(provider.config_name, config_payload)
     if config_key:
         return True
@@ -121,10 +155,94 @@ def _provider_is_active(provider: Provider, config_payload: dict[str, Any]) -> b
 
     return False
 
+def _catalog_options_from_entries(
+    entries: tuple[CatalogModelEntry, ...],
+    *,
+    provider: Provider,
+    source: ModelSource,
+    spec_transform: Any = None,
+) -> list[ModelOption]:
+    transform = spec_transform or (lambda value: value)
 
-def build_snapshot(config_path: str | Path | None = None) -> ModelPickerSnapshot:
-    settings = get_settings(str(config_path) if config_path else None)
-    config_payload = settings.model_dump()
+    curated_options: list[ModelOption] = []
+    for entry in entries:
+        spec = transform(entry.model)
+        tags: list[str] = []
+        if entry.local:
+            tags.append("local")
+        if entry.fast:
+            tags.append("fast")
+        if not entry.current:
+            tags.append("legacy")
+
+        suffix = f" ({', '.join(tags)})" if tags else ""
+        entry_label = entry.display_label or entry.alias
+        label = f"{entry_label:<19} → {spec}{suffix}"
+        if entry.description:
+            label = f"{label} — {entry.description}"
+        curated_options.append(
+            ModelOption(
+                spec=spec,
+                label=label,
+                preset_token=entry.alias,
+                fast=entry.fast,
+                curated=entry.current,
+            )
+        )
+
+    if source == "curated":
+        return curated_options
+
+    seen_identities: set[tuple[Provider, str]] = set()
+    options: list[ModelOption] = list(curated_options)
+    for curated in curated_options:
+        identity = model_identity(curated.spec)
+        if identity is not None:
+            seen_identities.add(identity)
+
+    for spec in _static_provider_models(provider):
+        transformed_spec = transform(spec)
+        identity = model_identity(transformed_spec)
+        if identity is not None and identity in seen_identities:
+            continue
+        if identity is not None:
+            seen_identities.add(identity)
+        options.append(ModelOption(spec=transformed_spec, label=f"{transformed_spec} (catalog)"))
+
+    return options
+
+
+def model_options_for_option(
+    snapshot: ModelPickerSnapshot,
+    option: ProviderOption,
+    *,
+    source: ModelSource,
+) -> list[ModelOption]:
+    if option.overlay_group:
+        return _catalog_options_from_entries(
+            option.curated_entries,
+            provider=Provider.ANTHROPIC,
+            source="curated",
+        )
+
+    provider = option.provider
+    assert provider is not None
+    return _catalog_options_from_entries(
+        option.curated_entries,
+        provider=provider,
+        source=source,
+    )
+
+
+def build_snapshot(
+    config_path: str | Path | None = None,
+    *,
+    config_payload: dict[str, Any] | None = None,
+    start_path: Path | None = None,
+) -> ModelPickerSnapshot:
+    if config_payload is None:
+        settings = get_settings(str(config_path) if config_path else None)
+        config_payload = settings.model_dump()
 
     active_providers = set(ModelSelectionCatalog.configured_providers(config_payload))
     for provider in PICKER_PROVIDER_ORDER:
@@ -132,40 +250,210 @@ def build_snapshot(config_path: str | Path | None = None) -> ModelPickerSnapshot
             active_providers.add(provider)
 
     providers: list[ProviderOption] = []
+    overlay_registry = _load_overlay_registry_for_snapshot(
+        config_path=config_path,
+        config_payload=config_payload,
+        start_path=start_path,
+    )
+    overlay_entries = tuple(
+        CatalogModelEntry(
+            alias=overlay.name,
+            model=overlay.compiled_model_spec,
+            current=overlay.current,
+            fast=overlay.fast,
+            local=True,
+            display_label=overlay.display_label,
+            description=overlay.description,
+        )
+        for overlay in overlay_registry.overlays
+    )
+    if overlay_entries:
+        overlay_group_active = True
+    else:
+        overlay_group_active = False
+    providers.append(
+        ProviderOption(
+            provider=None,
+            active=overlay_group_active,
+            curated_entries=overlay_entries,
+            key="overlays",
+            display_name="Overlays",
+            overlay_group=True,
+        )
+    )
+
     for provider in PICKER_PROVIDER_ORDER:
-        entries = ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER.get(provider, ())
+        if provider == Provider.ANTHROPIC_VERTEX and not anthropic_vertex_intent(config_payload):
+            continue
+        entries = tuple(
+            entry
+            for entry in ModelSelectionCatalog.list_entries(
+                provider,
+                overlay_registry=overlay_registry,
+            )
+            if not entry.local
+        )
+        has_special_picker_flow = (
+            provider in REFER_TO_DOCS_PROVIDERS or provider == Provider.GENERIC
+        )
+        if not entries and not has_special_picker_flow:
+            continue
         providers.append(
             ProviderOption(
                 provider=provider,
                 active=provider in active_providers,
                 curated_entries=entries,
+                disabled_reason=(
+                    anthropic_vertex_ready(config_payload)[1]
+                    if provider == Provider.ANTHROPIC_VERTEX and provider not in active_providers
+                    else None
+                ),
             )
         )
 
     return ModelPickerSnapshot(providers=tuple(providers), config_payload=config_payload)
 
 
+def _load_overlay_registry_for_snapshot(
+    *,
+    config_path: str | Path | None,
+    config_payload: dict[str, Any],
+    start_path: Path | None,
+):
+    from pathlib import Path as _Path
+
+    env_dir = config_payload.get("environment_dir")
+    normalized_env_dir = env_dir if isinstance(env_dir, (str, _Path)) else None
+
+    candidate_starts: list[_Path] = []
+    if config_path is not None:
+        config_file = _Path(config_path).expanduser().resolve()
+        candidate_starts.append(config_file.parent)
+
+        relative_env_dir: _Path | None = None
+        if normalized_env_dir is None:
+            relative_env_dir = _Path(DEFAULT_ENVIRONMENT_DIR)
+        else:
+            env_path = _Path(normalized_env_dir).expanduser()
+            if not env_path.is_absolute():
+                relative_env_dir = env_path
+
+        if relative_env_dir is not None and relative_env_dir.parts:
+            env_parts = relative_env_dir.parts
+            parent_parts = config_file.parent.parts
+            if len(env_parts) <= len(parent_parts) and parent_parts[-len(env_parts) :] == env_parts:
+                project_root = config_file.parent
+                for _ in env_parts:
+                    project_root = project_root.parent
+                if project_root != config_file.parent:
+                    candidate_starts.append(project_root)
+
+    if config_path is None and start_path is not None:
+        candidate_starts.append(_Path(start_path).expanduser().resolve())
+
+    if config_path is None and start_path is None:
+        candidate_starts.append(_Path.cwd().resolve())
+
+    seen: set[_Path] = set()
+    ordered_starts: list[_Path] = []
+    for candidate in candidate_starts:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered_starts.append(candidate)
+
+    fallback_registry = None
+    for start_path in ordered_starts:
+        registry = load_model_overlay_registry(start_path=start_path, env_dir=normalized_env_dir)
+        if fallback_registry is None:
+            fallback_registry = registry
+        if registry.overlays:
+            return registry
+
+    assert fallback_registry is not None
+    return fallback_registry
+
+
 def find_provider(snapshot: ModelPickerSnapshot, provider_name: str) -> ProviderOption:
     for option in snapshot.providers:
-        if option.provider.config_name == provider_name:
+        if option.option_key == provider_name:
             return option
     raise ValueError(f"Unknown provider: {provider_name}")
 
 
 def build_provider_label(option: ProviderOption) -> str:
-    status = "active" if option.active else "inactive"
+    status = "active" if option.active else "disabled" if option.disabled_reason else "inactive"
     curated_count = len(option.curated_entries)
-    curated_text = f"{curated_count} curated model"
-    if curated_count != 1:
-        curated_text += "s"
-    return f"{option.provider.display_name:<16} [{status}] · {curated_text}"
+    if option.overlay_group:
+        entry_text = "overlay" if curated_count == 1 else "overlays"
+        count_text = f"{curated_count} {entry_text}"
+    else:
+        count_text = f"{curated_count} curated model"
+        if curated_count != 1:
+            count_text += "s"
+    return f"{option.option_display_name:<16} [{status}] · {count_text}"
 
 
 def active_provider_names(snapshot: ModelPickerSnapshot) -> list[str]:
-    return [option.provider.display_name for option in snapshot.providers if option.active]
+    return [option.option_display_name for option in snapshot.providers if option.active]
 
 
-def _model_identity(model_spec: str) -> tuple[Provider, str] | None:
+def has_explicit_provider_prefix(model_spec: str) -> bool:
+    provider_names = {provider.config_name for provider in Provider}
+
+    slash_prefix, _, slash_rest = model_spec.partition("/")
+    if slash_prefix and slash_rest and slash_prefix in provider_names:
+        return True
+
+    dot_prefix, _, dot_rest = model_spec.partition(".")
+    if dot_prefix and dot_rest and dot_prefix in provider_names:
+        return True
+
+    return False
+
+
+def normalize_generic_model_spec(raw_model: str) -> str | None:
+    candidate = raw_model.strip()
+    if not candidate:
+        return None
+
+    if has_explicit_provider_prefix(candidate):
+        return candidate
+
+    return f"generic.{candidate}"
+
+
+def infer_initial_picker_provider(model_spec: str | None) -> str | None:
+    if model_spec is None:
+        return None
+
+    normalized = model_spec.strip()
+    if not normalized:
+        return None
+
+    try:
+        parsed = ModelFactory.parse_model_string(
+            normalized,
+            presets=ModelFactory.MODEL_PRESETS,
+        )
+    except Exception:
+        return None
+
+    config_name = parsed.provider.config_name.strip()
+    return config_name or None
+
+
+def provider_activation_action(
+    snapshot: ModelPickerSnapshot,
+    provider: Provider,
+) -> ProviderActivationAction | None:
+    option = find_provider(snapshot, provider.config_name)
+    if provider == Provider.CODEX_RESPONSES and not option.active:
+        return "codex-login"
+    return None
+
+
+def model_identity(model_spec: str) -> tuple[Provider, str] | None:
     try:
         parsed = ModelFactory.parse_model_string(model_spec)
     except Exception:
@@ -176,7 +464,13 @@ def _model_identity(model_spec: str) -> tuple[Provider, str] | None:
 def _static_provider_models(provider: Provider) -> list[str]:
     models: list[str] = []
     for model in ModelDatabase.list_models():
-        if ModelDatabase.get_default_provider(model) != provider:
+        default_provider = ModelDatabase.get_default_provider(model)
+        if provider == Provider.ANTHROPIC_VERTEX:
+            if default_provider != Provider.ANTHROPIC:
+                continue
+            models.append(f"{provider.config_name}.{model}")
+            continue
+        if default_provider != provider:
             continue
         models.append(f"{provider.config_name}.{model}")
     return models
@@ -200,77 +494,38 @@ def model_options_for_provider(
         return [
             ModelOption(
                 spec=f"{provider.config_name}.refer-to-docs",
-                label="Refer to docs (provider-specific setup not yet modeled)",
+                label="Refer to docs (provider-specific setup)",
             )
         ]
 
     provider_option = find_provider(snapshot, provider.config_name)
-
-    curated_options: list[ModelOption] = []
-    for entry in provider_option.curated_entries:
-        tags: list[str] = []
-        if entry.fast:
-            tags.append("fast")
-        if not entry.current:
-            tags.append("legacy")
-
-        suffix = f" ({', '.join(tags)})" if tags else ""
-        label = f"{entry.alias:<18} → {entry.model}{suffix}"
-        curated_options.append(
+    activation_action = provider_activation_action(snapshot, provider)
+    if activation_action is not None:
+        return [
             ModelOption(
-                spec=entry.model,
-                label=label,
-                alias=entry.alias,
-                fast=entry.fast,
-                curated=entry.current,
+                spec=CODEX_LOGIN_SENTINEL,
+                label="Log in to enable Codex (Plan)",
+                activation_action=activation_action,
             )
-        )
-
-    if source == "curated":
-        return curated_options
-
-    seen_identities: set[tuple[Provider, str]] = set()
-    options: list[ModelOption] = list(curated_options)
-
-    for curated in curated_options:
-        model_identity = _model_identity(curated.spec)
-        if model_identity is not None:
-            seen_identities.add(model_identity)
-
-    for spec in _static_provider_models(provider):
-        model_identity = _model_identity(spec)
-        if model_identity is not None and model_identity in seen_identities:
-            continue
-        if model_identity is not None:
-            seen_identities.add(model_identity)
-        options.append(ModelOption(spec=spec, label=f"{spec} (catalog)"))
-
-    return options
-
-
-def _supports_web_search(provider: Provider, model_name: str) -> bool:
-    if provider in {
-        Provider.RESPONSES,
-        Provider.CODEX_RESPONSES,
-        Provider.OPENRESPONSES,
-    }:
-        return True
-
-    if provider == Provider.ANTHROPIC:
-        return ModelDatabase.get_anthropic_web_search_version(model_name) is not None
-
-    return False
+        ]
+    return _catalog_options_from_entries(
+        provider_option.curated_entries,
+        provider=provider,
+        source=source,
+    )
 
 
 def model_capabilities(model_spec: str) -> ModelCapabilities:
-    parsed = ModelFactory.parse_model_string(model_spec)
-    reasoning_spec = ModelDatabase.get_reasoning_effort_spec(parsed.model_name)
+    resolved = ModelFactory.resolve_model_spec(model_spec)
+    parsed = resolved.model_config
+    reasoning_spec = resolved.reasoning_effort_spec
     reasoning_values = tuple(available_reasoning_values(reasoning_spec))
     default_reasoning = format_reasoning_setting(
         reasoning_spec.default if reasoning_spec is not None else None
     )
-    long_context_window = ModelDatabase.get_long_context_window(parsed.model_name)
-    cache_ttl_default = ModelDatabase.get_cache_ttl(parsed.model_name)
+    long_context_window = resolved.long_context_window
+    cache_ttl_default = resolved.cache_ttl
+    supports_long_context = long_context_window is not None
 
     return ModelCapabilities(
         provider=parsed.provider,
@@ -278,10 +533,16 @@ def model_capabilities(model_spec: str) -> ModelCapabilities:
         reasoning_values=reasoning_values,
         current_reasoning=format_reasoning_setting(parsed.reasoning_effort),
         default_reasoning=default_reasoning,
-        web_search_supported=_supports_web_search(parsed.provider, parsed.model_name),
+        web_search_supported=(
+            parsed.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}
+            or (
+                parsed.provider == Provider.ANTHROPIC
+                and resolved.anthropic_web_search_version is not None
+            )
+        ),
         current_web_search=parsed.web_search,
-        supports_long_context=long_context_window is not None,
-        current_long_context=parsed.long_context,
+        supports_long_context=supports_long_context,
+        current_long_context=parsed.long_context and supports_long_context,
         long_context_window=long_context_window,
         cache_ttl_default=cache_ttl_default,
     )

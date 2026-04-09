@@ -1,6 +1,7 @@
+import json
 from contextlib import contextmanager
 from json import JSONDecodeError
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Union
 
 from mcp.types import CallToolResult
 from rich.console import Group
@@ -10,8 +11,10 @@ from rich.panel import Panel
 from rich.text import Text
 
 from fast_agent.config import LoggerSettings, Settings
-from fast_agent.constants import REASONING
+from fast_agent.constants import OPENAI_ASSISTANT_MESSAGE_ITEMS, REASONING
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.llm.model_display_name import resolve_llm_display_name, resolve_model_display_name
+from fast_agent.types.assistant_message_phase import coerce_assistant_message_phase
 from fast_agent.ui import console
 from fast_agent.ui.display_suppression import (
     display_chat_enabled,
@@ -27,8 +30,7 @@ from fast_agent.ui.mermaid_utils import (
     extract_mermaid_diagrams,
 )
 from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
-from fast_agent.ui.message_styles import MessageStyle, resolve_message_style
-from fast_agent.ui.model_display import format_model_display
+from fast_agent.ui.message_styles import A3MessageStyle
 from fast_agent.ui.shell_output_truncation import format_shell_output_line_count
 from fast_agent.ui.streaming import (
     NullStreamingHandle as _NullStreamingHandle,
@@ -52,6 +54,8 @@ CODE_STYLE = "native"
 
 # Glyph to indicate tool hooks are active
 HOOK_INDICATOR_GLYPH = "◆"
+
+PHASE_LABELS = {"final_answer": "Final Answer:", "commentary": "Commentary"}
 
 
 class ConsoleDisplay:
@@ -79,7 +83,7 @@ class ConsoleDisplay:
                 pass
         self._markup = getattr(self._logger_settings, "enable_markup", True)
         self._escape_xml = True
-        self._style = resolve_message_style(getattr(self._logger_settings, "message_style", "a3"))
+        self._style = A3MessageStyle()
         self._tool_display = ToolDisplay(self)
 
     @staticmethod
@@ -119,7 +123,7 @@ class ConsoleDisplay:
         return CODE_STYLE
 
     @property
-    def style(self) -> MessageStyle:
+    def style(self) -> A3MessageStyle:
         return self._style
 
     def show_status_message(self, content: Text) -> None:
@@ -399,9 +403,11 @@ class ConsoleDisplay:
         import json
         import re
 
+        from rich.protocol import is_renderable
         from rich.syntax import Syntax
 
         from fast_agent.mcp.helpers.content_helpers import get_text, is_text_content
+        from fast_agent.ui.markdown_renderables import build_markdown_renderable
 
         # Determine the style based on message type
         # USER, ASSISTANT, and SYSTEM messages should display in normal style
@@ -422,9 +428,14 @@ class ConsoleDisplay:
                     return
                 except (JSONDecodeError, TypeError, ValueError):
                     if render_markdown:
-                        prepared_content = prepare_markdown_content(content, self._escape_xml)
-                        md = Markdown(prepared_content, code_theme=CODE_STYLE)
-                        console.console.print(md, markup=self._markup)
+                        console.console.print(
+                            build_markdown_renderable(
+                                content,
+                                code_theme=CODE_STYLE,
+                                escape_xml=self._escape_xml,
+                            ),
+                            markup=self._markup,
+                        )
                     else:
                         self._print_plain_text(content, truncate=truncate, style=style)
                     return
@@ -448,9 +459,14 @@ class ConsoleDisplay:
                     # Check for markdown markers before deciding to use markdown rendering
                     if self._looks_like_markdown(content):
                         # Has markdown markers - render as markdown with escaping
-                        prepared_content = prepare_markdown_content(content, self._escape_xml)
-                        md = Markdown(prepared_content, code_theme=CODE_STYLE)
-                        console.console.print(md, markup=self._markup)
+                        console.console.print(
+                            build_markdown_renderable(
+                                content,
+                                code_theme=CODE_STYLE,
+                                escape_xml=self._escape_xml,
+                            ),
+                            markup=self._markup,
+                        )
                     else:
                         # Plain text - display as-is
                         self._print_plain_text(content, truncate=truncate, style=style)
@@ -464,10 +480,14 @@ class ConsoleDisplay:
                     # Check if it looks like markdown
                     if self._looks_like_markdown(content) and not has_substantial_xml:
                         # Escape HTML/XML tags while preserving code blocks
-                        prepared_content = prepare_markdown_content(content, self._escape_xml)
-                        md = Markdown(prepared_content, code_theme=CODE_STYLE)
-                        # Markdown handles its own styling, don't apply style
-                        console.console.print(md, markup=self._markup)
+                        console.console.print(
+                            build_markdown_renderable(
+                                content,
+                                code_theme=CODE_STYLE,
+                                escape_xml=self._escape_xml,
+                            ),
+                            markup=self._markup,
+                        )
                     else:
                         # Plain text (or mixed markdown+XML content)
                         self._print_plain_text(content, truncate=truncate, style=style)
@@ -509,9 +529,14 @@ class ConsoleDisplay:
                     # Check if the first part has markdown
                     if self._looks_like_markdown(markdown_part):
                         # Render markdown part
-                        prepared_content = prepare_markdown_content(markdown_part, self._escape_xml)
-                        md = Markdown(prepared_content, code_theme=CODE_STYLE)
-                        console.console.print(md, markup=self._markup)
+                        console.console.print(
+                            build_markdown_renderable(
+                                markdown_part,
+                                code_theme=CODE_STYLE,
+                                escape_xml=self._escape_xml,
+                            ),
+                            markup=self._markup,
+                        )
 
                         # Then render any additional styled segments
                         if markdown_end < len(plain_text):
@@ -527,12 +552,21 @@ class ConsoleDisplay:
                         console.console.print(content, markup=self._markup)
                 else:
                     # Simple case: entire text should be rendered as markdown
-                    prepared_content = prepare_markdown_content(plain_text, self._escape_xml)
-                    md = Markdown(prepared_content, code_theme=CODE_STYLE)
-                    console.console.print(md, markup=self._markup)
+                    console.console.print(
+                        build_markdown_renderable(
+                            plain_text,
+                            code_theme=CODE_STYLE,
+                            escape_xml=self._escape_xml,
+                        ),
+                        markup=self._markup,
+                    )
             else:
                 # No markdown markers, print as regular Rich Text
                 console.console.print(content, markup=self._markup)
+        elif isinstance(content, Group):
+            console.console.print(content, markup=self._markup)
+        elif is_renderable(content):
+            console.console.print(content, markup=self._markup)
         elif isinstance(content, list):
             # Handle content blocks (for tool results)
             if len(content) == 1 and is_text_content(content[0]):
@@ -570,11 +604,10 @@ class ConsoleDisplay:
             highlight_index: Optional index of the item to highlight
             max_item_length: Optional maximum length for individual items
         """
-        if self._style.bottom_metadata_requires_highlight:
-            if not bottom_metadata or highlight_index is None:
-                return
-            if highlight_index < 0 or highlight_index >= len(bottom_metadata):
-                return
+        if not bottom_metadata or highlight_index is None:
+            return
+        if highlight_index < 0 or highlight_index >= len(bottom_metadata):
+            return
 
         line = self._style.bottom_metadata_line(
             bottom_metadata,
@@ -726,6 +759,89 @@ class ConsoleDisplay:
 
         return Text(joined, style="dim italic")
 
+    @classmethod
+    def _extract_openai_phase_content(
+        cls, message: "PromptMessageExtended"
+    ) -> str | Group | None:
+        channels = message.channels or {}
+        raw_blocks = (
+            channels.get(OPENAI_ASSISTANT_MESSAGE_ITEMS) if isinstance(channels, Mapping) else None
+        )
+        if not raw_blocks:
+            return None
+
+        sections: list[str | Group | Text] = []
+        saw_phase = False
+
+        for block in raw_blocks:
+            raw_text = getattr(block, "text", None)
+            if not isinstance(raw_text, str) or not raw_text:
+                continue
+
+            try:
+                payload = json.loads(raw_text)
+            except (TypeError, ValueError):
+                continue
+
+            if not isinstance(payload, Mapping) or payload.get("type") != "message":
+                continue
+
+            phase = coerce_assistant_message_phase(payload.get("phase"))
+            content = payload.get("content")
+            if not isinstance(content, list):
+                continue
+
+            text_segments: list[str] = []
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                part_type = part.get("type")
+                part_text = part.get("text")
+                if (
+                    part_type in {"output_text", "text"}
+                    and isinstance(part_text, str)
+                    and part_text
+                ):
+                    text_segments.append(part_text)
+
+            section_text = "".join(text_segments).strip()
+            if not section_text:
+                continue
+
+            if phase is not None:
+                saw_phase = True
+                phase_label = PHASE_LABELS.get(phase, phase)
+                label = Text()
+                label.append("▎", style="dim")
+                label.append(phase_label, style="dim")
+                if cls._looks_like_markdown(section_text):
+                    prepared_content = prepare_markdown_content(section_text, True)
+                    sections.append(
+                        Group(
+                            label,
+                            Markdown(prepared_content, code_theme=CODE_STYLE),
+                        )
+                    )
+                else:
+                    label.append(" ")
+                    label.append(section_text)
+                    sections.append(label)
+            else:
+                sections.append(section_text)
+
+        if not sections or not saw_phase:
+            return None
+
+        if all(isinstance(section, str) for section in sections):
+            return "\n\n".join(section for section in sections if isinstance(section, str))
+
+        renderables: list[str | Group | Text] = []
+        for index, section in enumerate(sections):
+            if index:
+                renderables.append(Text("\n"))
+            renderables.append(section)
+        return Group(*renderables)
+
     async def show_assistant_message(
         self,
         message_text: Union[str, Text, "PromptMessageExtended"],
@@ -735,6 +851,7 @@ class ConsoleDisplay:
         name: str | None = None,
         model: str | None = None,
         additional_message: Text | None = None,
+        pre_content: Text | Group | None = None,
         render_markdown: bool | None = None,
         show_hook_indicator: bool = False,
     ) -> None:
@@ -749,6 +866,7 @@ class ConsoleDisplay:
             name: Optional agent name
             model: Optional model name for right info
             additional_message: Optional additional styled message to append
+            pre_content: Optional additional styled message to prepend before body text
             render_markdown: Force markdown rendering (True) or plain rendering (False)
             show_hook_indicator: Whether to show the hook indicator glyph (◆)
         """
@@ -760,18 +878,26 @@ class ConsoleDisplay:
         # Extract text from PromptMessageExtended if needed
         from fast_agent.types import PromptMessageExtended
 
-        pre_content: Text | Group | None = None
+        resolved_pre_content = pre_content
 
         if isinstance(message_text, PromptMessageExtended):
             # Prefer full assistant text so streamed/finalized multi-block responses
             # (e.g., provider-side web tool turns) are preserved after live refresh.
-            display_text = message_text.all_text() or message_text.last_text() or ""
-            pre_content = self._extract_reasoning_content(message_text)
+            display_text = (
+                self._extract_openai_phase_content(message_text)
+                or message_text.all_text()
+                or message_text.last_text()
+                or ""
+            )
+            resolved_pre_content = self._merge_pre_content(
+                self._extract_reasoning_content(message_text),
+                pre_content,
+            )
         else:
             display_text = message_text
 
         # Build right info
-        display_model = format_model_display(model)
+        display_model = resolve_model_display_name(model)
         right_info = f"[dim]{display_model}[/dim]" if display_model else ""
 
         # Display main message using unified method
@@ -785,13 +911,24 @@ class ConsoleDisplay:
             max_item_length=max_item_length,
             truncate_content=False,  # Assistant messages shouldn't be truncated
             additional_message=additional_message,
-            pre_content=pre_content,
+            pre_content=resolved_pre_content,
             render_markdown=render_markdown,
             show_hook_indicator=show_hook_indicator,
         )
 
         # Handle mermaid diagrams separately (after the main message)
         self.show_mermaid_diagrams_from_message_text(message_text)
+
+    @staticmethod
+    def _merge_pre_content(
+        primary: Text | Group | None,
+        secondary: Text | Group | None,
+    ) -> Text | Group | None:
+        if primary is None:
+            return secondary
+        if secondary is None:
+            return primary
+        return Group(primary, Text("\n\n"), secondary)
 
     def show_mermaid_diagrams_from_message_text(
         self,
@@ -824,6 +961,7 @@ class ConsoleDisplay:
         name: str | None = None,
         model: str | None = None,
         show_hook_indicator: bool = False,
+        tool_metadata_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> Iterator[StreamingHandle]:
         """Create a streaming context for assistant messages."""
         if not display_chat_enabled():
@@ -851,7 +989,7 @@ class ConsoleDisplay:
             show_hook_indicator=show_hook_indicator,
         )
 
-        display_model = format_model_display(model)
+        display_model = resolve_model_display_name(model)
         right_info = f"[dim]{display_model}[/dim]" if display_model else ""
 
         # Determine renderer based on streaming mode
@@ -866,6 +1004,7 @@ class ConsoleDisplay:
             header_left=left,
             header_right=right_info,
             tool_header_name=name,
+            tool_metadata_resolver=tool_metadata_resolver,
             progress_display=progress_display,
         )
         try:
@@ -948,6 +1087,8 @@ class ConsoleDisplay:
             return
 
         from urllib.parse import urlparse
+
+        console.configure_console_stream("stdout")
 
         # Extract domain for security display
         parsed = urlparse(url)
@@ -1186,7 +1327,7 @@ class ConsoleDisplay:
             # Get model name
             model = "unknown"
             if agent.llm:
-                model = format_model_display(agent.llm.model_name) or "unknown"
+                model = resolve_llm_display_name(agent.llm) or "unknown"
 
             # Get usage information
             tokens = 0

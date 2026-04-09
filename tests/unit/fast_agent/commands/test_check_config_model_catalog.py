@@ -9,6 +9,34 @@ from fast_agent.cli.commands.check_config import (
     show_models_overview,
     show_provider_model_catalog,
 )
+from fast_agent.llm.model_selection import ModelSelectionCatalog
+from fast_agent.llm.provider_types import Provider
+
+OPENAI_FAMILY_PROVIDERS = (
+    Provider.OPENAI,
+    Provider.RESPONSES,
+    Provider.CODEX_RESPONSES,
+)
+
+
+def _collapse(text: str) -> str:
+    return "".join(text.split())
+
+
+def _current_catalog_models(providers: tuple[Provider, ...]) -> set[str]:
+    models: set[str] = set()
+    for provider in providers:
+        models.update(ModelSelectionCatalog.list_current_models(provider))
+    return models
+
+
+def _first_additional_model(providers: tuple[Provider, ...]) -> str:
+    current_models = _current_catalog_models(providers)
+    for provider in providers:
+        for model in ModelSelectionCatalog.list_all_models(provider):
+            if model not in current_models:
+                return model
+    raise AssertionError("expected at least one non-curated model in provider catalog")
 
 
 def test_show_check_summary_points_to_check_models_command(tmp_path: Path, capsys) -> None:
@@ -37,17 +65,25 @@ def test_show_provider_model_catalog_openai_defaults_to_curated_aliases(capsys) 
     show_provider_model_catalog("openai")
 
     output = capsys.readouterr().out
+    collapsed_output = _collapse(output)
     assert "OpenAI model catalog (curated)" in output
     assert "Tags" in output
     assert "fast" in output
     assert "OpenAI" in output
     assert "Responses" in output
     assert "Codex Responses" in output
-    assert "gpt-4.1-mini" in output
-    assert "openai.gpt-4.1-mini" in output
-    assert "gpt-5-mini" in output
-    assert "responses.gpt-5-mini" in output
-    assert "codexspark" in output
+    assert "All known models" not in output
+
+    for provider in OPENAI_FAMILY_PROVIDERS:
+        current_entry = ModelSelectionCatalog.list_current_entries(provider)[0]
+        fast_entry = next(
+            entry for entry in ModelSelectionCatalog.list_current_entries(provider) if entry.fast
+        )
+        assert current_entry.alias in output
+        assert _collapse(current_entry.model) in collapsed_output
+        assert fast_entry.alias in output
+        assert _collapse(fast_entry.model) in collapsed_output
+
     assert "More models are available" in output
 
 
@@ -55,12 +91,13 @@ def test_show_provider_model_catalog_openai_all_includes_openai_family(capsys) -
     show_provider_model_catalog("openai", show_all=True)
 
     output = capsys.readouterr().out
+    collapsed_output = _collapse(output)
+    additional_model = _first_additional_model(OPENAI_FAMILY_PROVIDERS)
+
     assert "OpenAI model catalog (curated + all models)" in output
     assert "All known models" in output
     assert "catalog" in output
-    assert "gpt-4.1" in output
-    assert "o1" in output
-    assert "gpt-5.3-codex-spark" in output
+    assert _collapse(additional_model) in collapsed_output
 
 
 def test_show_models_overview_includes_provider_args_and_named_aliases(
@@ -73,7 +110,7 @@ def test_show_models_overview_includes_provider_args_and_named_aliases(
     config_path.write_text(
         "\n".join(
             [
-                "model_aliases:",
+                "model_references:",
                 "  system:",
                 "    fast: responses.gpt-5-mini?reasoning=low",
             ]
@@ -104,7 +141,7 @@ def test_show_models_overview_uses_default_env_config_aliases(tmp_path: Path, ca
     (env_dir / "fastagent.config.yaml").write_text(
         "\n".join(
             [
-                "model_aliases:",
+                "model_references:",
                 "  system:",
                 "    envfast: responses.gpt-5-mini?reasoning=low",
             ]
@@ -129,12 +166,49 @@ def test_show_models_overview_uses_default_env_config_aliases(tmp_path: Path, ca
     assert "$system.envfast" in output
 
 
+def test_show_provider_model_catalog_scopes_overlays_to_requested_env(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_dir = tmp_path / "project-env"
+    ambient_env_dir = tmp_path / "ambient-env"
+    (env_dir / "model-overlays").mkdir(parents=True)
+    (ambient_env_dir / "model-overlays").mkdir(parents=True)
+    (env_dir / "model-overlays" / "projectoverlay.yaml").write_text(
+        "name: projectoverlay\nprovider: responses\nmodel: overlay-tests/project\n",
+        encoding="utf-8",
+    )
+    (ambient_env_dir / "model-overlays" / "ambientoverlay.yaml").write_text(
+        "name: ambientoverlay\nprovider: responses\nmodel: overlay-tests/ambient\n",
+        encoding="utf-8",
+    )
+
+    cwd = Path.cwd()
+    previous_env_dir = os.environ.get("ENVIRONMENT_DIR")
+    try:
+        os.environ["ENVIRONMENT_DIR"] = str(ambient_env_dir)
+        os.chdir(tmp_path)
+        show_provider_model_catalog("responses", env_dir=env_dir)
+    finally:
+        os.chdir(cwd)
+        if previous_env_dir is None:
+            os.environ.pop("ENVIRONMENT_DIR", None)
+        else:
+            os.environ["ENVIRONMENT_DIR"] = previous_env_dir
+
+    output = capsys.readouterr().out
+    assert "projectoverlay" in output
+    assert "responses.overlay-tests/project" in output
+    assert "ambientoverlay" not in output
+    assert "responses.overlay-tests/ambient" not in output
+
+
 def test_show_provider_model_catalog_rejects_unknown_provider() -> None:
     with pytest.raises(ValueError, match="Unknown provider"):
         show_provider_model_catalog("not-a-provider")
 
 
-def test_show_check_summary_reports_invalid_effective_model_aliases(
+def test_show_check_summary_reports_invalid_effective_model_references(
     tmp_path: Path,
     capsys,
 ) -> None:
@@ -145,7 +219,7 @@ def test_show_check_summary_reports_invalid_effective_model_aliases(
     (env_dir / "fastagent.config.yaml").write_text(
         "\n".join(
             [
-                "model_aliases:",
+                "model_references:",
                 "  system: foo=bar",
             ]
         ),
@@ -161,7 +235,7 @@ def test_show_check_summary_reports_invalid_effective_model_aliases(
 
     output = " ".join(capsys.readouterr().out.split())
     assert "Effective Config Errors" in output
-    assert "model_aliases" in output
+    assert "model_references" in output
     assert "Input should be a valid dictionary" in output
 
 
@@ -176,7 +250,7 @@ def test_show_check_summary_reports_malformed_yaml_as_effective_config_error(
     (env_dir / "fastagent.config.yaml").write_text(
         "\n".join(
             [
-                "model_aliases:",
+                "model_references:",
                 "  system.code=codexplan?transport=ws",
             ]
         ),

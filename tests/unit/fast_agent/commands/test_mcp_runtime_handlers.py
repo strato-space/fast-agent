@@ -7,6 +7,7 @@ from fast_agent.commands.context import CommandContext
 from fast_agent.commands.handlers import mcp_runtime
 from fast_agent.commands.results import CommandMessage
 from fast_agent.config import MCPServerSettings, MCPSettings, Settings
+from fast_agent.mcp.connect_targets import parse_connect_command_text
 from fast_agent.mcp.experimental_session_client import SessionJarEntry
 from fast_agent.mcp.mcp_aggregator import MCPAttachResult, MCPDetachResult
 from fast_agent.mcp.oauth_client import OAuthEvent
@@ -22,6 +23,15 @@ class _IO:
 
     async def prompt_selection(self, prompt: str, *, options, allow_cancel=False, default=None):
         del prompt, options, allow_cancel, default
+        return None
+
+    async def prompt_model_selection(
+        self,
+        *,
+        initial_provider=None,
+        default_model=None,
+    ):
+        del initial_provider, default_model
         return None
 
     async def prompt_argument(self, arg_name: str, *, description=None, required=True):
@@ -41,13 +51,36 @@ class _IO:
         del agent_name, system_prompt, server_count
 
 
+def _request(text: str):
+    return parse_connect_command_text(text)
+
+    async def display_history_overview(self, agent_name, history, usage=None):
+        del agent_name, history, usage
+
+    async def display_usage_report(self, agents):
+        del agents
+
+    async def display_system_prompt(self, agent_name, system_prompt, *, server_count=0):
+        del agent_name, system_prompt, server_count
+
+
 class _Provider:
     def _agent(self, name: str):
         del name
         return object()
 
-    def agent_names(self):
+    def resolve_target_agent_name(self, agent_name: str | None = None):
+        return agent_name or "main"
+
+    def visible_agent_names(self, *, force_include: str | None = None):
+        del force_include
         return ["main"]
+
+    def registered_agent_names(self):
+        return ["main"]
+
+    def registered_agents(self):
+        return {"main": object()}
 
     async def list_prompts(self, namespace: str | None, agent_name: str | None = None):
         del namespace, agent_name
@@ -498,6 +531,16 @@ class _OAuthRegistration404Manager(_Manager):
         )
 
 
+class _StartupTimeoutManager(_Manager):
+    async def attach_mcp_server(self, agent_name, server_name, server_config=None, options=None):
+        del agent_name, server_name, server_config, options
+        raise RuntimeError(
+            "MCP Server: 'desktop-commander': Startup timed out after 10.0s "
+            "(non-OAuth startup budget)\n\n"
+            "Try increasing --timeout or verify server/network startup."
+        )
+
+
 class _Always404Manager(_Manager):
     def __init__(self) -> None:
         super().__init__()
@@ -512,53 +555,57 @@ class _Always404Manager(_Manager):
 
 
 @pytest.mark.parametrize("raw_timeout", ["nan", "inf", "-inf", "0", "-1"])
-def test_parse_connect_input_rejects_non_finite_or_non_positive_timeout(
+def test_parse_connect_request_rejects_non_finite_or_non_positive_timeout(
     raw_timeout: str,
 ) -> None:
     with pytest.raises(ValueError, match="--timeout"):
-        mcp_runtime.parse_connect_input(f"npx demo-server --timeout {raw_timeout}")
+        parse_connect_command_text(f"npx demo-server --timeout {raw_timeout}")
 
 
-def test_parse_connect_input_resolves_auth_env_reference(monkeypatch) -> None:
+def test_runtime_resolves_auth_env_reference(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_TOKEN", "token-from-env")
 
-    parsed = mcp_runtime.parse_connect_input("https://example.com/api --auth ${DEMO_TOKEN}")
+    parsed = mcp_runtime._resolve_request_auth(
+        parse_connect_command_text("https://example.com/api --auth ${DEMO_TOKEN}")
+    )
 
-    assert parsed.auth_token == "token-from-env"
+    assert parsed.options.auth_token == "token-from-env"
 
 
-def test_parse_connect_input_resolves_simple_auth_env_reference(monkeypatch) -> None:
+def test_runtime_resolves_simple_auth_env_reference(monkeypatch) -> None:
     monkeypatch.setenv("DEMO_TOKEN", "token-from-env")
 
-    parsed = mcp_runtime.parse_connect_input("https://example.com/api --auth $DEMO_TOKEN")
+    parsed = mcp_runtime._resolve_request_auth(
+        parse_connect_command_text("https://example.com/api --auth $DEMO_TOKEN")
+    )
 
-    assert parsed.auth_token == "token-from-env"
+    assert parsed.options.auth_token == "token-from-env"
 
 
-def test_parse_connect_input_resolves_auth_env_reference_with_default(monkeypatch) -> None:
+def test_runtime_resolves_auth_env_reference_with_default(monkeypatch) -> None:
     monkeypatch.delenv("MISSING_TOKEN", raising=False)
 
-    parsed = mcp_runtime.parse_connect_input(
-        "https://example.com/api --auth ${MISSING_TOKEN:default-token}"
+    parsed = mcp_runtime._resolve_request_auth(
+        parse_connect_command_text("https://example.com/api --auth ${MISSING_TOKEN:default-token}")
     )
 
-    assert parsed.auth_token == "default-token"
+    assert parsed.options.auth_token == "default-token"
 
 
-def test_parse_connect_input_normalizes_bearer_prefix() -> None:
-    parsed = mcp_runtime.parse_connect_input(
-        "https://example.com/api --auth 'Bearer token-from-cli'"
+def test_runtime_normalizes_bearer_prefix() -> None:
+    parsed = mcp_runtime._resolve_request_auth(
+        parse_connect_command_text("https://example.com/api --auth 'Bearer token-from-cli'")
     )
 
-    assert parsed.auth_token == "token-from-cli"
+    assert parsed.options.auth_token == "token-from-cli"
 
 
-def test_parse_connect_input_normalizes_bearer_prefix_before_env_resolution() -> None:
+def test_runtime_normalizes_bearer_prefix_before_env_resolution() -> None:
     original_token = os.environ.get("DEMO_TOKEN")
     os.environ["DEMO_TOKEN"] = "token-from-env"
     try:
-        parsed = mcp_runtime.parse_connect_input(
-            "https://example.com/api --auth 'Bearer $DEMO_TOKEN'"
+        parsed = mcp_runtime._resolve_request_auth(
+            parse_connect_command_text("https://example.com/api --auth 'Bearer $DEMO_TOKEN'")
         )
     finally:
         if original_token is None:
@@ -566,14 +613,16 @@ def test_parse_connect_input_normalizes_bearer_prefix_before_env_resolution() ->
         else:
             os.environ["DEMO_TOKEN"] = original_token
 
-    assert parsed.auth_token == "token-from-env"
+    assert parsed.options.auth_token == "token-from-env"
 
 
-def test_parse_connect_input_rejects_missing_auth_env_reference(monkeypatch) -> None:
+def test_runtime_rejects_missing_auth_env_reference(monkeypatch) -> None:
     monkeypatch.delenv("MISSING_TOKEN", raising=False)
 
     with pytest.raises(ValueError, match="Environment variable 'MISSING_TOKEN' is not set"):
-        mcp_runtime.parse_connect_input("https://example.com/api --auth ${MISSING_TOKEN}")
+        mcp_runtime._resolve_request_auth(
+            parse_connect_command_text("https://example.com/api --auth ${MISSING_TOKEN}")
+        )
 
 
 @pytest.mark.asyncio
@@ -585,7 +634,7 @@ async def test_handle_mcp_connect_and_disconnect() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="npx demo-server --name demo",
+        request=_request("npx demo-server --name demo"),
     )
     connect_text = "\n".join(str(message.text) for message in connect_outcome.messages)
     assert "Connected MCP server" in connect_text
@@ -667,7 +716,7 @@ async def test_handle_mcp_connect_scoped_package_uses_npx_command() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="@modelcontextprotocol/server-everything",
+        request=_request("@modelcontextprotocol/server-everything"),
     )
 
     assert any("Connected MCP server" in str(msg.text) for msg in outcome.messages)
@@ -704,7 +753,7 @@ async def test_handle_mcp_connect_configured_name_uses_existing_registry_entry()
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="docs",
+        request=_request("docs"),
         on_progress=_capture_progress,
     )
 
@@ -726,7 +775,7 @@ async def test_handle_mcp_connect_scoped_package_with_args_infers_server_name() 
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="@modelcontextprotocol/server-filesystem .",
+        request=_request("@modelcontextprotocol/server-filesystem ."),
     )
 
     message_text = "\n".join(str(msg.text) for msg in outcome.messages)
@@ -745,7 +794,7 @@ async def test_handle_mcp_connect_preserves_quoted_target_arguments() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text='demo-server --root "My Folder" --name demo',
+        request=_request('demo-server --root "My Folder" --name demo'),
     )
 
     assert any("Connected MCP server" in str(msg.text) for msg in outcome.messages)
@@ -763,7 +812,7 @@ async def test_handle_mcp_connect_reports_already_attached() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="@modelcontextprotocol/server-filesystem .",
+        request=_request("@modelcontextprotocol/server-filesystem ."),
     )
 
     message_text = "\n".join(str(msg.text) for msg in outcome.messages)
@@ -779,7 +828,7 @@ async def test_handle_mcp_connect_with_reconnect_reports_reconnected() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="@modelcontextprotocol/server-filesystem . --reconnect",
+        request=_request("@modelcontextprotocol/server-filesystem . --reconnect"),
     )
 
     message_text = "\n".join(str(msg.text) for msg in outcome.messages)
@@ -797,7 +846,7 @@ async def test_handle_mcp_connect_url_uses_cli_url_parsing_for_auth_headers() ->
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com/api --auth token123",
+        request=_request("https://example.com/api --auth token123"),
     )
 
     assert any("Connected MCP server" in str(msg.text) for msg in outcome.messages)
@@ -816,7 +865,7 @@ async def test_handle_mcp_connect_url_auto_appends_mcp_suffix() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com/api",
+        request=_request("https://example.com/api"),
     )
 
     assert any("Connected MCP server" in str(msg.text) for msg in outcome.messages)
@@ -833,7 +882,7 @@ async def test_handle_mcp_connect_url_with_query_preserves_explicit_endpoint() -
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com/api?version=1",
+        request=_request("https://example.com/api?version=1"),
     )
 
     assert any(msg.channel == "error" for msg in outcome.messages)
@@ -850,7 +899,7 @@ async def test_handle_mcp_connect_hf_url_adds_hf_auth_from_env(monkeypatch) -> N
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://demo.hf.space",
+        request=_request("https://demo.hf.space"),
     )
 
     assert any("Connected MCP server" in str(msg.text) for msg in outcome.messages)
@@ -873,7 +922,7 @@ async def test_handle_mcp_connect_emits_oauth_progress_and_final_link() -> None:
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="npx demo-server --name demo",
+        request=_request("npx demo-server --name demo"),
         on_progress=_capture_progress,
     )
 
@@ -893,7 +942,7 @@ async def test_handle_mcp_connect_enables_oauth_paste_fallback_without_progress_
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="npx demo-server --name demo",
+        request=_request("npx demo-server --name demo"),
     )
 
     assert manager.last_options is not None
@@ -914,7 +963,7 @@ async def test_handle_mcp_connect_oauth_failure_adds_noninteractive_recovery_gui
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com",
+        request=_request("https://example.com"),
         on_progress=_capture_progress,
     )
 
@@ -934,7 +983,7 @@ async def test_handle_mcp_connect_oauth_registration_404_adds_guidance() -> None
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://api.githubcopilot.com/mcp/",
+        request=_request("https://api.githubcopilot.com/mcp/"),
     )
 
     message_text = "\n".join(str(msg.text) for msg in outcome.messages)
@@ -946,6 +995,28 @@ async def test_handle_mcp_connect_oauth_registration_404_adds_guidance() -> None
 
 
 @pytest.mark.asyncio
+async def test_handle_mcp_connect_non_oauth_timeout_does_not_add_oauth_guidance() -> None:
+    manager = _StartupTimeoutManager()
+    ctx = CommandContext(agent_provider=_Provider(), current_agent_name="main", io=_IO())
+
+    async def _capture_progress(_message: str) -> None:
+        return None
+
+    outcome = await mcp_runtime.handle_mcp_connect(
+        ctx,
+        manager=cast("mcp_runtime.McpRuntimeManager", manager),
+        agent_name="main",
+        request=_request("@wonderwhy-er/desktop-commander@latest"),
+        on_progress=_capture_progress,
+    )
+
+    message_text = "\n".join(str(msg.text) for msg in outcome.messages)
+    assert "Failed to connect MCP server" in message_text
+    assert "fast-agent auth login" not in message_text
+    assert "OAuth could not be completed in this connection mode" not in message_text
+
+
+@pytest.mark.asyncio
 async def test_handle_mcp_connect_defaults_url_oauth_timeout_to_30_seconds() -> None:
     manager = _Manager()
     ctx = CommandContext(agent_provider=_Provider(), current_agent_name="main", io=_IO())
@@ -954,7 +1025,7 @@ async def test_handle_mcp_connect_defaults_url_oauth_timeout_to_30_seconds() -> 
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com",
+        request=_request("https://example.com"),
     )
 
     assert manager.last_options is not None
@@ -970,7 +1041,7 @@ async def test_handle_mcp_connect_defaults_url_no_oauth_timeout_to_10_seconds() 
         ctx,
         manager=cast("mcp_runtime.McpRuntimeManager", manager),
         agent_name="main",
-        target_text="https://example.com --no-oauth",
+        request=_request("https://example.com --no-oauth"),
     )
 
     assert manager.last_options is not None

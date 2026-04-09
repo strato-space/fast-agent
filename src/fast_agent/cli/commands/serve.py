@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 class ServeTransport(str, Enum):
     HTTP = "http"
-    SSE = "sse"
     STDIO = "stdio"
     ACP = "acp"
 
@@ -35,6 +34,21 @@ class MissingShellCwdPolicy(str, Enum):
     CREATE = "create"
     WARN = "warn"
     ERROR = "error"
+
+
+def _resolve_instance_scope(
+    ctx: typer.Context,
+    *,
+    transport: ServeTransport,
+    instance_scope: InstanceScope,
+) -> InstanceScope:
+    """Apply transport-specific defaults without overriding explicit flags."""
+    parameter_source = ctx.get_parameter_source("instance_scope")
+    if transport == ServeTransport.ACP and (
+        parameter_source is None or parameter_source.name == "DEFAULT"
+    ):
+        return InstanceScope.CONNECTION
+    return instance_scope
 
 
 def _build_run_request(
@@ -148,17 +162,17 @@ def serve(
     transport: ServeTransport = typer.Option(
         ServeTransport.HTTP,
         "--transport",
-        help="Transport protocol to expose (http, sse, stdio, acp)",
+        help="Transport protocol to expose (http, stdio, acp)",
     ),
     host: str = typer.Option(
         "0.0.0.0",
         "--host",
-        help="Host address to bind when using HTTP or SSE transport",
+        help="Host address to bind when using HTTP transport",
     ),
     port: int = typer.Option(
         8000,
         "--port",
-        help="Port to use when running as a server with HTTP or SSE transport",
+        help="Port to use when running as a server with HTTP transport",
     ),
     shell: bool = CommonAgentOptions.shell(),
     instance_scope: InstanceScope = typer.Option(
@@ -205,7 +219,11 @@ def serve(
         host=host,
         port=port,
         shell=shell,
-        instance_scope=instance_scope,
+        instance_scope=_resolve_instance_scope(
+            ctx,
+            transport=transport,
+            instance_scope=instance_scope,
+        ),
         no_permissions=no_permissions,
         reload=reload,
         watch=watch,

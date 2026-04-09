@@ -7,10 +7,65 @@
 <a href="https://github.com/evalstate/fast-agent-mcp/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/fast-agent-mcp" /></a>
 </p>
 
-## Overview
+## Start Here
 
 > [!TIP]
-> Please see : https://fast-agent.ai for latest documentation. There is also an LLMs.txt [here](https://fast-agent.ai/llms.txt)
+> Please see https://fast-agent.ai for latest documentation.
+
+**`fast-agent`** is a flexible way to interact with LLMs, excellent for use as a Coding Agent, Development Toolkit, Evaluation or Workflow platform.
+
+To start an interactive session with shell support, install [uv](https://astral.sh/uv) and run
+
+```bash
+uvx fast-agent-mcp@latest -x
+```
+
+To start coding with Hugging Face inference providers or use your OpenAI Codex plan:
+
+```bash
+# Code with Hugging Face Inference Providers
+uvx fast-agent-mcp@latest --pack hf-dev
+
+# Code with Codex (agents optimized for OpenAI)
+uvx fast-agent-mcp@latest --pack codex
+```
+
+Enter a shell with `!`, or run shell commands e.g. `! cd web && npm run build`.
+
+Manage skills with the `/skills` command, and connect to MCP Servers with `/connect`. The default **`fast-agent`** registry contains skills to let you set up LSP, Agent and Tool Hooks, Compaction strategies, Automation and more.
+
+```bash
+# /connect supports stdio or streamable http (with OAuth)
+
+# Start a STDIO server
+/connect @modelcontextprotocol/server-everything
+
+# Connect to a Streamable HTTP Server
+/connect https://huggingface.co/mcp
+```
+
+It's recommended to install **`fast-agent`** to set up the shell aliases and other tooling.
+
+```bash
+# Install fast-agent
+uv tool install -U fast-agent-mcp
+
+# Run fast-agent with opus, shell support and subagent/smart mode
+fast-agent --model opus -x --smart
+```
+
+Use local models with the generic provider, or automatically create the correct configuration for `llama.cpp`:
+
+```bash
+fast-agent model llamacpp
+```
+
+Any **`fast-agent`** setup or program can be used with any ACP client - the simplest way is to use `fast-agent-acp`:
+
+```bash
+# Run fast-agent inside Toad
+toad acp "fast-agent-acp -x --model sonnet"
+```
 
 **`fast-agent`** enables you to create and interact with sophisticated multimodal Agents and Workflows in minutes. It is the first framework with complete, end-to-end tested MCP Feature support including Sampling and Elicitations.
 
@@ -23,32 +78,32 @@ The simple declarative syntax lets you concentrate on composing your Prompts and
 Model support is comprehensive with native support for Anthropic, OpenAI and Google providers as well as Azure, Ollama, Deepseek and dozens of others via TensorZero. Structured Outputs, PDF and Vision support is simple to use and well tested. Passthrough and Playback LLMs enable rapid development and test of Python glue-code for your applications.
 
 Recent features include:
- - Agent Skills (SKILL.md)
- - MCP-UI Support |
- - OpenAI Apps SDK (Skybridge)
- - Shell Mode
- - Advanced MCP Transport Diagnsotics
- - MCP Elicitations
+
+- Agent Skills (SKILL.md)
+- MCP-UI Support |
+- OpenAI Apps SDK (Skybridge)
+- Shell Mode
+- Advanced MCP Transport Diagnsotics
+- MCP Elicitations
 
 <img width="800"  alt="MCP Transport Diagnostics" src="https://github.com/user-attachments/assets/e26472de-58d9-4726-8bdd-01eb407414cf" />
 
-
 `fast-agent` is the only tool that allows you to inspect Streamable HTTP Transport usage - a critical feature for ensuring reliable, compliant deployments. OAuth is supported with KeyRing storage for secrets. Use the `fast-agent auth` command to manage.
-
-
-
-
 
 > [!IMPORTANT]
 >
 > Documentation is included as a submodule. When cloning, use `--recurse-submodules` to get everything:
+>
 > ```bash
 > git clone --recurse-submodules https://github.com/evalstate/fast-agent.git
 > ```
+>
 > Or if you've already cloned:
+>
 > ```bash
 > git submodule update --init --recursive
 > ```
+>
 > The documentation source is also available at: https://github.com/evalstate/fast-agent-docs
 
 ### Agent Application Development
@@ -70,14 +125,20 @@ uv pip install fast-agent-mcp          # install fast-agent!
 fast-agent go                          # start an interactive session
 fast-agent go --url https://hf.co/mcp  # with a remote MCP
 fast-agent go --model=generic.qwen2.5  # use ollama qwen 2.5
+fast-agent go --pack analyst --model haiku  # install/reuse a card pack and launch it
 fast-agent scaffold                    # create an example agent and config files
 uv run agent.py                        # run your first agent
-uv run agent.py --model=o3-mini.low    # specify a model
+uv run agent.py --model='o3-mini?reasoning=low'    # specify a model
 uv run agent.py --transport http --port 8001  # expose as MCP server (server mode implied)
 fast-agent quickstart workflow  # create "building effective agents" examples
 ```
 
 `--server` remains available for backward compatibility but is deprecated; `--transport` now automatically switches an agent into server mode.
+
+For packaged starter agents, use `fast-agent go --pack <name> --model <model>`.
+This installs the pack into the selected fast-agent environment if needed, then
+starts `go` normally. `--model` is a fallback for cards without an explicit
+model setting; a model declared directly in an AgentCard still wins.
 
 Other quickstart examples include a Researcher Agent (with Evaluator-Optimizer workflow) and Data Analysis Agent (similar to the ChatGPT experience), demonstrating MCP Roots support.
 
@@ -132,6 +193,17 @@ if __name__ == "__main__":
 The Agent can then be run with `uv run sizer.py`.
 
 Specify a model with the `--model` switch - for example `uv run sizer.py --model sonnet`.
+
+Model strings also accept query overrides. For example:
+
+- `uv run sizer.py --model "gpt-5?reasoning=low"`
+- `uv run sizer.py --model "claude-sonnet-4-6?web_search=on"`
+- `uv run sizer.py --model "claude-sonnet-4-5?context=1m"`
+
+For Anthropic models, `?context=1m` is only needed for earlier Sonnet 4 / Sonnet 4.5
+models that still require the explicit 1M context opt-in. Claude Sonnet 4.6 and
+Claude Opus 4.6 already use their long context window by default, so `?context=1m`
+is accepted for backward compatibility but is unnecessary there.
 
 ### Combining Agents and using MCP Servers
 
@@ -434,7 +506,7 @@ agent["greeter"].send("Good Evening!")          # Dictionary access is supported
   name="agent",                          # name of the agent
   instruction="You are a helpful Agent", # base instruction for the agent
   servers=["filesystem"],                # list of MCP Servers for the agent
-  model="o3-mini.high",                  # specify a model for the agent
+  model="o3-mini?reasoning=high",        # specify a model for the agent
   use_history=True,                      # agent maintains chat history
   request_params=RequestParams(temperature= 0.7), # additional parameters for the LLM (or RequestParams())
   human_input=True,                      # agent can request human input
@@ -483,7 +555,7 @@ agent["greeter"].send("Good Evening!")          # Dictionary access is supported
 @fast.router(
   name="route",                          # name of the router
   agents=["agent1", "agent2", "agent3"], # list of agent names router can delegate to
-  model="o3-mini.high",                  # specify routing model
+  model="o3-mini?reasoning=high",        # specify routing model
   use_history=False,                     # router maintains conversation history
   human_input=False,                     # whether router can request human input
 )
@@ -496,7 +568,7 @@ agent["greeter"].send("Good Evening!")          # Dictionary access is supported
   name="orchestrator",                   # name of the orchestrator
   instruction="instruction",             # base instruction for the orchestrator
   agents=["agent1", "agent2"],           # list of agent names this orchestrator can use
-  model="o3-mini.high",                  # specify orchestrator planning model
+  model="o3-mini?reasoning=high",        # specify orchestrator planning model
   use_history=False,                     # orchestrator doesn't maintain chat history (no effect).
   human_input=False,                     # whether orchestrator can request human input
   plan_type="full",                      # planning approach: "full" or "iterative"
@@ -530,6 +602,40 @@ agent["greeter"].send("Good Evening!")          # Dictionary access is supported
   max_display_instances=20,               # collapse progress display after top-N instances
 )
 ```
+
+### Function Tools
+
+Register Python functions as tools directly in code — no MCP server or external file needed. Both sync and async functions are supported. The function name and docstring are used as the tool name and description by default, or you can override them with `name=` and `description=`.
+
+**Per-agent tools (`@agent.tool`)** — scope a tool to a specific agent:
+
+```python
+@fast.agent(name="writer", instruction="You write things.")
+async def writer(): ...
+
+@writer.tool
+def translate(text: str, language: str) -> str:
+    """Translate text to the given language."""
+    return f"[{language}] {text}"
+
+@writer.tool(name="summarize", description="Produce a one-line summary")
+def summarize(text: str) -> str:
+    return f"Summary: {text[:80]}..."
+```
+
+**Global tools (`@fast.tool`)** — available to all agents that don't declare their own tools:
+
+```python
+@fast.tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"Sunny in {city}"
+
+@fast.agent(name="assistant", instruction="You are helpful.")
+# assistant gets get_weather (global @fast.tool)
+```
+
+Agents with `@agent.tool` or `function_tools=` only see their own tools — globals are not injected. Use `function_tools=[]` to explicitly opt out of globals with no tools.
 
 ### Multimodal Support
 

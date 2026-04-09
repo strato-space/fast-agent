@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 from mcp import Tool
 from mcp.types import (
     CallToolRequest,
@@ -29,7 +30,6 @@ from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt import Prompt
 from fast_agent.event_progress import ProgressAction
 from fast_agent.llm.fastagent_llm import FastAgentLLM, RequestParams
-from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider.error_utils import build_stream_failure_response
 from fast_agent.llm.provider.openai._stream_capture import (
     save_stream_chunk as _save_stream_chunk,
@@ -41,17 +41,21 @@ from fast_agent.llm.provider.openai._stream_capture import (
     stream_capture_filename as _stream_capture_filename,
 )
 from fast_agent.llm.provider.openai.multipart_converter_openai import OpenAIConverter
+from fast_agent.llm.provider.openai.responses_files import ResponsesFileMixin
 from fast_agent.llm.provider.openai.schema_sanitizer import (
     sanitize_tool_input_schema,
     should_strip_tool_schema_defaults,
 )
+from fast_agent.llm.provider.openai.streaming_utils import with_stream_idle_timeout
 from fast_agent.llm.provider.openai.tool_notifications import OpenAIToolNotificationMixin
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import format_reasoning_setting, parse_reasoning_setting
 from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.usage_tracking import TurnUsage
 from fast_agent.mcp.helpers.content_helpers import get_text
+from fast_agent.mcp.mime_utils import guess_mime_type
 from fast_agent.types import LlmStopReason, PromptMessageExtended
+from fast_agent.utils.reasoning_chunk_join import normalize_reasoning_delta
 
 _logger = get_logger(__name__)
 
@@ -59,11 +63,15 @@ _logger = get_logger(__name__)
 class EmptyStreamError(RuntimeError):
     """Raised when a streaming response yields no chunks."""
 
+
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_REASONING_EFFORT = "low"
 
+
 class OpenAILLM(
-    OpenAIToolNotificationMixin, FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage]
+    OpenAIToolNotificationMixin,
+    ResponsesFileMixin,
+    FastAgentLLM[ChatCompletionMessageParam, ChatCompletionMessage],
 ):
     # Config section name override (falls back to provider value)
     config_section: str | None = None
@@ -87,6 +95,7 @@ class OpenAILLM(
 
         # Initialize logger with name if available
         self.logger = get_logger(f"{__name__}.{self.name}" if self.name else __name__)
+        self._file_id_cache: dict[str, str] = {}
 
         # Set up reasoning-related attributes
         raw_setting = kwargs.get("reasoning_effort", None)
@@ -115,13 +124,95 @@ class OpenAILLM(
 
         # Determine reasoning mode for the selected model
         chosen_model = self.default_request_params.model if self.default_request_params else None
-        self._reasoning_mode = ModelDatabase.get_reasoning(chosen_model) if chosen_model else None
+        self._reasoning_mode = self._get_model_reasoning(chosen_model)
         self._reasoning = self._reasoning_mode == "openai"
         if self._reasoning_mode:
             self.logger.info(
                 f"Using reasoning model '{chosen_model}' (mode='{self._reasoning_mode}') with "
                 f"'{format_reasoning_setting(self.reasoning_effort)}' reasoning effort"
             )
+
+    async def _download_remote_file(
+        self,
+        file_url: str,
+    ) -> tuple[bytes | None, str | None]:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                response = await client.get(file_url)
+                response.raise_for_status()
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to download remote attachment for OpenAI chat completions",
+                data={"url": file_url, "error": str(exc)},
+            )
+            return None, None
+
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip() or None
+        return response.content, content_type
+
+    async def _normalize_chat_completion_files(
+        self,
+        client: AsyncOpenAI,
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        normalized: list[ChatCompletionMessageParam] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                normalized.append(message)
+                continue
+
+            updated_content: list[Any] = []
+            changed = False
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "file":
+                    updated_content.append(part)
+                    continue
+
+                file_obj = part.get("file")
+                if not isinstance(file_obj, dict):
+                    updated_content.append(part)
+                    continue
+
+                file_url = file_obj.get("file_url")
+                if not isinstance(file_url, str) or not file_url:
+                    updated_content.append(part)
+                    continue
+
+                filename = file_obj.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    filename = None
+
+                data_bytes: bytes | None = None
+                mime_type: str | None = None
+                if file_url.startswith("data:"):
+                    data_bytes, mime_type = self._decode_file_data(file_url)
+                elif file_url.startswith("file://"):
+                    local_path = Path(file_url[len("file://") :])
+                    if local_path.exists():
+                        data_bytes = local_path.read_bytes()
+                        filename = filename or local_path.name
+                        mime_type = guess_mime_type(local_path.name)
+                elif file_url.startswith(("http://", "https://")):
+                    data_bytes, mime_type = await self._download_remote_file(file_url)
+
+                if data_bytes is None:
+                    updated_content.append(part)
+                    continue
+
+                mime_type = mime_type or guess_mime_type(filename or file_url)
+                file_id = await self._upload_file_bytes(client, data_bytes, filename, mime_type)
+                updated_content.append({"type": "file", "file": {"file_id": file_id}})
+                changed = True
+
+            if changed:
+                message = cast(
+                    "ChatCompletionMessageParam",
+                    {**message, "content": updated_content},
+                )
+            normalized.append(message)
+
+        return normalized
 
     def _resolve_reasoning_effort(self) -> str | None:
         setting = self.reasoning_effort
@@ -140,12 +231,12 @@ class OpenAILLM(
         """Initialize OpenAI-specific default parameters"""
         return self._initialize_default_params_with_model_fallback(kwargs, DEFAULT_OPENAI_MODEL)
 
-    def _base_url(self) -> str | None:
+    def _provider_base_url(self) -> str | None:
         if self.context.config and self.context.config.openai:
             return self.context.config.openai.base_url
         return None
 
-    def _default_headers(self) -> dict[str, str] | None:
+    def _provider_default_headers(self) -> dict[str, str] | None:
         """
         Get custom headers from configuration.
         Subclasses can override this to provide provider-specific headers.
@@ -235,17 +326,22 @@ class OpenAILLM(
         if not reasoning_text:
             return reasoning_active
 
+        last_char = reasoning_segments[-1][-1] if reasoning_segments and reasoning_segments[-1] else None
+        normalized_text = normalize_reasoning_delta(last_char, reasoning_text)
+        if not normalized_text:
+            return reasoning_active
+
         if reasoning_mode == "tags":
             if not reasoning_active:
                 reasoning_active = True
-            self._notify_stream_listeners(StreamChunk(text=reasoning_text, is_reasoning=True))
-            reasoning_segments.append(reasoning_text)
+            self._notify_stream_listeners(StreamChunk(text=normalized_text, is_reasoning=True))
+            reasoning_segments.append(normalized_text)
             return reasoning_active
 
         if reasoning_mode in {"stream", "reasoning_content", "gpt_oss"}:
             # Emit reasoning as-is
-            self._notify_stream_listeners(StreamChunk(text=reasoning_text, is_reasoning=True))
-            reasoning_segments.append(reasoning_text)
+            self._notify_stream_listeners(StreamChunk(text=normalized_text, is_reasoning=True))
+            reasoning_segments.append(normalized_text)
             return reasoning_active
 
         return reasoning_active
@@ -510,10 +606,10 @@ class OpenAILLM(
         estimated_tokens = 0
         reasoning_active = False
         reasoning_segments: list[str] = []
-        reasoning_mode = ModelDatabase.get_reasoning(model)
+        reasoning_mode = self._get_model_reasoning(model)
 
         # For providers/models that emit non-OpenAI deltas, fall back to manual accumulation
-        stream_mode = ModelDatabase.get_stream_mode(model)
+        stream_mode = self._get_model_stream_mode(model)
         provider_requires_manual = self.provider in [
             Provider.GENERIC,
             Provider.OPENROUTER,
@@ -661,7 +757,7 @@ class OpenAILLM(
         estimated_tokens = 0
         reasoning_active = False
         reasoning_segments: list[str] = []
-        reasoning_mode = ModelDatabase.get_reasoning(model)
+        reasoning_mode = self._get_model_reasoning(model)
 
         # Manual accumulation of response data
         accumulated_content = ""
@@ -883,66 +979,57 @@ class OpenAILLM(
         if not self._reasoning and request_params.stopSequences:
             arguments["stop"] = request_params.stopSequences
 
-        self.logger.debug(f"OpenAI completion requested for: {arguments}")
-
-        self._log_chat_progress(self.chat_turn(), model=model_name)
-
-        # Generate stream capture filename once (before streaming starts)
-        capture_filename = _stream_capture_filename(self.chat_turn())
-        _save_stream_request(capture_filename, arguments)
-
         # Use basic streaming API with context manager to properly close aiohttp session
         try:
             async with self._openai_client() as client:
+                messages_arg = arguments.get("messages")
+                if isinstance(messages_arg, list):
+                    arguments = dict(arguments)
+                    arguments["messages"] = await self._normalize_chat_completion_files(
+                        client, messages_arg
+                    )
+
+                self.logger.debug(f"OpenAI completion requested for: {arguments}")
+                self._log_chat_progress(self.chat_turn(), model=model_name)
+
+                # Generate stream capture filename once (before streaming starts)
+                capture_filename = _stream_capture_filename(self.chat_turn())
+                _save_stream_request(capture_filename, arguments)
+
                 stream = await client.chat.completions.create(**arguments)
-                # Process the stream
                 timeout = request_params.streaming_timeout
-                if timeout is None:
-                    try:
-                        response, streamed_reasoning = await self._process_stream(
-                            stream, model_name, capture_filename
-                        )
-                    except EmptyStreamError as exc:
-                        self.logger.error(
-                            "OpenAI stream returned no chunks; retrying without streaming",
-                            data={
-                                "model": model_name,
-                                "error": str(exc),
-                            },
-                        )
-                        response = await client.chat.completions.create(
-                            **self._prepare_non_streaming_request(arguments)
-                        )
-                        streamed_reasoning = []
-                else:
-                    try:
-                        response, streamed_reasoning = await asyncio.wait_for(
-                            self._process_stream(stream, model_name, capture_filename),
-                            timeout=timeout,
-                        )
-                    except EmptyStreamError as exc:
-                        self.logger.error(
-                            "OpenAI stream returned no chunks; retrying without streaming",
-                            data={
-                                "model": model_name,
-                                "error": str(exc),
-                            },
-                        )
-                        response = await client.chat.completions.create(
-                            **self._prepare_non_streaming_request(arguments)
-                        )
-                        streamed_reasoning = []
-                    except asyncio.TimeoutError as exc:
-                        self.logger.error(
-                            "Streaming timeout while waiting for OpenAI completion",
-                            data={
-                                "model": model_name,
-                                "timeout_seconds": timeout,
-                            },
-                        )
-                        raise TimeoutError(
-                            f"Streaming did not complete within {timeout} seconds."
-                        ) from exc
+                timed_stream = with_stream_idle_timeout(
+                    stream,
+                    idle_timeout_seconds=timeout,
+                    timeout_message=f"Streaming was idle for more than {timeout} seconds.",
+                )
+                try:
+                    response, streamed_reasoning = await self._process_stream(
+                        timed_stream, model_name, capture_filename
+                    )
+                except EmptyStreamError as exc:
+                    self.logger.error(
+                        "OpenAI stream returned no chunks; retrying without streaming",
+                        data={
+                            "model": model_name,
+                            "error": str(exc),
+                        },
+                    )
+                    response = await client.chat.completions.create(
+                        **self._prepare_non_streaming_request(arguments)
+                    )
+                    streamed_reasoning = []
+                except TimeoutError:
+                    if timeout is None:
+                        raise
+                    self.logger.error(
+                        "Streaming idle timeout while waiting for OpenAI completion",
+                        data={
+                            "model": model_name,
+                            "timeout_seconds": timeout,
+                        },
+                    )
+                    raise
         except asyncio.CancelledError as e:
             reason = str(e) if e.args else "cancelled"
             self.logger.info(f"OpenAI completion cancelled: {reason}")
@@ -1086,7 +1173,9 @@ class OpenAILLM(
             return last_message
 
         # Convert the supplied history/messages directly
-        converted_messages = self._convert_to_provider_format(multipart_messages)
+        converted_messages: list[ChatCompletionMessageParam] = self._convert_to_provider_format(
+            multipart_messages
+        )
         if not converted_messages:
             converted_messages = [ChatCompletionUserMessageParam(role="user", content="")]
 
@@ -1100,7 +1189,7 @@ class OpenAILLM(
     ) -> dict[str, Any]:
         # Create base arguments dictionary
 
-        base_args = {
+        base_args: dict[str, Any] = {
             "model": request_params.model
             or self.default_request_params.model
             or DEFAULT_OPENAI_MODEL,
@@ -1193,7 +1282,7 @@ class OpenAILLM(
         """
         converted: list[ChatCompletionMessageParam] = []
         model = self.default_request_params.model
-        reasoning_mode = ModelDatabase.get_reasoning(model) if model else None
+        reasoning_mode = self._get_model_reasoning(model)
 
         for msg in messages:
             # convert_to_openai returns a list of messages

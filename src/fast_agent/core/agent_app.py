@@ -13,14 +13,14 @@ from rich.markup import escape
 
 from fast_agent.agents.agent_types import AgentType
 from fast_agent.agents.workflow.parallel_agent import ParallelAgent
+from fast_agent.core.default_agent import resolve_default_agent_name
 from fast_agent.core.exceptions import AgentConfigError, ServerConfigError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import AgentProtocol
-from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.usage_tracking import last_turn_usage
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.ui.display_suppression import display_usage_enabled
-from fast_agent.ui.interactive_prompt import InteractivePrompt
+from fast_agent.ui.interactive_prompt import InteractivePrompt, PromptLoopResult
 from fast_agent.ui.progress_display import progress_display
 
 if TYPE_CHECKING:
@@ -117,6 +117,13 @@ class AgentApp:
         """Return the named agent if available, else None."""
         return self._agents.get(name)
 
+    def resolve_target_agent_name(self, agent_name: str | None = None) -> str | None:
+        if agent_name is None:
+            return self.get_default_agent_name()
+        if agent_name not in self._agents:
+            raise ValueError(f"Agent '{agent_name}' not found")
+        return agent_name
+
     def __getattr__(self, name: str) -> AgentProtocol:
         """Allow access to agents using attribute syntax."""
         if name in self._agents:
@@ -129,7 +136,7 @@ class AgentApp:
         agent_name: str | None = None,
         default_prompt: str = "",
         request_params: RequestParams | None = None,
-    ) -> str:
+    ) -> PromptLoopResult:
         """
         Make the object callable to send messages or start interactive prompt.
         This mirrors the FastAgent implementation that allowed agent("message").
@@ -177,24 +184,18 @@ class AgentApp:
         await self._refresh_if_needed()
         return await self._agent(agent_name).send(message, request_params)
 
+    def get_default_agent_name(self) -> str | None:
+        return resolve_default_agent_name(
+            self._agents,
+            is_default=lambda _name, agent: bool(getattr(agent.config, "default", False)),
+            is_tool_only=lambda name, _agent: name in self._tool_only_agents,
+        )
+
     def _agent(self, agent_name: str | None) -> AgentProtocol:
-        if agent_name:
-            if agent_name not in self._agents:
-                raise ValueError(f"Agent '{agent_name}' not found")
-            return self._agents[agent_name]
-
-        # Skip tool_only agents when selecting default
-        for agent in self._agents.values():
-            if agent.config.default and agent.name not in self._tool_only_agents:
-                return agent
-
-        # Fall back to first non-tool_only agent
-        for name, agent in self._agents.items():
-            if name not in self._tool_only_agents:
-                return agent
-
-        # If all agents are tool_only, return the first one anyway
-        return next(iter(self._agents.values()))
+        resolved_agent_name = self.resolve_target_agent_name(agent_name)
+        if resolved_agent_name is None:
+            raise ValueError("No agents provided!")
+        return self._agents[resolved_agent_name]
 
     async def apply_prompt(
         self,
@@ -498,17 +499,30 @@ class AgentApp:
         """Update callback for listing configured detached MCP servers."""
         self._list_configured_detached_mcp_servers_callback = callback
 
-    def agent_names(self) -> list[str]:
-        """Return available agent names (excluding tool_only agents)."""
-        return [name for name in self._agents.keys() if name not in self._tool_only_agents]
+    def visible_agent_names(self, *, force_include: str | None = None) -> list[str]:
+        names = [name for name in self._agents.keys() if name not in self._tool_only_agents]
+        if force_include and force_include in self._agents and force_include not in names:
+            return [force_include, *names]
+        return names
+
+    def visible_agent_types(self, *, force_include: str | None = None) -> dict[str, AgentType]:
+        visible_names = set(self.visible_agent_names(force_include=force_include))
+        return {
+            name: agent.agent_type for name, agent in self._agents.items() if name in visible_names
+        }
+
+    def registered_agents(self) -> Mapping[str, AgentProtocol]:
+        return self._agents
+
+    def registered_agent_names(self) -> list[str]:
+        return list(self._agents.keys())
+
+    def registered_agent_types(self) -> dict[str, AgentType]:
+        return {name: agent.agent_type for name, agent in self._agents.items()}
 
     def can_detach_agent_tools(self) -> bool:
         """Return True if agent tool detachment is available."""
         return self._detach_agent_tools_callback is not None
-
-    def agent_types(self) -> dict[str, AgentType]:
-        """Return mapping of agent names to agent types."""
-        return {name: agent.agent_type for name, agent in self._agents.items()}
 
     async def refresh_if_needed(self) -> bool:
         """Refresh agent instances if the registry has changed."""
@@ -525,7 +539,7 @@ class AgentApp:
         agent_name: str | None = None,
         default_prompt: str = "",
         request_params: RequestParams | None = None,
-    ) -> str:
+    ) -> PromptLoopResult:
         """
         Deprecated - use interactive() instead.
         """
@@ -539,7 +553,7 @@ class AgentApp:
         default_prompt: str = "",
         pretty_print_parallel: bool = False,
         request_params: RequestParams | None = None,
-    ) -> str:
+    ) -> PromptLoopResult:
         """
         Interactive prompt for sending messages with advanced features.
 
@@ -552,36 +566,15 @@ class AgentApp:
         Returns:
             The result of the interactive session
         """
-        # Get the default agent name if none specified
-        if agent_name:
-            # Validate that this agent exists
-            if agent_name not in self._agents:
-                raise ValueError(f"Agent '{agent_name}' not found")
-            target_name = agent_name
-        else:
-            target_name = None
-            for agent in self._agents.values():
-                if agent.config.default:
-                    target_name = agent.name
-                    break
-
-            if not target_name:
-                # Use the first agent's name as default
-                target_name = next(iter(self._agents.keys()))
+        target_name = self.resolve_target_agent_name(agent_name)
+        if target_name is None:
+            raise ValueError("No agents provided!")
 
         # Don't delegate to the agent's own prompt method - use our implementation
         # The agent's prompt method doesn't fully support switching between agents
 
-        # Create agent_types dictionary mapping agent names to their types (excluding tool_only)
-        # but keep an explicitly targeted tool-only agent available for direct testing.
-        available_names = self.agent_names()
-        if agent_name and agent_name in self._agents and agent_name not in available_names:
-            available_names = [agent_name, *available_names]
-
-        visible_names = set(available_names)
-        agent_types = {
-            name: agent.agent_type for name, agent in self._agents.items() if name in visible_names
-        }
+        available_names = self.visible_agent_names(force_include=agent_name)
+        agent_types = self.visible_agent_types(force_include=agent_name)
 
         # Create the interactive prompt
         prompt = InteractivePrompt(agent_types=agent_types)
@@ -791,9 +784,9 @@ class AgentApp:
         # Build cache expiry time if cache is active
         cache_expiry_text = ""
         if cache_indicators and agent.usage_accumulator.last_cache_activity_time:
-            model = agent.usage_accumulator.model
-            # Get cache TTL: prefer config setting, fall back to model database
-            cache_ttl = ModelDatabase.get_cache_ttl(model) if model else None
+            llm = getattr(agent, "llm", None)
+            resolved_model = getattr(llm, "resolved_model", None)
+            cache_ttl = getattr(resolved_model, "cache_ttl", None)
             if cache_ttl:
                 # Override with config setting for Anthropic models
                 context = getattr(agent, "context", None)

@@ -11,6 +11,7 @@ from collections import OrderedDict
 from hashlib import blake2b
 from typing import TYPE_CHECKING
 
+from fast_agent.ui.markdown_renderables import build_markdown_renderable
 from fast_agent.ui.streaming_buffer import StreamBuffer
 
 if TYPE_CHECKING:
@@ -76,11 +77,14 @@ class MarkdownTruncator:
             self._height_cache.move_to_end(cache_key)
             return cached
         try:
-            from rich.markdown import Markdown
-
             options = console.options.update(width=width)
             lines = console.render_lines(
-                Markdown(text, code_theme=code_theme),
+                build_markdown_renderable(
+                    text,
+                    code_theme=code_theme,
+                    escape_xml=False,
+                    close_incomplete_fences=True,
+                ),
                 options=options,
                 pad=False,
             )
@@ -92,6 +96,14 @@ class MarkdownTruncator:
         if len(self._height_cache) > self._height_cache_limit:
             self._height_cache.popitem(last=False)
         return height
+
+    def estimate_rendered_height(self, text: str, terminal_width: int) -> int:
+        """Cheap width-based estimate for markdown display height."""
+        if not text:
+            return 0
+        if terminal_width <= 0:
+            return len(text.split("\n"))
+        return self._buffer.estimate_display_lines(text, terminal_width)
 
     def truncate_to_height(
         self,

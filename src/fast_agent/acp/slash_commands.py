@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Awaitable,
@@ -39,13 +40,12 @@ from fast_agent.acp.slash.handlers import commands as commands_slash_handlers
 from fast_agent.acp.slash.handlers import history as history_slash_handlers
 from fast_agent.acp.slash.handlers import mcp as mcp_slash_handlers
 from fast_agent.acp.slash.handlers import model as model_slash_handlers
-from fast_agent.acp.slash.handlers import models_manager as models_manager_slash_handlers
 from fast_agent.acp.slash.handlers import session as session_slash_handlers
 from fast_agent.acp.slash.handlers import skills as skills_slash_handlers
 from fast_agent.acp.slash.handlers import status as status_slash_handlers
 from fast_agent.acp.slash.handlers import tools as tools_slash_handlers
 from fast_agent.commands.command_catalog import command_action_names
-from fast_agent.commands.context import CommandContext
+from fast_agent.commands.context import CommandContext, StaticAgentProvider
 from fast_agent.commands.handlers import model as model_handlers
 from fast_agent.commands.protocols import ACPCommandAllowlistProvider
 from fast_agent.commands.renderers.command_markdown import render_command_outcome_markdown
@@ -55,28 +55,12 @@ from fast_agent.history.history_exporter import HistoryExporter
 from fast_agent.interfaces import ACPAwareProtocol, AgentProtocol
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from fast_agent.acp.acp_context import ACPContext
     from fast_agent.commands.context import AgentProvider
     from fast_agent.commands.results import CommandOutcome
     from fast_agent.config import MCPServerSettings
     from fast_agent.core.fastagent import AgentInstance
     from fast_agent.mcp.mcp_aggregator import MCPAttachOptions
-
-
-class _SimpleAgentProvider:
-    def __init__(self, agents: "Mapping[str, object]") -> None:
-        self._agents = agents
-
-    def _agent(self, name: str):
-        return self._agents[name]
-
-    def agent_names(self) -> Iterable[str]:
-        return list(self._agents.keys())
-
-    async def list_prompts(self, namespace: str | None, agent_name: str | None = None) -> object:
-        return {}
 
 
 class _ACPAgentCardManager:
@@ -141,7 +125,7 @@ class _ACPAgentCardManager:
             return False
         return await self._handler._reload_callback()
 
-    def agent_names(self) -> Iterable[str]:
+    def registered_agent_names(self) -> Iterable[str]:
         return list(self._handler.instance.agents.keys())
 
 
@@ -233,8 +217,6 @@ class SlashCommandHandler:
         cards_action_hint = "|".join(
             action for action in command_action_names("cards") if action != "list"
         ) or "add|remove|update|publish|registry"
-        models_action_hint = "|".join(command_action_names("models")) or "doctor|aliases|catalog"
-        models_catalog_hint = models_action_hint.replace("catalog", "catalog <provider> [--all]")
 
         # Session-level commands (always available, operate on current agent)
         self._session_commands: dict[str, AvailableCommand] = {
@@ -285,22 +267,12 @@ class SlashCommandHandler:
             ),
             "model": AvailableCommand(
                 name="model",
-                description="Update model settings",
+                description="Inspect, switch, or update model settings",
                 input=AvailableCommandInput(
                     root=UnstructuredCommandInput(
                         hint=(
-                            "reasoning <value> | verbosity <value> | fast <on|off|status|flex when supported> | "
-                            "web_search <on|off|default> | web_fetch <on|off|default>"
+                            self._model_command_hint()
                         )
-                    )
-                ),
-            ),
-            "models": AvailableCommand(
-                name="models",
-                description="Inspect model onboarding state (doctor/aliases/catalog)",
-                input=AvailableCommandInput(
-                    root=UnstructuredCommandInput(
-                        hint=f"[{models_catalog_hint}]"
                     )
                 ),
             ),
@@ -308,7 +280,7 @@ class SlashCommandHandler:
                 name="history",
                 description="Show or manage conversation history",
                 input=AvailableCommandInput(
-                    root=UnstructuredCommandInput(hint="[show|save|load] [args]")
+                    root=UnstructuredCommandInput(hint="[show|detail <turn>|save|load] [args]")
                 ),
             ),
             "clear": AvailableCommand(
@@ -424,6 +396,14 @@ class SlashCommandHandler:
             options.append("web_search <on|off|default>")
         if model_handlers.model_supports_web_fetch(llm):
             options.append("web_fetch <on|off|default>")
+        options.extend(
+            [
+                "switch [<model>]",
+                "doctor",
+                "references [list|set|unset]",
+                "catalog <provider> [--all]",
+            ]
+        )
         return " | ".join(options)
 
     def _model_usage_text(self) -> str:
@@ -529,13 +509,30 @@ class SlashCommandHandler:
         settings = get_settings()
         provider = getattr(self.instance, "app", None)
         if provider is None:
-            provider = _SimpleAgentProvider(self.instance.agents)
+            provider = StaticAgentProvider(self.instance.agents)
+        raw_session_cwd = getattr(self._acp_context, "session_cwd", None)
+        raw_session_store_cwd = getattr(self._acp_context, "session_store_cwd", None)
         return CommandContext(
             agent_provider=cast("AgentProvider", provider),
             current_agent_name=self.current_agent_name,
             io=ACPCommandIO(),
             settings=settings,
             noenv=self._noenv,
+            session_cwd=(
+                Path(str(raw_session_cwd)).expanduser().resolve()
+                if raw_session_cwd
+                else None
+            ),
+            session_store_scope=getattr(
+                self._acp_context,
+                "session_store_scope",
+                "workspace",
+            ),
+            session_store_cwd=(
+                Path(str(raw_session_store_cwd)).expanduser().resolve()
+                if raw_session_store_cwd
+                else None
+            ),
         )
 
     def _format_outcome_as_markdown(
@@ -559,8 +556,26 @@ class SlashCommandHandler:
             return
         from fast_agent.session import extract_session_title, get_session_manager
 
-        manager = get_session_manager()
+        raw_session_store_scope = getattr(
+            self._acp_context,
+            "session_store_scope",
+            "workspace",
+        )
+        raw_session_store_cwd = getattr(self._acp_context, "session_store_cwd", None)
+        raw_session_cwd = getattr(self._acp_context, "session_cwd", None)
+        if raw_session_store_scope == "app":
+            manager = get_session_manager()
+        elif raw_session_store_cwd:
+            manager = get_session_manager(
+                cwd=Path(str(raw_session_store_cwd)).expanduser().resolve()
+            )
+        elif raw_session_cwd:
+            manager = get_session_manager(cwd=Path(str(raw_session_cwd)).expanduser().resolve())
+        else:
+            manager = get_session_manager()
         session = manager.current_session
+        if session is None or session.info.name != self.session_id:
+            session = manager.get_session(self.session_id)
         if session is None:
             return
 
@@ -656,9 +671,6 @@ class SlashCommandHandler:
 
     async def _handle_model(self, arguments: str | None = None) -> str:
         return await model_slash_handlers.handle_model(self, arguments)
-
-    async def _handle_models(self, arguments: str | None = None) -> str:
-        return await models_manager_slash_handlers.handle_models(self, arguments)
 
     async def _handle_session(self, arguments: str | None = None) -> str:
         return await session_slash_handlers.handle_session(self, arguments)

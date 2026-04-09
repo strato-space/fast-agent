@@ -5,10 +5,14 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from fast_agent.commands.results import CommandMessage
+from fast_agent.config import Settings
 from fast_agent.ui.adapters.tui_io import TuiCommandIO
 from fast_agent.ui.message_primitives import MessageType
+from fast_agent.ui.model_picker import ModelPickerResult
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from rich.text import Text
 
     from fast_agent.commands.context import AgentProvider
@@ -38,8 +42,18 @@ class _FakeProvider:
     def _agent(self, agent_name: str) -> object:  # noqa: ARG002
         return _FakeAgent(self._display)
 
-    def agent_names(self) -> list[str]:
+    def visible_agent_names(self, *, force_include: str | None = None) -> list[str]:
+        del force_include
         return ["alpha"]
+
+    def registered_agent_names(self) -> list[str]:
+        return ["alpha"]
+
+    def registered_agents(self) -> dict[str, object]:
+        return {"alpha": _FakeAgent(self._display)}
+
+    def resolve_target_agent_name(self, agent_name: str | None = None) -> str | None:
+        return agent_name or "alpha"
 
     async def list_prompts(self, namespace: str | None, agent_name: str | None = None) -> object:  # noqa: ARG002
         return {}
@@ -71,3 +85,139 @@ async def test_emit_render_markdown_uses_assistant_renderer() -> None:
     assert display_call["right_info"] == "session"
     assert display_call["truncate_content"] is False
     assert display_call["render_markdown"] is True
+
+
+@pytest.mark.asyncio
+async def test_prompt_model_selection_normalizes_generic_custom_model(monkeypatch) -> None:
+    display = _FakeDisplay()
+    provider = cast("AgentProvider", _FakeProvider(display))
+    io = TuiCommandIO(prompt_provider=provider, agent_name="alpha")
+
+    picker_result = ModelPickerResult(
+        provider="generic",
+        provider_available=True,
+        selected_model="generic.__custom__",
+        resolved_model=None,
+        source="curated",
+        refer_to_docs=False,
+        activation_action=None,
+    )
+
+    async def fake_run_model_picker_async(**kwargs):
+        del kwargs
+        return picker_result
+
+    async def fake_prompt_text(prompt: str, *, default=None, allow_empty=True):
+        del prompt, default, allow_empty
+        return "llama3.2"
+
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+    monkeypatch.setattr(io, "prompt_text", fake_prompt_text)
+
+    selected = await io.prompt_model_selection(initial_provider="generic")
+
+    assert selected == "generic.llama3.2"
+
+
+@pytest.mark.asyncio
+async def test_prompt_model_selection_preserves_explicit_provider_prefix_for_generic_entry(
+    monkeypatch,
+) -> None:
+    display = _FakeDisplay()
+    provider = cast("AgentProvider", _FakeProvider(display))
+    io = TuiCommandIO(prompt_provider=provider, agent_name="alpha")
+
+    picker_result = ModelPickerResult(
+        provider="generic",
+        provider_available=True,
+        selected_model="generic.__custom__",
+        resolved_model=None,
+        source="curated",
+        refer_to_docs=False,
+        activation_action=None,
+    )
+
+    async def fake_run_model_picker_async(**kwargs):
+        del kwargs
+        return picker_result
+
+    async def fake_prompt_text(prompt: str, *, default=None, allow_empty=True):
+        del prompt, default, allow_empty
+        return "openai/gpt-4.1"
+
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+    monkeypatch.setattr(io, "prompt_text", fake_prompt_text)
+
+    selected = await io.prompt_model_selection(initial_provider="generic")
+
+    assert selected == "openai/gpt-4.1"
+
+
+@pytest.mark.asyncio
+async def test_prompt_model_selection_preserves_overlay_token_when_resolved_model_is_present(
+    monkeypatch,
+) -> None:
+    display = _FakeDisplay()
+    provider = cast("AgentProvider", _FakeProvider(display))
+    io = TuiCommandIO(prompt_provider=provider, agent_name="alpha")
+
+    picker_result = ModelPickerResult(
+        provider="overlays",
+        provider_available=True,
+        selected_model="haikutiny",
+        resolved_model="haikutiny",
+        source="curated",
+        refer_to_docs=False,
+        activation_action=None,
+    )
+
+    async def fake_run_model_picker_async(**kwargs):
+        del kwargs
+        return picker_result
+
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+
+    selected = await io.prompt_model_selection(initial_provider="overlays")
+
+    assert selected == "haikutiny"
+
+
+@pytest.mark.asyncio
+async def test_prompt_model_selection_passes_resolved_start_path(monkeypatch, tmp_path: Path) -> None:
+    display = _FakeDisplay()
+    provider = cast("AgentProvider", _FakeProvider(display))
+    project_root = tmp_path / "project"
+    settings = Settings(environment_dir=str(project_root / ".fast-agent"))
+    io = TuiCommandIO(prompt_provider=provider, agent_name="alpha", settings=settings)
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_run_model_picker_async(**kwargs):
+        captured_kwargs.update(kwargs)
+        return ModelPickerResult(
+            provider="overlays",
+            provider_available=True,
+            selected_model="haikutiny",
+            resolved_model="haikutiny",
+            source="curated",
+            refer_to_docs=False,
+            activation_action=None,
+        )
+
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+
+    selected = await io.prompt_model_selection(initial_provider="overlays")
+
+    assert selected == "haikutiny"
+    assert captured_kwargs["start_path"] == project_root

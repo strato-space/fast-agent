@@ -7,7 +7,7 @@ from typing import Any
 
 from rich.console import Console
 
-from fast_agent.ui.model_display import format_model_display
+from fast_agent.llm.model_display_name import resolve_llm_display_name
 
 
 def display_usage_report(
@@ -56,9 +56,7 @@ def display_usage_report(
                 # Get model name via typed property when available
                 model = "unknown"
                 if agent.llm:
-                    model = agent.llm.model_name or "unknown"
-
-                model = format_model_display(model, max_len=25) or model
+                    model = resolve_llm_display_name(agent.llm, max_len=25) or "unknown"
 
                 usage_data.append(
                     {
@@ -192,9 +190,8 @@ def collect_agents_from_provider(
     """
     agents_to_show = {}
 
-    if hasattr(prompt_provider, "_agents"):
-        # Multi-agent app - show all agents
-        agents_to_show = prompt_provider._agents
+    if hasattr(prompt_provider, "registered_agents"):
+        agents_to_show = dict(prompt_provider.registered_agents())
     elif hasattr(prompt_provider, "agent"):
         # Single agent
         agent = prompt_provider.agent

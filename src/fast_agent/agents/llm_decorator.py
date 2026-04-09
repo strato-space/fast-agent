@@ -56,7 +56,7 @@ from fast_agent.constants import (
 from fast_agent.context import Context
 from fast_agent.core.exceptions import AgentConfigError
 from fast_agent.core.logging.logger import get_logger
-from fast_agent.core.model_resolution import get_context_model_aliases, resolve_model_alias
+from fast_agent.core.model_resolution import get_context_model_references, resolve_model_reference
 from fast_agent.hooks.hook_messages import show_hook_failure
 from fast_agent.interfaces import (
     AgentProtocol,
@@ -65,7 +65,6 @@ from fast_agent.interfaces import (
     StreamingAgentProtocol,
     ToolRunnerHookCapable,
 )
-from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.usage_tracking import UsageAccumulator
@@ -204,6 +203,7 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
         # Initialize the LLM to None (will be set by attach_llm)
         self._llm: FastAgentLLMProtocol | None = None
         self._initialized = False
+        self._shutdown_complete = False
         self._llm_factory_ref: LLMFactoryProtocol | None = None
         self._llm_attach_kwargs: dict[str, Any] | None = None
         self._lifecycle_hooks: "AgentLifecycleHooks | None" = None
@@ -226,15 +226,19 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
     async def initialize(self) -> None:
         await self._run_lifecycle_hook("on_start")
         self.initialized = True
+        self._shutdown_complete = False
 
     async def shutdown(self) -> None:
         await self._finalize_shutdown()
 
     async def _finalize_shutdown(self, *, run_hook: bool = True) -> None:
+        if self._shutdown_complete:
+            return
         if run_hook:
             await self._run_lifecycle_hook("on_shutdown")
         await self._close_llm_resources()
         self.initialized = False
+        self._shutdown_complete = True
 
     async def _close_llm_resources(self) -> None:
         """Close optional LLM-owned resources (for example persistent transports)."""
@@ -337,11 +341,11 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
 
         from fast_agent.llm.model_factory import ModelFactory
 
-        model_with_aliases = resolve_model_alias(model, get_context_model_aliases(self._context))
-        model_config = ModelFactory.parse_model_string(model_with_aliases)
-        resolved_model = model_config.model_name
+        model_with_aliases = resolve_model_reference(model, get_context_model_references(self._context))
+        resolved_model = ModelFactory.resolve_model_spec(model_with_aliases)
+        wire_model = resolved_model.wire_model_name
         if self._default_request_params:
-            self._default_request_params.model = resolved_model
+            self._default_request_params.model = wire_model
 
         if self._llm_attach_kwargs is None:
             raise RuntimeError(
@@ -352,13 +356,13 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
         request_params = attach_kwargs.pop("request_params", None)
         if request_params is not None:
             request_params = deepcopy(request_params)
-            request_params.model = resolved_model
+            request_params.model = wire_model
 
         llm_factory = ModelFactory.create_factory(model_with_aliases)
 
         await self.attach_llm(
             llm_factory,
-            model=resolved_model,
+            model=wire_model,
             request_params=request_params,
             **attach_kwargs,
         )
@@ -429,7 +433,11 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
         # Store attachment details for future cloning
         self._llm_factory_ref = llm_factory
         attach_kwargs: dict[str, Any] = dict(additional_kwargs)
-        attach_kwargs["request_params"] = deepcopy(effective_params)
+        # Keep only caller-provided overrides so reattachment can recompute
+        # model-specific defaults (e.g. overlay maxTokens) for the new model.
+        attach_kwargs["request_params"] = (
+            deepcopy(request_params) if request_params is not None else None
+        )
         self._llm_attach_kwargs = attach_kwargs
         self._on_llm_attached(self._llm)
 
@@ -788,6 +796,7 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
         base_history = self._message_history if use_history else self._template_prefix_messages()
         full_history = [msg.model_copy(deep=True) for msg in base_history]
         full_history.extend(sanitized_messages)
+        full_history = self._merge_trailing_tool_result_turn(full_history)
 
         return _CallContext(
             full_history=full_history,
@@ -796,6 +805,43 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
             sanitized_messages=sanitized_messages,
             summary=summary,
         )
+
+    @staticmethod
+    def _merge_trailing_tool_result_turn(
+        messages: list[PromptMessageExtended],
+    ) -> list[PromptMessageExtended]:
+        """Fold a resumed tool-result turn into the next user prompt for provider calls."""
+        if len(messages) < 2:
+            return messages
+
+        merged_messages = [msg.model_copy(deep=True) for msg in messages]
+        previous = merged_messages[-2]
+        current = merged_messages[-1]
+        if (
+            previous.role != "user"
+            or not previous.tool_results
+            or current.role != "user"
+            or current.tool_results
+        ):
+            return merged_messages
+
+        merged_channels: dict[str, list[ContentBlock]] = {}
+        for source in (previous.channels, current.channels):
+            if not source:
+                continue
+            for channel_name, blocks in source.items():
+                merged_channels.setdefault(channel_name, []).extend(blocks)
+
+        merged_messages[-2] = PromptMessageExtended(
+            role="user",
+            content=list(current.content),
+            tool_results=previous.tool_results,
+            channels=merged_channels or None,
+            phase=current.phase or previous.phase,
+            is_template=previous.is_template and current.is_template,
+        )
+        merged_messages.pop()
+        return merged_messages
 
     def _persist_history(
         self,
@@ -916,7 +962,7 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
 
         for block in blocks or []:
             mime_type, category = self._extract_block_metadata(block)
-            if self._block_supported(mime_type, category):
+            if self._block_supported(block, mime_type, category):
                 kept.append(block)
             else:
                 removed_block = _RemovedBlock(
@@ -943,25 +989,30 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
 
         return kept
 
-    def _block_supported(self, mime_type: str | None, category: str) -> bool:
+    def _block_supported(
+        self,
+        block: ContentBlock,
+        mime_type: str | None,
+        category: str,
+    ) -> bool:
         """Determine if the current model can process a content block."""
         if category == "text":
             return True
 
-        model_name = self.llm.model_name if self.llm else None
-        if not model_name:
+        model_info = self.llm.model_info if self.llm else None
+        if not model_info:
             return False
 
+        resource_source = "link" if isinstance(block, ResourceLink) else "embedded"
+
         if mime_type:
-            return ModelDatabase.supports_mime(model_name, mime_type)
+            return model_info.supports_mime(mime_type, resource_source=resource_source)
 
         if category == "vision":
-            return ModelDatabase.supports_any_mime(
-                model_name, ["image/jpeg", "image/png", "image/webp"]
-            )
+            return model_info.supports_vision
 
         if category == "document":
-            return ModelDatabase.supports_mime(model_name, "application/pdf")
+            return model_info.supports_document
 
         return False
 

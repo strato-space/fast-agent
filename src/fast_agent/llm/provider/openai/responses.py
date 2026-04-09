@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from mcp import Tool
@@ -18,7 +19,6 @@ from fast_agent.core.exceptions import ModelConfigError, ProviderKeyError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.core.prompt import Prompt
 from fast_agent.llm.fastagent_llm import FastAgentLLM
-from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider.error_utils import build_stream_failure_response
 from fast_agent.llm.provider.openai._stream_capture import (
     save_stream_request as _save_stream_request,
@@ -46,12 +46,14 @@ from fast_agent.llm.provider.openai.schema_sanitizer import (
     sanitize_tool_input_schema,
     should_strip_tool_schema_defaults,
 )
+from fast_agent.llm.provider.openai.streaming_utils import with_stream_idle_timeout
 from fast_agent.llm.provider.openai.web_tools import build_web_search_tool, resolve_web_search
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import format_reasoning_setting, parse_reasoning_setting
 from fast_agent.llm.request_params import RequestParams
 from fast_agent.llm.text_verbosity import parse_text_verbosity
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.provider_management import build_openai_provider_managed_mcp_tools
 from fast_agent.tools.apply_patch_tool import get_openai_responses_custom_tool_payload
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
@@ -114,7 +116,7 @@ class ResponsesLLM(
             "reconnected": 0,
         }
         self._file_id_cache: dict[str, str] = {}
-        self._transport: ResponsesTransport = "sse"
+        self._transport: ResponsesTransport = self._default_transport_setting()
         self._last_transport_used: Literal["sse", "websocket"] | None = None
         self._ws_connections = WebSocketConnectionManager(idle_timeout_seconds=300.0)
         self._ws_debug_inline = os.getenv("FAST_AGENT_DEBUG_RESPONSES_WS", "").strip().lower() in {
@@ -176,7 +178,7 @@ class ResponsesLLM(
         )
 
         chosen_model = self.default_request_params.model if self.default_request_params else None
-        self._reasoning_mode = ModelDatabase.get_reasoning(chosen_model) if chosen_model else None
+        self._reasoning_mode = self._get_model_reasoning(chosen_model)
         self._reasoning = self._reasoning_mode == "openai"
         if self._reasoning_mode:
             self.logger.info(
@@ -255,7 +257,7 @@ class ResponsesLLM(
         if self.provider == Provider.CODEX_RESPONSES:
             return ("fast",)
         if model_name:
-            configured_tiers = ModelDatabase.get_response_service_tiers(model_name)
+            configured_tiers = self._get_model_response_service_tiers(model_name)
             if configured_tiers is not None:
                 return configured_tiers
         return ("fast", "flex")
@@ -313,12 +315,19 @@ class ResponsesLLM(
             return "priority"
         return "flex"
 
+    def _default_transport_setting(self) -> ResponsesTransport:
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+            return "auto"
+        return "sse"
+
     def _resolve_transport_setting(self, raw_value: Any, settings: Any) -> ResponsesTransport:
         value = raw_value
         if value is None and settings is not None:
-            value = getattr(settings, "transport", None)
+            model_fields_set = getattr(settings, "model_fields_set", set())
+            if "transport" in model_fields_set:
+                value = getattr(settings, "transport", None)
         if value is None:
-            return "sse"
+            return self._default_transport_setting()
 
         normalized = str(value).strip().lower()
         transport_aliases: dict[str, ResponsesTransport] = {
@@ -331,11 +340,12 @@ class ResponsesLLM(
         if normalized_transport is not None:
             return normalized_transport
 
+        default_transport = self._default_transport_setting()
         self.logger.warning(
-            "Invalid Responses transport setting; defaulting to SSE",
+            f"Invalid Responses transport setting; defaulting to {default_transport}",
             data={"transport": value},
         )
-        return "sse"
+        return default_transport
 
     def _supports_websocket_transport(self) -> bool:
         """Provider-level websocket support flag (opt-in while experimental)."""
@@ -360,12 +370,12 @@ class ResponsesLLM(
                 )
             return
 
-        response_transports = ModelDatabase.get_response_transports(model_to_check)
+        response_transports = self._get_model_response_transports(model_to_check)
         if not response_transports or "websocket" not in response_transports:
             raise ModelConfigError(
                 f"Transport '{transport}' is not supported for model '{model_to_check}'."
             )
-        websocket_providers = ModelDatabase.get_response_websocket_providers(model_to_check)
+        websocket_providers = self._get_model_response_websocket_providers(model_to_check)
         if websocket_providers is not None and self.provider not in websocket_providers:
             raise ModelConfigError(
                 f"Transport '{transport}' is not supported for model '{model_to_check}' "
@@ -491,8 +501,7 @@ class ResponsesLLM(
                 if payload_saved_bytes is not None and payload_saved_ratio is not None:
                     percent_saved = round(payload_saved_ratio * 100.0)
                     byte_counts = (
-                        f" {sent_payload_bytes}/{full_payload_bytes}B"
-                        f" ({percent_saved}% saved)"
+                        f" {sent_payload_bytes}/{full_payload_bytes}B ({percent_saved}% saved)"
                     )
                 else:
                     byte_counts = f" {sent_payload_bytes}/{full_payload_bytes}B"
@@ -583,11 +592,11 @@ class ResponsesLLM(
             )
         self.default_request_params.service_tier = parsed_value
 
-    def _base_url(self) -> str | None:
+    def _provider_base_url(self) -> str | None:
         settings = self._openai_settings()
         return settings.base_url if settings else None
 
-    def _default_headers(self) -> dict[str, str] | None:
+    def _provider_default_headers(self) -> dict[str, str] | None:
         settings = self._openai_settings()
         return settings.default_headers if settings else None
 
@@ -682,6 +691,17 @@ class ResponsesLLM(
                     }
                 )
             base_args["tools"] = tools_payload
+
+        if self.provider_managed_mcp_state.has_servers():
+            if self.provider != Provider.RESPONSES:
+                raise ModelConfigError(
+                    "Provider-managed MCP is not supported for this Responses-family provider."
+                )
+            tools_payload = base_args.setdefault("tools", [])
+            if isinstance(tools_payload, list):
+                tools_payload.extend(
+                    build_openai_provider_managed_mcp_tools(self.provider_managed_mcp_state)
+                )
 
         resolved_web_search = resolve_web_search(
             self._openai_settings(),
@@ -875,10 +895,12 @@ class ResponsesLLM(
             self._record_usage(response.usage, model_name)
 
         web_tool_payloads, citation_payloads = self._extract_web_search_metadata(response)
-        if web_tool_payloads:
+        provider_mcp_payloads = self._extract_provider_mcp_metadata(response)
+        server_tool_payloads = [*web_tool_payloads, *provider_mcp_payloads]
+        if server_tool_payloads:
             if channels is None:
                 channels = {}
-            channels[ANTHROPIC_SERVER_TOOLS_CHANNEL] = web_tool_payloads
+            channels[ANTHROPIC_SERVER_TOOLS_CHANNEL] = server_tool_payloads
         if citation_payloads:
             if channels is None:
                 channels = {}
@@ -910,29 +932,28 @@ class ResponsesLLM(
                 self.logger.debug("Responses request", data=arguments)
                 capture_filename = _stream_capture_filename(self.chat_turn())
                 _save_stream_request(capture_filename, arguments)
-                async with client.responses.stream(**arguments) as stream:
+                async with self._response_sse_stream(client=client, arguments=arguments) as stream:
                     timeout = request_params.streaming_timeout
-                    if timeout is None:
+                    timed_stream = with_stream_idle_timeout(
+                        stream,
+                        idle_timeout_seconds=timeout,
+                        timeout_message=f"Streaming was idle for more than {timeout} seconds.",
+                    )
+                    try:
                         response, streamed_summary = await self._process_stream(
-                            stream, model_name, capture_filename
+                            timed_stream, model_name, capture_filename
                         )
-                    else:
-                        try:
-                            response, streamed_summary = await asyncio.wait_for(
-                                self._process_stream(stream, model_name, capture_filename),
-                                timeout=timeout,
-                            )
-                        except asyncio.TimeoutError as exc:
-                            self.logger.error(
-                                "Streaming timeout while waiting for Responses",
-                                data={
-                                    "model": model_name,
-                                    "timeout_seconds": timeout,
-                                },
-                            )
-                            raise TimeoutError(
-                                f"Streaming did not complete within {timeout} seconds."
-                            ) from exc
+                    except TimeoutError:
+                        if timeout is None:
+                            raise
+                        self.logger.error(
+                            "Streaming idle timeout while waiting for Responses",
+                            data={
+                                "model": model_name,
+                                "timeout_seconds": timeout,
+                            },
+                        )
+                        raise
                 return response, streamed_summary, normalized_input
         except AuthenticationError as e:
             raise ProviderKeyError(
@@ -943,6 +964,16 @@ class ResponsesLLM(
         except APIError as error:
             self.logger.error("Streaming APIError during Responses completion", exc_info=error)
             raise
+
+    @asynccontextmanager
+    async def _response_sse_stream(
+        self,
+        *,
+        client: AsyncOpenAI,
+        arguments: dict[str, Any],
+    ):
+        async with client.responses.stream(**arguments) as stream:
+            yield stream
 
     async def _responses_completion_ws(
         self,
@@ -997,27 +1028,26 @@ class ResponsesLLM(
                 )
                 await send_response_request(connection.websocket, planned_request)
                 stream = WebSocketResponsesStream(connection.websocket)
-                if timeout is None:
+                timed_stream = with_stream_idle_timeout(
+                    stream,
+                    idle_timeout_seconds=timeout,
+                    timeout_message=f"Streaming was idle for more than {timeout} seconds.",
+                )
+                try:
                     response, streamed_summary = await self._process_stream(
-                        stream, model_name, capture_filename
+                        timed_stream, model_name, capture_filename
                     )
-                else:
-                    try:
-                        response, streamed_summary = await asyncio.wait_for(
-                            self._process_stream(stream, model_name, capture_filename),
-                            timeout=timeout,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        self.logger.error(
-                            "Streaming timeout while waiting for Responses websocket",
-                            data={
-                                "model": model_name,
-                                "timeout_seconds": timeout,
-                            },
-                        )
-                        raise TimeoutError(
-                            f"Streaming did not complete within {timeout} seconds."
-                        ) from exc
+                except TimeoutError:
+                    if timeout is None:
+                        raise
+                    self.logger.error(
+                        "Streaming idle timeout while waiting for Responses websocket",
+                        data={
+                            "model": model_name,
+                            "timeout_seconds": timeout,
+                        },
+                    )
+                    raise
                 planner.commit(arguments, planned_request, response)
                 keep_connection = True
                 if reconnected:
