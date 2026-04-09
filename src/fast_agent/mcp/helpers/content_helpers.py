@@ -151,7 +151,9 @@ def canonicalize_tool_result_content_for_llm(
     """
 
     raw_content = getattr(result, "content", None)
-    content = cast("list[ContentBlock]", raw_content) if isinstance(raw_content, list) else []
+    content = (
+        cast("list[ContentBlock]", list(raw_content)) if isinstance(raw_content, list) else []
+    )
 
     structured_content = getattr(result, "structuredContent", None)
     if structured_content is None:
