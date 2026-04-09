@@ -132,6 +132,7 @@ def test_tool_result_prefers_structured_content_over_many_text_blocks() -> None:
     assert '"id": "b"' in rendered
     assert "TextContent(" not in rendered
     assert "text only" in rendered
+    assert "TextContent mismatch" not in rendered
 
 
 def test_tool_result_prefers_structured_content_when_text_blocks_disagree() -> None:
@@ -162,6 +163,7 @@ def test_tool_result_prefers_structured_content_when_text_blocks_disagree() -> N
     assert '"status": "escalated"' in rendered
     assert '"status":"closed"' not in rendered
     assert '"status":"pending"' not in rendered
+    assert "Structured ■ (TextContent mismatch)" in rendered
 
 
 def test_structured_tool_result_shows_transport_timing_and_structured_footer() -> None:

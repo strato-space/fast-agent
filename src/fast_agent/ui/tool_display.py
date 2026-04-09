@@ -705,9 +705,44 @@ class ToolDisplay:
             bottom_metadata_items.append(self._display._format_elapsed(timing_seconds))
 
         if has_structured:
-            bottom_metadata_items.append("Structured ■")
+            structured_label = "Structured ■"
+            if self._has_structured_text_content_mismatch(result):
+                structured_label += " (TextContent mismatch)"
+            bottom_metadata_items.append(structured_label)
 
         return bottom_metadata_items or None
+
+    @staticmethod
+    def _has_structured_text_content_mismatch(result: "CallToolResult") -> bool:
+        from fast_agent.mcp.helpers.content_helpers import get_text, is_text_content
+
+        structured_content = getattr(result, "structuredContent", None)
+        content = getattr(result, "content", None)
+        if not (
+            isinstance(structured_content, (dict, list))
+            and isinstance(content, list)
+            and len(content) > 1
+            and all(is_text_content(item) for item in content)
+        ):
+            return False
+
+        parsed_blocks: list[object] = []
+        for item in content:
+            text = get_text(item)
+            if text is None:
+                return False
+            try:
+                parsed_blocks.append(json.loads(text))
+            except json.JSONDecodeError:
+                return False
+
+        if structured_content == parsed_blocks:
+            return False
+
+        if isinstance(structured_content, dict):
+            return all(value != parsed_blocks for value in structured_content.values())
+
+        return True
 
     def _prepare_read_text_file_result_display(
         self,
